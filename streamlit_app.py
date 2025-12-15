@@ -9,7 +9,7 @@ from pathlib import Path
 # ============================================================
 
 st.set_page_config(
-    page_title="Momentum Dashboard",
+    page_title="Momentum Strategy Dashboard",
     layout="wide",
 )
 
@@ -25,13 +25,13 @@ STATS_PATH   = ARTIFACTS / "backtest_stats_C.json"
 # ============================================================
 
 @st.cache_data
-def load_parquet(path: Path):
+def load_parquet(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     return pd.read_parquet(path)
 
 @st.cache_data
-def load_json(path: Path):
+def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
     with open(path) as f:
@@ -39,25 +39,23 @@ def load_json(path: Path):
 
 def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Robust Bucket C cleaner:
+    Clean Bucket C for display:
     - One row per ticker
     - Sum Position_Size
-    - Max of score columns
-    - Safe against missing / null columns
+    - Max of available score columns
+    - Fully schema-safe
     """
     if df.empty or "Ticker" not in df.columns:
-        return df
+        return pd.DataFrame()
 
     out = df[["Ticker"]].drop_duplicates().set_index("Ticker")
 
-    # Position size
     if "Position_Size" in df.columns:
         out["Position_Size"] = (
             df.groupby("Ticker")["Position_Size"]
             .sum(min_count=1)
         )
 
-    # Score columns
     score_cols = [
         "Weighted_Score",
         "Momentum Score",
@@ -99,14 +97,14 @@ st.title("📈 Momentum Strategy Dashboard")
 # PERFORMANCE SUMMARY
 # ============================================================
 
-st.subheader("Performance Summary (Bucket C)")
+st.subheader("Performance Summary — Bucket C")
 
 if stats:
     cols = st.columns(len(stats))
     for col, (k, v) in zip(cols, stats.items()):
         col.metric(k, round(v, 2) if isinstance(v, (int, float)) else v)
 else:
-    st.info("No performance stats available")
+    st.info("No performance statistics available")
 
 # ============================================================
 # EQUITY CURVE
@@ -114,7 +112,7 @@ else:
 
 st.subheader("Equity Curve")
 
-if not equity.empty:
+if not equity.empty and "Date" in equity.columns:
     equity = equity.sort_values("Date")
 
     value_col = (
@@ -129,7 +127,7 @@ if not equity.empty:
             width="stretch"
         )
     else:
-        st.info("No equity value column found")
+        st.info("No equity value column found in backtest output")
 else:
     st.info("Equity data not available")
 
@@ -139,12 +137,13 @@ else:
 
 st.subheader("Current Portfolio — Bucket C")
 
-if signals.empty:
+if signals.empty or "Date" not in signals.columns:
     st.info("No signal data available")
 else:
     latest_date = signals["Date"].max()
+
     today = signals[
-        (signals["Bucket"] == "C") &
+        (signals.get("Bucket") == "C") &
         (signals["Date"] == latest_date)
     ]
 
@@ -153,18 +152,19 @@ else:
     else:
         clean_c = clean_bucket_c(today)
 
-        display_cols = ["Ticker", "Position_Size"]
-        for c in [
+        display_cols = [
+            "Ticker",
+            "Position_Size",
             "Weighted_Score",
             "Momentum Score",
             "Early Momentum Score",
             "Consistency",
-        ]:
-            if c in clean_c.columns:
-                display_cols.append(c)
+        ]
+
+        safe_cols = [c for c in display_cols if c in clean_c.columns]
 
         st.dataframe(
-            clean_c[display_cols],
+            clean_c[safe_cols],
             width="stretch"
         )
 
@@ -180,8 +180,9 @@ with tab1:
     if signals.empty:
         st.info("No signals available")
     else:
+        sort_cols = [c for c in ["Date", "Weighted_Score"] if c in signals.columns]
         st.dataframe(
-            signals.sort_values(["Date", "Weighted_Score"], ascending=[False, False]),
+            signals.sort_values(sort_cols, ascending=False),
             width="stretch"
         )
 
@@ -200,5 +201,4 @@ with tab3:
     else:
         if "Date" in trades.columns:
             trades = trades.sort_values("Date", ascending=False)
-
         st.dataframe(trades, width="stretch")
