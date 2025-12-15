@@ -8,39 +8,39 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      # 1️⃣ Checkout repo FIRST
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 2️⃣ Setup Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3️⃣ Install dependencies
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4️⃣ Run daily pipeline (THIS CREATES today_C.parquet)
       - name: Run daily momentum update
         run: |
           python updater/run_daily.py
 
-      # 5️⃣ (Optional) Seed fallback if needed
-      - name: Seed daily output (safe fallback)
+      - name: Seed daily output (fallback only)
+        if: failure()
         run: |
           python updater/seed_today.py
 
-      # 6️⃣ Commit artifacts back to repo
       - name: Commit artifacts
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
+          mkdir -p artifacts
           git add artifacts/
-          git commit -m "Daily artifacts update" || echo "No changes"
+          git commit -m "Daily artifacts update" || echo "No changes to commit"
           git push
