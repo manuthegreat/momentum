@@ -1,4 +1,12 @@
+import sys
 from pathlib import Path
+
+# -----------------------------------------------------
+# Ensure project root is on PYTHONPATH
+# -----------------------------------------------------
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT))
+
 import pandas as pd
 
 from core.data import (
@@ -23,7 +31,7 @@ from core.selection import (
 # CONFIG
 # =====================================================
 
-ARTIFACTS = Path("artifacts")
+ARTIFACTS = ROOT / "artifacts"
 
 PRICE_PATH = ARTIFACTS / "index_constituents_5yr.parquet"
 INDEX_PATH = ARTIFACTS / "index_returns_5y.parquet"
@@ -55,7 +63,7 @@ base = filter_by_index(base, INDEX_NAME)
 idx = load_index_returns_parquet(INDEX_PATH)
 
 # =====================================================
-# BUCKET A — ABSOLUTE MOMENTUM
+# BUCKET A
 # =====================================================
 
 dfA = add_absolute_returns(base)
@@ -78,7 +86,7 @@ todayA = final_selection_from_daily(
 todayA.to_parquet(ARTIFACTS / "today_A.parquet", index=False)
 
 # =====================================================
-# BUCKET B — RELATIVE MOMENTUM
+# BUCKET B
 # =====================================================
 
 dfB = base.merge(
@@ -95,7 +103,6 @@ dfB = add_absolute_returns(dfB)
 dfB = calculate_momentum_features(dfB, windows=WINDOWS)
 dfB = add_regime_momentum_score(dfB)
 
-# Benchmark trend filter
 dfB = dfB[
     (dfB["Momentum_Slow"] > 0.5)
     & (dfB["Momentum_Mid"] > 0.25)
@@ -119,7 +126,7 @@ todayB = final_selection_from_daily(
 todayB.to_parquet(ARTIFACTS / "today_B.parquet", index=False)
 
 # =====================================================
-# BUCKET C — UNIFIED (80 / 20)
+# BUCKET C
 # =====================================================
 
 todayC = build_unified_target(
@@ -138,7 +145,4 @@ todayC = build_unified_target(
 
 todayC.to_parquet(ARTIFACTS / "today_C.parquet", index=False)
 
-print("✅ Daily artifacts written:")
-print(" - today_A.parquet")
-print(" - today_B.parquet")
-print(" - today_C.parquet")
+print("✅ Daily artifacts written")
