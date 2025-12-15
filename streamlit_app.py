@@ -1,160 +1,92 @@
-import json
-import pandas as pd
 import streamlit as st
+import pandas as pd
 from pathlib import Path
 
-# ============================================================
-# CONFIG
-# ============================================================
+st.set_page_config(layout="wide")
+st.title("📈 Momentum Strategy Dashboard")
 
 ARTIFACTS = Path("artifacts")
 
-SIGNALS_PATH = ARTIFACTS / "backtest_signals.parquet"
+# ---------------------------------------------------------
+# Load helpers
+# ---------------------------------------------------------
+def load_csv(name):
+    path = ARTIFACTS / name
+    if not path.exists():
+        st.warning(f"Missing artifact: {name}")
+        return pd.DataFrame()
+    return pd.read_csv(path, parse_dates=["Date"])
 
-EQUITY_PATH = ARTIFACTS / "backtest_equity_C.parquet"
-TRADES_PATH = ARTIFACTS / "backtest_trades_C.parquet"
-STATS_PATH  = ARTIFACTS / "backtest_stats_C.json"
+signals = load_csv("signals.csv")
+equity  = load_csv("backtest_equity.csv")
+stats   = load_csv("backtest_stats.csv")
 
-st.set_page_config(
-    page_title="Momentum Dashboard",
-    layout="wide"
-)
+# ---------------------------------------------------------
+# Normalize signals (Position_Size)
+# ---------------------------------------------------------
+TOTAL_CAPITAL = 100_000
+BUCKET_WEIGHTS = {"A": 0.2, "B": 0.8, "C": 1.0}
 
-# ============================================================
-# HELPERS
-# ============================================================
+if not signals.empty:
+    if "Position_Size" not in signals.columns:
+        def infer_position_size(df):
+            out = df.copy()
+            for b, w in BUCKET_WEIGHTS.items():
+                mask = out["Bucket"] == b
+                n = mask.sum()
+                if n > 0:
+                    out.loc[mask, "Position_Size"] = TOTAL_CAPITAL * w / n
+            return out
 
-@st.cache_data
-def load_parquet(path):
-    return pd.read_parquet(path)
+        signals = infer_position_size(signals)
 
-@st.cache_data
-def load_json(path):
-    with open(path) as f:
-        return json.load(f)
+# ---------------------------------------------------------
+# TODAY VIEW
+# ---------------------------------------------------------
+st.header("🟢 Today’s Signals")
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.title("Momentum Dashboard")
-
-view = st.sidebar.radio(
-    "View",
-    ["Overview", "Signals", "Backtests"]
-)
-
-bucket = st.sidebar.selectbox(
-    "Select Bucket",
-    ["A", "B", "C"]
-)
-
-# ============================================================
-# LOAD DATA
-# ============================================================
-
-signals = load_parquet(SIGNALS_PATH)
-
-# ============================================================
-# OVERVIEW
-# ============================================================
-
-if view == "Overview":
-
-    st.title("Momentum Strategy — Overview")
-
+if signals.empty:
+    st.info("No signals available")
+else:
     latest_date = signals["Date"].max()
     today = signals[signals["Date"] == latest_date]
 
-    col1, col2, col3 = st.columns(3)
+    for bucket in ["A", "B", "C"]:
+        df = today[today["Bucket"] == bucket]
+        if df.empty:
+            continue
 
-    col1.metric("Bucket A", len(today[today["Bucket"] == "A"]))
-    col2.metric("Bucket B", len(today[today["Bucket"] == "B"]))
-    col3.metric("Bucket C", len(today[today["Bucket"] == "C"]))
+        st.subheader(f"Bucket {bucket}")
+        st.dataframe(
+            df.sort_values("Position_Size", ascending=False)
+            .reset_index(drop=True)
+        )
 
-    st.subheader("Unified Portfolio (Bucket C)")
+# ---------------------------------------------------------
+# BACKTEST RESULTS
+# ---------------------------------------------------------
+st.header("📊 Backtest Results")
 
-    st.dataframe(
-        today[today["Bucket"] == "C"]
-        .sort_values("Position_Size", ascending=False)
-        .reset_index(drop=True)
-    )
-
-# ============================================================
-# SIGNALS
-# ============================================================
-
-elif view == "Signals":
-
-    st.title(f"Today's Signals — Bucket {bucket}")
-
-    latest_date = signals["Date"].max()
-
-    df = (
-        signals[
-            (signals["Bucket"] == bucket) &
-            (signals["Date"] == latest_date)
-        ]
-        .sort_values("Position_Size", ascending=False)
-    )
-
-    if df.empty:
-        st.warning("No signals available.")
+if equity.empty:
+    st.info("No backtest equity available")
+else:
+    if "Equity" in equity.columns:
+        y_col = "Equity"
+    elif "Portfolio Value" in equity.columns:
+        y_col = "Portfolio Value"
     else:
-        st.dataframe(df.reset_index(drop=True))
-
-# ============================================================
-# BACKTESTS
-# ============================================================
-
-elif view == "Backtests":
-
-    st.title("Backtests — Bucket C")
-
-    if not EQUITY_PATH.exists():
-        st.warning("Backtest not available.")
+        st.error("Unknown equity schema")
         st.stop()
 
-    equity = load_parquet(EQUITY_PATH)
-    trades = load_parquet(TRADES_PATH)
-    stats  = load_json(STATS_PATH)
-
-    # --------------------------------------------------------
-    # PERFORMANCE METRICS
-    # --------------------------------------------------------
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("Total Return (%)", round(stats.get("Total Return (%)", 0), 2))
-    c2.metric("CAGR (%)", round(stats.get("CAGR (%)", 0), 2))
-    c3.metric("Sharpe", round(stats.get("Sharpe Ratio", 0), 2))
-    c4.metric("Max Drawdown (%)", round(stats.get("Max Drawdown (%)", 0), 2))
-
-    # --------------------------------------------------------
-    # EQUITY CURVE
-    # --------------------------------------------------------
-
     st.subheader("Equity Curve")
+    st.line_chart(equity.set_index("Date")[y_col])
 
-    st.line_chart(
-        equity.set_index("Date")["Equity"]
-    )
+# ---------------------------------------------------------
+# PERFORMANCE STATS
+# ---------------------------------------------------------
+st.header("📈 Performance Summary")
 
-    # --------------------------------------------------------
-    # TRADES
-    # --------------------------------------------------------
-
-    st.subheader("Trade Blotter")
-
-    st.dataframe(
-        trades.sort_values("Date", ascending=False)
-        .reset_index(drop=True)
-    )
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.caption(
-    "Momentum system • Deterministic • Artifact-driven • Production-grade"
-)
+if stats.empty:
+    st.info("No performance stats available")
+else:
+    st.dataframe(stats)
