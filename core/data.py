@@ -30,20 +30,33 @@ def load_price_data_parquet(path: str | Path) -> pd.DataFrame:
     return df
 
 
-def load_index_returns_parquet(path: str | Path) -> pd.DataFrame:
+def load_index_returns_parquet(path):
+    """
+    Load index returns parquet.
+    Accepts either:
+      - Date as index
+      - Date as column
+    Always returns Date-indexed DataFrame
+    """
     df = pd.read_parquet(path)
-    df.columns = df.columns.str.lower().str.replace(" ", "_")
 
-    if "date" not in df.columns:
-        raise ValueError("Index parquet must contain a date column")
+    # Case 1: already indexed
+    if df.index.name is not None:
+        df.index = pd.to_datetime(df.index)
+        return df.sort_index()
 
-    if "index" not in df.columns:
-        raise ValueError("Index parquet must contain an index column")
+    # Case 2: Date column exists
+    date_cols = [c for c in df.columns if c.lower() in ("date", "datetime")]
+    if date_cols:
+        date_col = date_cols[0]
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.set_index(date_col)
+        return df.sort_index()
 
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values(["index", "date"]).reset_index(drop=True)
-
-    return df
+    # Otherwise → genuinely invalid
+    raise ValueError(
+        "Index parquet must contain a Date column or indexed dates"
+    )
 
 
 def filter_by_index(df: pd.DataFrame, index_name: str) -> pd.DataFrame:
