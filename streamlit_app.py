@@ -1,92 +1,142 @@
-import streamlit as st
-import pandas as pd
+# streamlit_app.py
+
+import json
 from pathlib import Path
 
-st.set_page_config(layout="wide")
-st.title("📈 Momentum Strategy Dashboard")
+import pandas as pd
+import streamlit as st
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="Momentum Strategy Dashboard",
+    layout="wide",
+)
 
 ARTIFACTS = Path("artifacts")
 
-# ---------------------------------------------------------
-# Load helpers
-# ---------------------------------------------------------
-def load_csv(name):
-    path = ARTIFACTS / name
+SIGNALS_PATH = ARTIFACTS / "backtest_signals.parquet"
+EQUITY_PATH  = ARTIFACTS / "backtest_equity_C.parquet"
+TRADES_PATH  = ARTIFACTS / "backtest_trades_C.parquet"
+STATS_PATH   = ARTIFACTS / "backtest_stats_C.json"
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def load_parquet(path: Path, label: str) -> pd.DataFrame:
     if not path.exists():
-        st.warning(f"Missing artifact: {name}")
+        st.warning(f"Missing artifact: {path.name}")
         return pd.DataFrame()
-    return pd.read_csv(path, parse_dates=["Date"])
+    return pd.read_parquet(path)
 
-signals = load_csv("signals.csv")
-equity  = load_csv("backtest_equity.csv")
-stats   = load_csv("backtest_stats.csv")
+def load_json(path: Path, label: str) -> dict:
+    if not path.exists():
+        st.warning(f"Missing artifact: {path.name}")
+        return {}
+    with open(path) as f:
+        return json.load(f)
 
-# ---------------------------------------------------------
-# Normalize signals (Position_Size)
-# ---------------------------------------------------------
-TOTAL_CAPITAL = 100_000
-BUCKET_WEIGHTS = {"A": 0.2, "B": 0.8, "C": 1.0}
+# ============================================================
+# HEADER
+# ============================================================
 
-if not signals.empty:
-    if "Position_Size" not in signals.columns:
-        def infer_position_size(df):
-            out = df.copy()
-            for b, w in BUCKET_WEIGHTS.items():
-                mask = out["Bucket"] == b
-                n = mask.sum()
-                if n > 0:
-                    out.loc[mask, "Position_Size"] = TOTAL_CAPITAL * w / n
-            return out
+st.title("📈 Momentum Strategy Dashboard")
+st.caption("Deterministic • Artifact-driven • Production-grade")
 
-        signals = infer_position_size(signals)
+# ============================================================
+# LOAD DATA
+# ============================================================
 
-# ---------------------------------------------------------
-# TODAY VIEW
-# ---------------------------------------------------------
+signals = load_parquet(SIGNALS_PATH, "Signals")
+equity  = load_parquet(EQUITY_PATH, "Equity")
+trades  = load_parquet(TRADES_PATH, "Trades")
+stats   = load_json(STATS_PATH, "Stats")
+
+# Normalize equity column for UI
+if not equity.empty and "Portfolio Value" in equity.columns:
+    equity = equity.rename(columns={"Portfolio Value": "Equity"})
+
+# ============================================================
+# TODAY'S SIGNALS
+# ============================================================
+
 st.header("🟢 Today’s Signals")
 
 if signals.empty:
     st.info("No signals available")
 else:
     latest_date = signals["Date"].max()
-    today = signals[signals["Date"] == latest_date]
+    today = signals[signals["Date"] == latest_date].copy()
 
-    for bucket in ["A", "B", "C"]:
-        df = today[today["Bucket"] == bucket]
-        if df.empty:
-            continue
+    st.caption(f"As of {latest_date.date()}")
 
-        st.subheader(f"Bucket {bucket}")
-        st.dataframe(
-            df.sort_values("Position_Size", ascending=False)
-            .reset_index(drop=True)
-        )
+    # Bucket selector
+    bucket = st.selectbox(
+        "Select Bucket",
+        sorted(today["Bucket"].unique())
+    )
 
-# ---------------------------------------------------------
-# BACKTEST RESULTS
-# ---------------------------------------------------------
-st.header("📊 Backtest Results")
+    df = today[today["Bucket"] == bucket]
+
+    # Safe sort
+    if "Position_Size" in df.columns:
+        df = df.sort_values("Position_Size", ascending=False)
+
+    st.dataframe(
+        df.reset_index(drop=True),
+        use_container_width=True
+    )
+
+# ============================================================
+# BACKTEST RESULTS — BUCKET C
+# ============================================================
+
+st.header("📊 Backtest Results — Bucket C")
 
 if equity.empty:
     st.info("No backtest equity available")
 else:
-    if "Equity" in equity.columns:
-        y_col = "Equity"
-    elif "Portfolio Value" in equity.columns:
-        y_col = "Portfolio Value"
-    else:
-        st.error("Unknown equity schema")
-        st.stop()
+    col1, col2 = st.columns([3, 1])
 
-    st.subheader("Equity Curve")
-    st.line_chart(equity.set_index("Date")[y_col])
+    with col1:
+        st.subheader("Equity Curve")
+        st.line_chart(
+            equity.set_index("Date")["Equity"]
+        )
 
-# ---------------------------------------------------------
-# PERFORMANCE STATS
-# ---------------------------------------------------------
-st.header("📈 Performance Summary")
+    with col2:
+        st.subheader("Summary Stats")
+        if stats:
+            stats_df = (
+                pd.DataFrame(stats.items(), columns=["Metric", "Value"])
+                .sort_values("Metric")
+            )
+            st.dataframe(stats_df, hide_index=True)
+        else:
+            st.info("No performance stats available")
 
-if stats.empty:
-    st.info("No performance stats available")
+# ============================================================
+# TRADES
+# ============================================================
+
+st.header("🧾 Trade History")
+
+if trades.empty:
+    st.info("No trades available")
 else:
-    st.dataframe(stats)
+    st.dataframe(
+        trades.sort_values("Date", ascending=False),
+        use_container_width=True
+    )
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.caption(
+    "Momentum system • Absolute + Relative regimes • "
+    "Persistence-scored • Unified portfolio construction"
+)
