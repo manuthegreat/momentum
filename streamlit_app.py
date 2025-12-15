@@ -39,23 +39,35 @@ def load_json(path: Path) -> dict:
 
 def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean Bucket C for display:
+    Robust Bucket C cleaner:
     - One row per ticker
-    - Sum Position_Size
+    - Sum position size (Position_Size OR Capital)
     - Max of available score columns
-    - Fully schema-safe
+    - Schema-safe
     """
     if df.empty or "Ticker" not in df.columns:
         return pd.DataFrame()
 
     out = df[["Ticker"]].drop_duplicates().set_index("Ticker")
 
+    # --------------------------------------------------
+    # Position sizing (auto-detect)
+    # --------------------------------------------------
+    pos_col = None
     if "Position_Size" in df.columns:
+        pos_col = "Position_Size"
+    elif "Capital" in df.columns:
+        pos_col = "Capital"
+
+    if pos_col:
         out["Position_Size"] = (
-            df.groupby("Ticker")["Position_Size"]
+            df.groupby("Ticker")[pos_col]
             .sum(min_count=1)
         )
 
+    # --------------------------------------------------
+    # Scores (max across duplicates)
+    # --------------------------------------------------
     score_cols = [
         "Weighted_Score",
         "Momentum Score",
@@ -65,14 +77,10 @@ def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in score_cols:
         if col in df.columns:
-            out[col] = (
-                df.groupby("Ticker")[col]
-                .max()
-            )
+            out[col] = df.groupby("Ticker")[col].max()
 
     out = (
-        out
-        .reset_index()
+        out.reset_index()
         .sort_values(
             "Position_Size" if "Position_Size" in out.columns else "Ticker",
             ascending=False
@@ -141,7 +149,6 @@ if signals.empty or "Date" not in signals.columns:
     st.info("No signal data available")
 else:
     latest_date = signals["Date"].max()
-
     today = signals[
         (signals.get("Bucket") == "C") &
         (signals["Date"] == latest_date)
@@ -152,21 +159,25 @@ else:
     else:
         clean_c = clean_bucket_c(today)
 
-        display_cols = [
-            "Ticker",
-            "Position_Size",
-            "Weighted_Score",
-            "Momentum Score",
-            "Early Momentum Score",
-            "Consistency",
-        ]
+        if clean_c.empty:
+            st.warning("Bucket C data found, but no position or score columns available.")
+            st.dataframe(today)
+        else:
+            display_cols = [
+                "Ticker",
+                "Position_Size",
+                "Weighted_Score",
+                "Momentum Score",
+                "Early Momentum Score",
+                "Consistency",
+            ]
 
-        safe_cols = [c for c in display_cols if c in clean_c.columns]
+            safe_cols = [c for c in display_cols if c in clean_c.columns]
 
-        st.dataframe(
-            clean_c[safe_cols],
-            width="stretch"
-        )
+            st.dataframe(
+                clean_c[safe_cols],
+                width="stretch"
+            )
 
 # ============================================================
 # ARTIFACTS EXPLORER
