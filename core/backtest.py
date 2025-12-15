@@ -117,9 +117,10 @@ def simulate_unified_portfolio(
         equity.append(
             {
                 "Date": curr,
-                "Equity": capital,
+                "Portfolio Value": capital,
                 "PnL": pnl,
             }
         )
-
+        
+    equity_df = pd.DataFrame(equity).sort_values("Date").reset_index(drop=True)
     return pd.DataFrame(equity), target
