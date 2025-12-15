@@ -20,7 +20,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run historical seed
-        run: python updater/seed_backtest_history.py
+        run: |
+          export PYTHONPATH=$PWD
+          python updater/seed_backtest_history.py
 
       - name: Commit artifacts
         run: |
