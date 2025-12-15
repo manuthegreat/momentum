@@ -3,10 +3,8 @@ import json
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from momentum.core.data_utils import (
-    load_price_data_parquet,
-    load_index_returns_parquet
-)
+from core.data_utils import load_price_data_parquet
+
 
 # ---- IMPORT YOUR EXISTING FUNCTIONS ----
 # If your functions live in one file, move them into a module (recommended).
