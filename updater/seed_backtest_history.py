@@ -55,7 +55,7 @@ def main():
     base = filter_by_index(base, "SP500")
 
     print("📥 Loading index returns...")
-    idx = load_index_returns_parquet(INDEX_PATH)
+    idx = pd.read_parquet(INDEX_PATH)
 
     print("Index returns columns (before normalization):", list(idx.columns))
 
