@@ -2,16 +2,16 @@ name: Run backtests
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * 1-5"   # Weekdays, after daily artifacts
 
 jobs:
-  backtest:
+  run-backtests:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -20,16 +20,20 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run backtest pipeline
+      - name: Run Bucket C backtest
         run: |
-          python updater/run_backtest.py
+          export PYTHONPATH=$PWD
+          python updater/run_backtest_from_signals.py
 
       - name: Commit backtest artifacts
         run: |
-          git config user.name "actions-user"
-          git config user.email "actions@github.com"
-          git add artifacts/backtest_signals.parquet
-          git commit -m "Backtest artifacts update" || echo "No changes"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add artifacts/backtest_equity_C.parquet
+          git add artifacts/backtest_trades_C.parquet
+          git add artifacts/backtest_stats_C.json
+          git commit -m "Update Bucket C backtest artifacts" || echo "No changes to commit"
           git push
