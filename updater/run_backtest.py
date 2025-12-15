@@ -1,7 +1,19 @@
+import sys
 from pathlib import Path
+
+# -----------------------------------------------------
+# Ensure project root is on PYTHONPATH
+# -----------------------------------------------------
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT))
+
 import pandas as pd
 
-from core.data import load_price_data_parquet, load_index_returns_parquet, filter_by_index
+from core.data import (
+    load_price_data_parquet,
+    load_index_returns_parquet,
+    filter_by_index,
+)
 from core.features import (
     add_absolute_returns,
     calculate_momentum_features,
@@ -19,9 +31,10 @@ from core.backtest import (
 # CONFIG
 # =====================================================
 
-ARTIFACTS = Path("artifacts")
+ARTIFACTS = ROOT / "artifacts"
 PRICE_PATH = ARTIFACTS / "index_constituents_5yr.parquet"
 INDEX_PATH = ARTIFACTS / "index_returns_5y.parquet"
+
 INDEX_NAME = "SP500"
 
 WINDOWS = (5, 10, 30, 45, 60, 90)
@@ -103,7 +116,7 @@ histB = simulate_single_bucket(
 histB.to_parquet(ARTIFACTS / "history_B.parquet", index=False)
 
 # =====================================================
-# BUCKET C — UNIFIED
+# BUCKET C
 # =====================================================
 
 histC, _ = simulate_unified_portfolio(
@@ -122,7 +135,4 @@ histC, _ = simulate_unified_portfolio(
 
 histC.to_parquet(ARTIFACTS / "history_C.parquet", index=False)
 
-print("✅ Backtest artifacts written:")
-print(" - history_A.parquet")
-print(" - history_B.parquet")
-print(" - history_C.parquet")
+print("✅ Backtest artifacts written")
