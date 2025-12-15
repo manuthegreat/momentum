@@ -57,6 +57,30 @@ def main():
     print("📥 Loading index returns...")
     idx = load_index_returns_parquet(INDEX_PATH)
 
+    print("Index returns columns (before normalization):", list(idx.columns))
+
+    # --------------------------------------------------------
+    # Normalize historical index returns schema
+    # (match live daily pipeline exactly)
+    # --------------------------------------------------------
+    
+    if "index" not in idx.columns:
+        if "Index" in idx.columns:
+            idx = idx.rename(columns={"Index": "index"})
+        elif "Ticker" in idx.columns:
+            idx = idx.rename(columns={"Ticker": "index"})
+        else:
+            raise ValueError(
+                f"Index returns parquet must contain an index identifier. "
+                f"Found columns: {list(idx.columns)}"
+            )
+    
+    if "date" not in idx.columns and "Date" in idx.columns:
+        idx = idx.rename(columns={"Date": "date"})
+    
+    print("Index returns columns (after normalization):", list(idx.columns))
+
+
     # ========================================================
     # BUCKET A — ABSOLUTE MOMENTUM
     # ========================================================
