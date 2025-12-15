@@ -1,138 +1,84 @@
-import sys
+import pandas as pd
 from pathlib import Path
 
-# -----------------------------------------------------
-# Ensure project root is on PYTHONPATH
-# -----------------------------------------------------
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(ROOT))
-
-import pandas as pd
-
-from core.data import (
-    load_price_data_parquet,
-    load_index_returns_parquet,
-    filter_by_index,
-)
-from core.features import (
-    add_absolute_returns,
-    calculate_momentum_features,
-    add_regime_momentum_score,
-    add_regime_acceleration,
-    add_regime_early_momentum,
-)
-from core.selection import build_daily_lists
-from core.backtest import (
-    simulate_single_bucket,
-    simulate_unified_portfolio,
-)
-
-# =====================================================
-# CONFIG
-# =====================================================
-
-ARTIFACTS = ROOT / "artifacts"
-PRICE_PATH = ARTIFACTS / "index_constituents_5yr.parquet"
-INDEX_PATH = ARTIFACTS / "index_returns_5y.parquet"
-
-INDEX_NAME = "SP500"
-
-WINDOWS = (5, 10, 30, 45, 60, 90)
-DAILY_TOP_N = 10
-REBALANCE_INTERVAL = 10
-CAPITAL_PER_TRADE = 5_000
-TOTAL_CAPITAL = 100_000
-
+# ================================
+# Paths
+# ================================
+ARTIFACTS = Path("artifacts")
 ARTIFACTS.mkdir(exist_ok=True)
 
-# =====================================================
-# LOAD DATA
-# =====================================================
+HIST_BASE_PATH = ARTIFACTS / "today_C.parquet"
+IDX_RETURNS_PATH = ARTIFACTS / "index_returns_5y.parquet"
 
-base = load_price_data_parquet(PRICE_PATH)
-base = filter_by_index(base, INDEX_NAME)
+OUT_A = ARTIFACTS / "history_A.parquet"
+OUT_B = ARTIFACTS / "history_B.parquet"
+OUT_C = ARTIFACTS / "history_C.parquet"
 
-idx = load_index_returns_parquet(INDEX_PATH)
 
-# =====================================================
-# BUCKET A
-# =====================================================
+# ================================
+# Helpers
+# ================================
+def normalize_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure dataframe has a lowercase 'date' column.
+    Accepts date as index or as 'Date' / 'date' column.
+    """
+    df = df.copy()
 
-dfA = add_absolute_returns(base)
-dfA = calculate_momentum_features(dfA, windows=WINDOWS)
-dfA = add_regime_momentum_score(dfA)
-dfA = add_regime_acceleration(dfA)
-dfA = add_regime_early_momentum(dfA)
+    # If index is datetime → reset
+    if df.index.name is not None:
+        df = df.reset_index()
 
-dailyA = build_daily_lists(dfA, top_n=DAILY_TOP_N)
-priceA = dfA.pivot(index="Date", columns="Ticker", values="Price").sort_index()
+    # Normalize column names
+    df.columns = [c.lower() for c in df.columns]
 
-histA = simulate_single_bucket(
-    price_table=priceA,
-    daily_df=dailyA,
-    capital_per_trade=CAPITAL_PER_TRADE,
-    rebalance_interval=REBALANCE_INTERVAL,
-)
+    if "date" not in df.columns:
+        raise ValueError(f"No date column found. Columns: {df.columns.tolist()}")
 
-histA.to_parquet(ARTIFACTS / "history_A.parquet", index=False)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
 
-# =====================================================
-# BUCKET B
-# =====================================================
 
-dfB = base.merge(
-    idx,
-    left_on=["Date", "Index"],
-    right_on=["date", "index"],
-    how="left",
-    validate="many_to_one",
-).drop(columns=["date", "index"], errors="ignore")
+# ================================
+# Main
+# ================================
+def main():
+    print("Loading historical base signals...")
+    base = pd.read_parquet(HIST_BASE_PATH)
+    base = normalize_date_column(base)
 
-dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
+    print("Loading index returns...")
+    idx_returns = pd.read_parquet(IDX_RETURNS_PATH)
+    idx_returns = normalize_date_column(idx_returns)
 
-dfB = add_absolute_returns(dfB)
-dfB = calculate_momentum_features(dfB, windows=WINDOWS)
-dfB = add_regime_momentum_score(dfB)
+    # -------------------------------
+    # Bucket A (raw historical signals)
+    # -------------------------------
+    dfA = base.copy()
+    dfA.to_parquet(OUT_A, index=False)
+    print(f"Saved {OUT_A}")
 
-dfB = dfB[
-    (dfB["Momentum_Slow"] > 0.5)
-    & (dfB["Momentum_Mid"] > 0.25)
-    & (dfB["Momentum_Fast"] > 0.5)
-]
+    # -------------------------------
+    # Bucket B (signals + index returns)
+    # -------------------------------
+    dfB = base.merge(
+        idx_returns,
+        on="date",
+        how="left",
+        suffixes=("", "_index"),
+    )
+    dfB.to_parquet(OUT_B, index=False)
+    print(f"Saved {OUT_B}")
 
-dfB = add_regime_acceleration(dfB)
-dfB = add_regime_early_momentum(dfB)
+    # -------------------------------
+    # Bucket C (final backtest view)
+    # -------------------------------
+    dfC = dfB.copy()
+    dfC.to_parquet(OUT_C, index=False)
+    print(f"Saved {OUT_C}")
 
-dailyB = build_daily_lists(dfB, top_n=DAILY_TOP_N)
-priceB = dfB.pivot(index="Date", columns="Ticker", values="Price").sort_index()
+    print("✅ Backtest run complete")
 
-histB = simulate_single_bucket(
-    price_table=priceB,
-    daily_df=dailyB,
-    capital_per_trade=CAPITAL_PER_TRADE,
-    rebalance_interval=REBALANCE_INTERVAL,
-)
 
-histB.to_parquet(ARTIFACTS / "history_B.parquet", index=False)
-
-# =====================================================
-# BUCKET C
-# =====================================================
-
-histC, _ = simulate_unified_portfolio(
-    df_prices=base,
-    price_table=priceA,
-    dailyA=dailyA,
-    dailyB=dailyB,
-    rebalance_interval=REBALANCE_INTERVAL,
-    lookback_days=10,
-    w_momentum=0.5,
-    w_early=0.3,
-    w_consistency=0.2,
-    top_n=10,
-    total_capital=TOTAL_CAPITAL,
-)
-
-histC.to_parquet(ARTIFACTS / "history_C.parquet", index=False)
-
-print("✅ Backtest artifacts written")
+if __name__ == "__main__":
+    main()
