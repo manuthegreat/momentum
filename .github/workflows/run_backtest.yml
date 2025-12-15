@@ -1,4 +1,4 @@
-name: Run Full Backtest
+name: Run Momentum Backtest
 
 on:
   workflow_dispatch:
@@ -26,12 +26,12 @@ jobs:
 
       - name: Run backtest
         run: |
-          python backtest/run_backtest.py
+          python updater/run_backtest.py
 
       - name: Commit backtest artifacts
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add artifacts/backtest/
+          git add artifacts/
           git commit -m "Backtest results update" || echo "No changes"
           git push
