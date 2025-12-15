@@ -18,6 +18,8 @@ TODAY_B = ARTIFACTS / "today_B.parquet"
 TODAY_C = ARTIFACTS / "today_C.parquet"
 
 HISTORY_A = ARTIFACTS / "history_A.parquet"
+HISTORY_B = ARTIFACTS / "history_B.parquet"
+HISTORY_C = ARTIFACTS / "history_C.parquet"
 
 # =====================================================
 # HELPERS
@@ -30,12 +32,22 @@ def load_parquet(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def format_percent(df: pd.DataFrame, cols):
-    for c in cols:
-        if c in df.columns:
-            df[c] = df[c].astype(float).round(2)
-    return df
+def perf_stats(hist: pd.DataFrame) -> dict:
+    if hist.empty or len(hist) < 2:
+        return {}
 
+    start = hist["Portfolio Value"].iloc[0]
+    end = hist["Portfolio Value"].iloc[-1]
+
+    ret = hist["Portfolio Value"].pct_change().dropna()
+
+    return {
+        "Start ($)": f"{start:,.0f}",
+        "End ($)": f"{end:,.0f}",
+        "Total Return (%)": f"{(end / start - 1) * 100:.2f}",
+        "Sharpe": f"{(ret.mean() / ret.std() * (252 ** 0.5)):.2f}" if ret.std() else "—",
+        "Max DD (%)": f"{((hist['Portfolio Value'] / hist['Portfolio Value'].cummax() - 1).min() * 100):.2f}",
+    }
 
 # =====================================================
 # LOAD DATA
@@ -46,6 +58,8 @@ todayB = load_parquet(TODAY_B)
 todayC = load_parquet(TODAY_C)
 
 historyA = load_parquet(HISTORY_A)
+historyB = load_parquet(HISTORY_B)
+historyC = load_parquet(HISTORY_C)
 
 # =====================================================
 # SIDEBAR
@@ -53,153 +67,77 @@ historyA = load_parquet(HISTORY_A)
 
 st.sidebar.title("Momentum Dashboard")
 
-view = st.sidebar.radio(
-    "Select View",
-    [
-        "📈 Overview",
-        "🅰️ Bucket A — Absolute Momentum",
-        "🅱️ Bucket B — Relative Momentum",
-        "🅲 Bucket C — Unified Portfolio",
-        "📊 Backtest Results",
-    ],
+section = st.sidebar.radio(
+    "View",
+    ["Overview", "Signals", "Backtests"],
 )
 
 # =====================================================
 # OVERVIEW
 # =====================================================
 
-if view == "📈 Overview":
+if section == "Overview":
 
-    st.title("📈 Momentum Strategy — Daily Overview")
+    st.title("Momentum Strategy — Overview")
 
-    col1, col2, col3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Bucket A", len(todayA))
+    c2.metric("Bucket B", len(todayB))
+    c3.metric("Bucket C", len(todayC))
 
-    with col1:
-        st.metric("Bucket A Names", len(todayA))
+    st.subheader("Unified Portfolio (Bucket C)")
+    st.dataframe(todayC, use_container_width=True)
 
-    with col2:
-        st.metric("Bucket B Names", len(todayB))
+# =====================================================
+# SIGNALS
+# =====================================================
 
-    with col3:
-        st.metric("Unified Portfolio Names", len(todayC))
+elif section == "Signals":
 
-    st.divider()
+    bucket = st.selectbox("Select Bucket", ["A", "B", "C"])
 
-    st.subheader("🅲 Today's Unified Portfolio (80 / 20 Allocation)")
-    if todayC.empty:
-        st.info("No signals generated today.")
+    st.subheader(f"Today's Signals — Bucket {bucket}")
+
+    if bucket == "A":
+        st.dataframe(todayA, use_container_width=True)
+    elif bucket == "B":
+        st.dataframe(todayB, use_container_width=True)
     else:
-        st.dataframe(
-            todayC.sort_values("Position_Size", ascending=False),
-            use_container_width=True,
-        )
+        st.dataframe(todayC, use_container_width=True)
 
 # =====================================================
-# BUCKET A
+# BACKTESTS
 # =====================================================
 
-elif view == "🅰️ Bucket A — Absolute Momentum":
+elif section == "Backtests":
 
-    st.title("🅰️ Bucket A — Absolute Momentum")
+    bucket = st.selectbox("Select Backtest", ["A", "B", "C"])
 
-    if todayA.empty:
-        st.warning("No signals available.")
+    if bucket == "A":
+        hist = historyA
+    elif bucket == "B":
+        hist = historyB
     else:
-        df = todayA.copy()
-        df = format_percent(
-            df,
-            ["Momentum_Score", "Early_Momentum_Score", "Consistency", "Weighted_Score"],
-        )
+        hist = historyC
 
-        st.dataframe(
-            df.sort_values("Weighted_Score", ascending=False),
-            use_container_width=True,
-        )
-
-# =====================================================
-# BUCKET B
-# =====================================================
-
-elif view == "🅱️ Bucket B — Relative Momentum":
-
-    st.title("🅱️ Bucket B — Relative Momentum")
-
-    if todayB.empty:
-        st.warning("No signals available.")
+    if hist.empty:
+        st.warning("Backtest not available.")
     else:
-        df = todayB.copy()
-        df = format_percent(
-            df,
-            ["Momentum_Score", "Early_Momentum_Score", "Consistency", "Weighted_Score"],
-        )
-
-        st.dataframe(
-            df.sort_values("Weighted_Score", ascending=False),
-            use_container_width=True,
-        )
-
-# =====================================================
-# BUCKET C
-# =====================================================
-
-elif view == "🅲 Bucket C — Unified Portfolio":
-
-    st.title("🅲 Bucket C — Unified Portfolio")
-
-    if todayC.empty:
-        st.warning("No unified portfolio available.")
-    else:
-        st.subheader("Target Allocations")
-
-        st.dataframe(
-            todayC.sort_values("Position_Size", ascending=False),
-            use_container_width=True,
-        )
-
-        total = todayC["Position_Size"].sum()
-        st.metric("Total Capital Allocated", f"${total:,.0f}")
-
-# =====================================================
-# BACKTEST
-# =====================================================
-
-elif view == "📊 Backtest Results":
-
-    st.title("📊 Backtest — Bucket A")
-
-    if historyA.empty or len(historyA) < 2:
-        st.warning("Backtest history not available.")
-    else:
-        hist = historyA.copy()
         hist["Date"] = pd.to_datetime(hist["Date"])
         hist = hist.sort_values("Date")
 
-        col1, col2, col3 = st.columns(3)
+        st.subheader(f"Bucket {bucket} — Performance")
 
-        start = hist["Portfolio Value"].iloc[0]
-        end = hist["Portfolio Value"].iloc[-1]
-        total_return = (end / start - 1) * 100
+        stats = perf_stats(hist)
+        cols = st.columns(len(stats))
+        for c, (k, v) in zip(cols, stats.items()):
+            c.metric(k, v)
 
-        col1.metric("Start Value", f"${start:,.0f}")
-        col2.metric("End Value", f"${end:,.0f}")
-        col3.metric("Total Return", f"{total_return:.2f}%")
-
-        st.divider()
-
-        st.subheader("Equity Curve")
-        st.line_chart(
-            hist.set_index("Date")["Portfolio Value"],
-            use_container_width=True,
-        )
-
-        st.subheader("Backtest Data")
+        st.line_chart(hist.set_index("Date")["Portfolio Value"], use_container_width=True)
         st.dataframe(hist, use_container_width=True)
 
 # =====================================================
 # FOOTER
 # =====================================================
 
-st.divider()
-st.caption(
-    "Momentum Strategy Dashboard • Deterministic pipeline • GitHub Actions powered"
-)
+st.caption("Momentum system • Deterministic • Artifact-driven • Production-grade")
