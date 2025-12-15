@@ -1,0 +1,31 @@
+name: Seed full backtest history (one-off)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  seed-history:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run historical seed
+        run: python updater/seed_backtest_history.py
+
+      - name: Commit artifacts
+        run: |
+          git config user.name "actions-user"
+          git config user.email "actions@github.com"
+          git add artifacts/backtest_signals.parquet
+          git commit -m "Seed full historical backtest" || echo "No changes"
+          git push
