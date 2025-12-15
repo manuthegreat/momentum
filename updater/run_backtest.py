@@ -1,23 +1,12 @@
-# updater/run_backtest.py
-
 from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from core.data_utils import (
-    load_price_data_parquet,
-)
+from core.data_utils import load_price_data_parquet
 from core.momentum_utils import (
-    calculate_momentum_features,
-    add_absolute_returns,
-    add_regime_momentum_score,
-    add_regime_acceleration,
-    add_regime_residual_momentum,
-    add_regime_early_momentum,
     build_daily_lists,
     final_selection_from_daily,
 )
-
 
 ART = Path("artifacts")
 ART.mkdir(exist_ok=True)
@@ -27,24 +16,38 @@ WEIGHT_A = 0.5
 WEIGHT_B = 0.5
 
 
-def compute_daily_returns(price_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Computes daily returns per ticker
-    """
-    df = price_df.sort_values(["Ticker", "Date"]).copy()
+def compute_daily_returns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(["Ticker", "Date"]).copy()
     df["Return"] = df.groupby("Ticker")["Price"].pct_change()
     return df.dropna(subset=["Return"])
 
 
-def backtest_bucket(
-    signals: pd.DataFrame,
-    returns: pd.DataFrame,
-    capital: float,
-) -> pd.DataFrame:
+def generate_signals_from_existing_logic(prices: pd.DataFrame) -> pd.DataFrame:
     """
-    Equal-weight daily rebalance backtest for one bucket
+    Uses EXISTING momentum_utils logic.
+    No new functions. No refactors.
     """
 
+    all_days = []
+
+    for dt, day_df in prices.groupby("Date"):
+        daily_lists = build_daily_lists(day_df)
+        final = final_selection_from_daily(daily_lists)
+
+        if final is None or final.empty:
+            continue
+
+        final = final.copy()
+        final["Date"] = dt
+        all_days.append(final)
+
+    if not all_days:
+        raise RuntimeError("No signals generated in backtest")
+
+    return pd.concat(all_days, ignore_index=True)
+
+
+def backtest_bucket(signals: pd.DataFrame, returns: pd.DataFrame, capital: float):
     df = (
         signals.merge(
             returns[["Date", "Ticker", "Return"]],
@@ -54,19 +57,15 @@ def backtest_bucket(
         .sort_values("Date")
     )
 
-    daily_returns = (
+    daily = (
         df.groupby("Date")["Return"]
         .mean()
         .rename("Portfolio_Return")
         .to_frame()
     )
 
-    daily_returns["Portfolio_Value"] = capital * (
-        1 + daily_returns["Portfolio_Return"]
-    ).cumprod()
-
-    daily_returns = daily_returns.reset_index()
-    return daily_returns
+    daily["Portfolio_Value"] = capital * (1 + daily["Portfolio_Return"]).cumprod()
+    return daily.reset_index()
 
 
 def main():
@@ -74,45 +73,33 @@ def main():
     print("Loading price data...")
     prices = load_price_data_parquet(ART / "index_constituents_5yr.parquet")
 
-    prices = prices.rename(columns={"Close": "Price"}) if "Close" in prices else prices
-    assert "Price" in prices.columns, "Price column missing"
+    if "Close" in prices.columns and "Price" not in prices.columns:
+        prices["Price"] = prices["Close"]
 
+    assert {"Date", "Ticker", "Price"}.issubset(prices.columns)
+
+    print("Computing returns...")
     returns = compute_daily_returns(prices)
 
-    print("Generating daily signals...")
-    signals = generate_daily_signals(prices)
+    print("Generating signals using EXISTING logic...")
+    signals = generate_signals_from_existing_logic(prices)
 
     bucketA = signals[signals["Bucket"] == "A"]
     bucketB = signals[signals["Bucket"] == "B"]
 
-    print("Running backtest for Bucket A...")
-    histA = backtest_bucket(
-        bucketA,
-        returns,
-        capital=INITIAL_CAPITAL * WEIGHT_A,
-    )
+    print("Backtesting Bucket A...")
+    histA = backtest_bucket(bucketA, returns, INITIAL_CAPITAL * WEIGHT_A)
 
-    print("Running backtest for Bucket B...")
-    histB = backtest_bucket(
-        bucketB,
-        returns,
-        capital=INITIAL_CAPITAL * WEIGHT_B,
-    )
+    print("Backtesting Bucket B...")
+    histB = backtest_bucket(bucketB, returns, INITIAL_CAPITAL * WEIGHT_B)
 
-    print("Combining Bucket C (A + B)...")
+    print("Combining Bucket C...")
     histC = (
-        histA[["Date", "Portfolio_Value"]]
-        .merge(
-            histB[["Date", "Portfolio_Value"]],
-            on="Date",
-            suffixes=("_A", "_B"),
-        )
+        histA.merge(histB, on="Date", suffixes=("_A", "_B"))
     )
-
     histC["Portfolio_Value"] = (
         histC["Portfolio_Value_A"] + histC["Portfolio_Value_B"]
     )
-
     histC = histC[["Date", "Portfolio_Value"]]
 
     print("Saving artifacts...")
@@ -120,7 +107,7 @@ def main():
     histB.to_parquet(ART / "history_B.parquet", index=False)
     histC.to_parquet(ART / "history_C.parquet", index=False)
 
-    print("Backtest complete.")
+    print("✅ Backtest complete.")
 
 
 if __name__ == "__main__":
