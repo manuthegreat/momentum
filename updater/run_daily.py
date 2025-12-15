@@ -3,7 +3,7 @@ import json
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from core.data_utils import load_price_data_parquet
+from core.data_utils import load_price_data_parquet, load_index_returns_parquet
 
 
 # ---- IMPORT YOUR EXISTING FUNCTIONS ----
