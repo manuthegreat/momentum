@@ -58,28 +58,43 @@ def main():
     idx = pd.read_parquet(INDEX_PATH)
 
     print("Index returns columns (before normalization):", list(idx.columns))
-
+    
     # --------------------------------------------------------
     # Normalize historical index returns schema
     # (match live daily pipeline exactly)
     # --------------------------------------------------------
     
+    rename_map = {}
+    
+    # Date
+    if "date" not in idx.columns and "Date" in idx.columns:
+        rename_map["Date"] = "date"
+    
+    # Index identifier
     if "index" not in idx.columns:
-        if "Index" in idx.columns:
-            idx = idx.rename(columns={"Index": "index"})
-        elif "Ticker" in idx.columns:
-            idx = idx.rename(columns={"Ticker": "index"})
+        if "index_name" in idx.columns:
+            rename_map["index_name"] = "index"
+        elif "Index" in idx.columns:
+            rename_map["Index"] = "index"
+        elif "ticker" in idx.columns:
+            rename_map["ticker"] = "index"
         else:
             raise ValueError(
-                f"Index returns parquet must contain an index identifier. "
-                f"Found columns: {list(idx.columns)}"
+                f"Cannot infer index column. Found columns: {list(idx.columns)}"
             )
     
-    if "date" not in idx.columns and "Date" in idx.columns:
-        idx = idx.rename(columns={"Date": "date"})
+    # 1D return (required downstream)
+    if "idx_ret_1d" not in idx.columns:
+        if "ret_1d" in idx.columns:
+            rename_map["ret_1d"] = "idx_ret_1d"
+        else:
+            raise ValueError(
+                "Index returns parquet must contain ret_1d or idx_ret_1d"
+            )
+    
+    idx = idx.rename(columns=rename_map)
     
     print("Index returns columns (after normalization):", list(idx.columns))
-
 
     # ========================================================
     # BUCKET A — ABSOLUTE MOMENTUM
