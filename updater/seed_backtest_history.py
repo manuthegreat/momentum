@@ -173,7 +173,7 @@ def main():
 
     history = pd.concat(records, ignore_index=True)
     history = history.sort_values(
-        ["Date", "Position_Size"],
+        ["Date", "Capital"],
         ascending=[True, False],
     )
 
