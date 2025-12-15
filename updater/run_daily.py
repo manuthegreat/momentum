@@ -2,12 +2,12 @@ import pandas as pd
 from pathlib import Path
 from datetime import date
 
-from momentum.core.data_utils import (
+from core.data_utils import (
     load_price_data_parquet,
     filter_by_index,
 )
 
-from momentum.core.momentum_utils import (
+from core.momentum_utils import (
     compute_absolute_momentum,
     compute_relative_momentum,
 )
