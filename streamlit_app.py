@@ -39,21 +39,19 @@ def load_json(path: Path):
 
 def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Final, defensive Bucket C cleaner
+    Final robust Bucket C cleaner:
     - One row per ticker
     - Sum Position_Size
-    - Max of all score columns
-    - Never errors if columns are missing
+    - Max of score columns
+    - Zero assumptions about schema
     """
     if df.empty or "Ticker" not in df.columns:
         return pd.DataFrame()
 
-    g = df.groupby("Ticker", as_index=False)
-
-    out = pd.DataFrame({"Ticker": g["Ticker"].first()})
+    agg = {}
 
     if "Position_Size" in df.columns:
-        out["Position_Size"] = g["Position_Size"].sum()
+        agg["Position_Size"] = "sum"
 
     score_cols = [
         "Weighted_Score",
@@ -64,9 +62,17 @@ def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in score_cols:
         if col in df.columns:
-            out[col] = g[col].max()
+            agg[col] = "max"
 
-    # Sort by capital if available, else by score, else ticker
+    if not agg:
+        return df[["Ticker"]].drop_duplicates().reset_index(drop=True)
+
+    out = (
+        df.groupby("Ticker", as_index=False)
+        .agg(agg)
+    )
+
+    # Sort intelligently
     sort_col = (
         "Position_Size"
         if "Position_Size" in out.columns
@@ -75,7 +81,11 @@ def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
         else "Ticker"
     )
 
-    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    return (
+        out
+        .sort_values(sort_col, ascending=False)
+        .reset_index(drop=True)
+    )
 
 # ============================================================
 # LOAD DATA
