@@ -55,3 +55,71 @@ def compute_performance_stats(history_df):
              history_df["Portfolio Value"].cummax() - 1).min() * 100
         )
     }
+
+def simulate_unified_portfolio(
+    df_prices,
+    price_table,
+    dailyA,
+    dailyB,
+    rebalance_interval=10,
+    lookback_days=10,
+    w_momentum=0.5,
+    w_early=0.3,
+    w_consistency=0.2,
+    top_n=10,
+    total_capital=100_000,
+):
+    """
+    Unified backtest: recompute combined portfolio at each rebalance date
+    """
+
+    dates = sorted(price_table.index.unique())
+    rebalance_dates = dates[::rebalance_interval]
+
+    equity = []
+    capital = total_capital
+
+    for i in range(1, len(rebalance_dates)):
+        prev = rebalance_dates[i - 1]
+        curr = rebalance_dates[i]
+
+        target = build_unified_target(
+            dailyA=dailyA,
+            dailyB=dailyB,
+            as_of_date=prev,
+            lookback_days=lookback_days,
+            w_momentum=w_momentum,
+            w_early=w_early,
+            w_consistency=w_consistency,
+            top_n=top_n,
+            total_capital=capital,
+        )
+
+        pnl = 0.0
+
+        for _, row in target.iterrows():
+            t = row["Ticker"]
+            alloc = row["Capital"]
+
+            if t not in price_table.columns:
+                continue
+
+            p0 = price_table.loc[prev, t]
+            p1 = price_table.loc[curr, t]
+
+            if pd.isna(p0) or pd.isna(p1):
+                continue
+
+            pnl += alloc * (p1 / p0 - 1)
+
+        capital += pnl
+
+        equity.append(
+            {
+                "Date": curr,
+                "Equity": capital,
+                "PnL": pnl,
+            }
+        )
+
+    return pd.DataFrame(equity), target
