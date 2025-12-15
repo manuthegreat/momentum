@@ -1,83 +1,54 @@
+# updater/run_backtest.py
+
 import pandas as pd
 from pathlib import Path
 
-# ================================
-# Paths
-# ================================
-ARTIFACTS = Path("artifacts")
-ARTIFACTS.mkdir(exist_ok=True)
+ARTIFACTS_DIR = Path("artifacts")
 
-HIST_BASE_PATH = ARTIFACTS / "today_C.parquet"
-IDX_RETURNS_PATH = ARTIFACTS / "index_returns_5y.parquet"
-
-OUT_A = ARTIFACTS / "history_A.parquet"
-OUT_B = ARTIFACTS / "history_B.parquet"
-OUT_C = ARTIFACTS / "history_C.parquet"
+BASE_SIGNALS_FILE = ARTIFACTS_DIR / "today_C.parquet"
+OUTPUT_FILE = ARTIFACTS_DIR / "backtest_signals.parquet"
 
 
-# ================================
-# Helpers
-# ================================
 def normalize_date_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure dataframe has a lowercase 'date' column.
-    Accepts date as index or as 'Date' / 'date' column.
+    Normalize date column.
+    Accepts: date, Date, asof
+    Outputs: date (datetime64)
     """
     df = df.copy()
 
-    # If index is datetime → reset
-    if df.index.name is not None:
-        df = df.reset_index()
-
-    # Normalize column names
-    df.columns = [c.lower() for c in df.columns]
-
-    if "date" not in df.columns:
+    if "date" in df.columns:
+        col = "date"
+    elif "Date" in df.columns:
+        col = "Date"
+    elif "asof" in df.columns:
+        col = "asof"
+    else:
         raise ValueError(f"No date column found. Columns: {df.columns.tolist()}")
 
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    df["date"] = pd.to_datetime(df[col])
+    return df.drop(columns=[c for c in ["Date", "asof"] if c in df.columns])
 
 
-# ================================
-# Main
-# ================================
 def main():
     print("Loading historical base signals...")
-    base = pd.read_parquet(HIST_BASE_PATH)
+
+    base = pd.read_parquet(BASE_SIGNALS_FILE)
     base = normalize_date_column(base)
 
-    print("Loading index returns...")
-    idx_returns = pd.read_parquet(IDX_RETURNS_PATH)
-    idx_returns = normalize_date_column(idx_returns)
+    # Sort for backtest usage
+    base = base.sort_values(["date", "ticker"])
 
-    # -------------------------------
-    # Bucket A (raw historical signals)
-    # -------------------------------
-    dfA = base.copy()
-    dfA.to_parquet(OUT_A, index=False)
-    print(f"Saved {OUT_A}")
+    ARTIFACTS_DIR.mkdir(exist_ok=True)
 
-    # -------------------------------
-    # Bucket B (signals + index returns)
-    # -------------------------------
-    dfB = base.merge(
-        idx_returns,
-        on="date",
-        how="left",
-        suffixes=("", "_index"),
+    base.to_parquet(OUTPUT_FILE, index=False)
+
+    print(f"Saved backtest signals → {OUTPUT_FILE}")
+    print(
+        f"Rows: {len(base)} | "
+        f"From {base['date'].min().date()} "
+        f"To {base['date'].max().date()}"
     )
-    dfB.to_parquet(OUT_B, index=False)
-    print(f"Saved {OUT_B}")
-
-    # -------------------------------
-    # Bucket C (final backtest view)
-    # -------------------------------
-    dfC = dfB.copy()
-    dfC.to_parquet(OUT_C, index=False)
-    print(f"Saved {OUT_C}")
-
-    print("✅ Backtest run complete")
 
 
 if __name__ == "__main__":
