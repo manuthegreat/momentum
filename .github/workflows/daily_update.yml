@@ -1,46 +1,37 @@
-name: Daily Momentum Update
+name: Daily artifacts update
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "30 23 * * 1-5"   # Weekdays after US close
+    - cron: "30 22 * * 1-5"   # Weekdays
+  workflow_dispatch:
 
 jobs:
-  run:
+  daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Set PYTHONPATH
-        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
-
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run daily momentum update
+      - name: Run daily pipeline
         run: |
           python updater/run_daily.py
 
-      - name: Seed daily output (fallback only)
-        if: failure()
-        run: |
-          python updater/seed_today.py
-
       - name: Commit artifacts
         run: |
-          git config user.name "github-actions"
+          git config user.name "actions-user"
           git config user.email "actions@github.com"
-          mkdir -p artifacts
-          git add artifacts/
-          git commit -m "Daily artifacts update" || echo "No changes to commit"
+          git add artifacts/*.parquet
+          git commit -m "Daily artifacts update" || echo "No changes"
           git push
