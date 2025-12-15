@@ -7,10 +7,17 @@ import numpy as np
 from core.data_utils import (
     load_price_data_parquet,
 )
-
 from core.momentum_utils import (
-    generate_daily_signals,   # <-- your existing signal function
+    calculate_momentum_features,
+    add_absolute_returns,
+    add_regime_momentum_score,
+    add_regime_acceleration,
+    add_regime_residual_momentum,
+    add_regime_early_momentum,
+    build_daily_lists,
+    final_selection_from_daily,
 )
+
 
 ART = Path("artifacts")
 ART.mkdir(exist_ok=True)
