@@ -1,83 +1,55 @@
+# updater/run_daily.py
+
 import pandas as pd
 from pathlib import Path
 
-# ================================
-# Paths
-# ================================
-ARTIFACTS = Path("artifacts")
-ARTIFACTS.mkdir(exist_ok=True)
-
-TODAY_PATH = ARTIFACTS / "today_C.parquet"
-IDX_RETURNS_PATH = ARTIFACTS / "index_returns_5y.parquet"
-
-OUT_A = ARTIFACTS / "today_A.parquet"
-OUT_B = ARTIFACTS / "today_B.parquet"
-OUT_C = ARTIFACTS / "today_C.parquet"
+ARTIFACTS_DIR = Path("artifacts")
+OUTPUT_FILE = ARTIFACTS_DIR / "daily_signals.parquet"
+BASE_SIGNALS_FILE = ARTIFACTS_DIR / "today_C.parquet"
 
 
-# ================================
-# Helpers
-# ================================
 def normalize_date_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure dataframe has a lowercase 'date' column.
-    Accepts date as index or as 'Date' / 'date' column.
+    Normalize date column.
+    Accepts: date, Date, asof
+    Outputs: date (datetime64)
     """
     df = df.copy()
 
-    # If index is datetime → reset
-    if df.index.name is not None:
-        df = df.reset_index()
-
-    # Normalize column names
-    df.columns = [c.lower() for c in df.columns]
-
-    if "date" not in df.columns:
+    if "date" in df.columns:
+        col = "date"
+    elif "Date" in df.columns:
+        col = "Date"
+    elif "asof" in df.columns:
+        col = "asof"
+    else:
         raise ValueError(f"No date column found. Columns: {df.columns.tolist()}")
 
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    df["date"] = pd.to_datetime(df[col])
+    return df.drop(columns=[c for c in ["Date", "asof"] if c in df.columns])
 
 
-# ================================
-# Main
-# ================================
 def main():
     print("Loading daily base signals (Bucket C)...")
-    base = pd.read_parquet(TODAY_PATH)
+
+    base = pd.read_parquet(BASE_SIGNALS_FILE)
     base = normalize_date_column(base)
 
-    print("Loading index returns...")
-    idx_returns = pd.read_parquet(IDX_RETURNS_PATH)
-    idx_returns = normalize_date_column(idx_returns)
+    # Enforce schema consistency
+    base = base.rename(columns={
+        "ticker": "ticker",
+        "count": "count",
+        "position_size": "position_size",
+        "action": "action",
+    })
 
-    # -------------------------------
-    # Bucket A (raw signals)
-    # -------------------------------
-    dfA = base.copy()
-    dfA.to_parquet(OUT_A, index=False)
-    print(f"Saved {OUT_A}")
+    base = base.sort_values(["date", "ticker"])
 
-    # -------------------------------
-    # Bucket B (signals + index returns)
-    # -------------------------------
-    dfB = base.merge(
-        idx_returns,
-        on="date",
-        how="left",
-        suffixes=("", "_index"),
-    )
-    dfB.to_parquet(OUT_B, index=False)
-    print(f"Saved {OUT_B}")
+    ARTIFACTS_DIR.mkdir(exist_ok=True)
 
-    # -------------------------------
-    # Bucket C (final = same as base for now)
-    # -------------------------------
-    dfC = base.copy()
-    dfC.to_parquet(OUT_C, index=False)
-    print(f"Saved {OUT_C}")
-
-    print("✅ Daily run complete")
+    base.to_parquet(OUTPUT_FILE, index=False)
+    print(f"Saved daily signals → {OUTPUT_FILE}")
+    print(f"Rows: {len(base)} | Date: {base['date'].max().date()}")
 
 
 if __name__ == "__main__":
