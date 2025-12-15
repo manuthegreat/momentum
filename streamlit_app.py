@@ -1,143 +1,160 @@
-import streamlit as st
+import json
 import pandas as pd
+import streamlit as st
 from pathlib import Path
 
-# =====================================================
+# ============================================================
 # CONFIG
-# =====================================================
-
-st.set_page_config(
-    page_title="Momentum Strategy Dashboard",
-    layout="wide",
-)
+# ============================================================
 
 ARTIFACTS = Path("artifacts")
 
-TODAY_A = ARTIFACTS / "today_A.parquet"
-TODAY_B = ARTIFACTS / "today_B.parquet"
-TODAY_C = ARTIFACTS / "today_C.parquet"
+SIGNALS_PATH = ARTIFACTS / "backtest_signals.parquet"
 
-HISTORY_A = ARTIFACTS / "history_A.parquet"
-HISTORY_B = ARTIFACTS / "history_B.parquet"
-HISTORY_C = ARTIFACTS / "history_C.parquet"
+EQUITY_PATH = ARTIFACTS / "backtest_equity_C.parquet"
+TRADES_PATH = ARTIFACTS / "backtest_trades_C.parquet"
+STATS_PATH  = ARTIFACTS / "backtest_stats_C.json"
 
-# =====================================================
+st.set_page_config(
+    page_title="Momentum Dashboard",
+    layout="wide"
+)
+
+# ============================================================
 # HELPERS
-# =====================================================
+# ============================================================
 
 @st.cache_data
-def load_parquet(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
+def load_parquet(path):
     return pd.read_parquet(path)
 
+@st.cache_data
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
 
-def perf_stats(hist: pd.DataFrame) -> dict:
-    if hist.empty or len(hist) < 2:
-        return {}
-
-    start = hist["Portfolio Value"].iloc[0]
-    end = hist["Portfolio Value"].iloc[-1]
-
-    ret = hist["Portfolio Value"].pct_change().dropna()
-
-    return {
-        "Start ($)": f"{start:,.0f}",
-        "End ($)": f"{end:,.0f}",
-        "Total Return (%)": f"{(end / start - 1) * 100:.2f}",
-        "Sharpe": f"{(ret.mean() / ret.std() * (252 ** 0.5)):.2f}" if ret.std() else "—",
-        "Max DD (%)": f"{((hist['Portfolio Value'] / hist['Portfolio Value'].cummax() - 1).min() * 100):.2f}",
-    }
-
-# =====================================================
-# LOAD DATA
-# =====================================================
-
-todayA = load_parquet(TODAY_A)
-todayB = load_parquet(TODAY_B)
-todayC = load_parquet(TODAY_C)
-
-historyA = load_parquet(HISTORY_A)
-historyB = load_parquet(HISTORY_B)
-historyC = load_parquet(HISTORY_C)
-
-# =====================================================
+# ============================================================
 # SIDEBAR
-# =====================================================
+# ============================================================
 
 st.sidebar.title("Momentum Dashboard")
 
-section = st.sidebar.radio(
+view = st.sidebar.radio(
     "View",
-    ["Overview", "Signals", "Backtests"],
+    ["Overview", "Signals", "Backtests"]
 )
 
-# =====================================================
-# OVERVIEW
-# =====================================================
+bucket = st.sidebar.selectbox(
+    "Select Bucket",
+    ["A", "B", "C"]
+)
 
-if section == "Overview":
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+signals = load_parquet(SIGNALS_PATH)
+
+# ============================================================
+# OVERVIEW
+# ============================================================
+
+if view == "Overview":
 
     st.title("Momentum Strategy — Overview")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Bucket A", len(todayA))
-    c2.metric("Bucket B", len(todayB))
-    c3.metric("Bucket C", len(todayC))
+    latest_date = signals["Date"].max()
+    today = signals[signals["Date"] == latest_date]
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Bucket A", len(today[today["Bucket"] == "A"]))
+    col2.metric("Bucket B", len(today[today["Bucket"] == "B"]))
+    col3.metric("Bucket C", len(today[today["Bucket"] == "C"]))
 
     st.subheader("Unified Portfolio (Bucket C)")
-    st.dataframe(todayC, use_container_width=True)
 
-# =====================================================
+    st.dataframe(
+        today[today["Bucket"] == "C"]
+        .sort_values("Position_Size", ascending=False)
+        .reset_index(drop=True)
+    )
+
+# ============================================================
 # SIGNALS
-# =====================================================
+# ============================================================
 
-elif section == "Signals":
+elif view == "Signals":
 
-    bucket = st.selectbox("Select Bucket", ["A", "B", "C"])
+    st.title(f"Today's Signals — Bucket {bucket}")
 
-    st.subheader(f"Today's Signals — Bucket {bucket}")
+    latest_date = signals["Date"].max()
 
-    if bucket == "A":
-        st.dataframe(todayA, use_container_width=True)
-    elif bucket == "B":
-        st.dataframe(todayB, use_container_width=True)
+    df = (
+        signals[
+            (signals["Bucket"] == bucket) &
+            (signals["Date"] == latest_date)
+        ]
+        .sort_values("Position_Size", ascending=False)
+    )
+
+    if df.empty:
+        st.warning("No signals available.")
     else:
-        st.dataframe(todayC, use_container_width=True)
+        st.dataframe(df.reset_index(drop=True))
 
-# =====================================================
+# ============================================================
 # BACKTESTS
-# =====================================================
+# ============================================================
 
-elif section == "Backtests":
+elif view == "Backtests":
 
-    bucket = st.selectbox("Select Backtest", ["A", "B", "C"])
+    st.title("Backtests — Bucket C")
 
-    if bucket == "A":
-        hist = historyA
-    elif bucket == "B":
-        hist = historyB
-    else:
-        hist = historyC
-
-    if hist.empty:
+    if not EQUITY_PATH.exists():
         st.warning("Backtest not available.")
-    else:
-        hist["Date"] = pd.to_datetime(hist["Date"])
-        hist = hist.sort_values("Date")
+        st.stop()
 
-        st.subheader(f"Bucket {bucket} — Performance")
+    equity = load_parquet(EQUITY_PATH)
+    trades = load_parquet(TRADES_PATH)
+    stats  = load_json(STATS_PATH)
 
-        stats = perf_stats(hist)
-        cols = st.columns(len(stats))
-        for c, (k, v) in zip(cols, stats.items()):
-            c.metric(k, v)
+    # --------------------------------------------------------
+    # PERFORMANCE METRICS
+    # --------------------------------------------------------
 
-        st.line_chart(hist.set_index("Date")["Portfolio Value"], use_container_width=True)
-        st.dataframe(hist, use_container_width=True)
+    c1, c2, c3, c4 = st.columns(4)
 
-# =====================================================
+    c1.metric("Total Return (%)", round(stats.get("Total Return (%)", 0), 2))
+    c2.metric("CAGR (%)", round(stats.get("CAGR (%)", 0), 2))
+    c3.metric("Sharpe", round(stats.get("Sharpe Ratio", 0), 2))
+    c4.metric("Max Drawdown (%)", round(stats.get("Max Drawdown (%)", 0), 2))
+
+    # --------------------------------------------------------
+    # EQUITY CURVE
+    # --------------------------------------------------------
+
+    st.subheader("Equity Curve")
+
+    st.line_chart(
+        equity.set_index("Date")["Equity"]
+    )
+
+    # --------------------------------------------------------
+    # TRADES
+    # --------------------------------------------------------
+
+    st.subheader("Trade Blotter")
+
+    st.dataframe(
+        trades.sort_values("Date", ascending=False)
+        .reset_index(drop=True)
+    )
+
+# ============================================================
 # FOOTER
-# =====================================================
+# ============================================================
 
-st.caption("Momentum system • Deterministic • Artifact-driven • Production-grade")
+st.caption(
+    "Momentum system • Deterministic • Artifact-driven • Production-grade"
+)
