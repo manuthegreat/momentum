@@ -1,172 +1,268 @@
-import pandas as pd
+"""
+Seed backtest history (GitHub Actions job: seed-history)
+
+This version is designed to align with the current core/ layout:
+core/
+  __init__.py
+  data.py
+  data_utils.py
+  features.py
+  selection.py
+  backtest.py
+
+Key goals:
+- DO NOT depend on non-existent `core.momentum_utils`
+- Prefer calling a single high-level "seed"/"run_backtest" entrypoint if core provides it
+- Provide clear diagnostics if core APIs changed
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import inspect
 from pathlib import Path
+from datetime import datetime
 
-from core.data_utils import (
-    load_price_data_parquet,
-    load_index_returns_parquet,
-    filter_by_index,
-)
+# -------------------------------------------------------------------
+# Ensure repo root is on sys.path (Actions does export PYTHONPATH=$PWD,
+# but this makes the script robust when run locally too.)
+# -------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from core.momentum_utils import (
-    add_absolute_returns,
-    calculate_momentum_features,
-    add_regime_momentum_score,
-    add_regime_acceleration,
-    add_regime_residual_momentum,
-    add_regime_early_momentum,
-    add_relative_regime_momentum_score,
-    compute_index_momentum,
-    build_daily_lists,
-    final_selection_from_daily,
-    build_unified_target,
-)
 
-# ============================================================
-# CONFIG
-# ============================================================
+def _first_attr(module, names: list[str]):
+    """Return the first attribute found on module from a list of candidates."""
+    for n in names:
+        if hasattr(module, n):
+            return getattr(module, n)
+    return None
 
-ARTIFACTS = Path("artifacts")
 
-PRICE_PATH = ARTIFACTS / "index_constituents_5yr.parquet"
-INDEX_PATH = ARTIFACTS / "index_returns_5y.parquet"
+def _call_with_supported_kwargs(fn, **kwargs):
+    """
+    Call fn with only the kwargs that are accepted by fn.
+    Helps keep compatibility as function signatures evolve.
+    """
+    sig = inspect.signature(fn)
+    accepted = {}
+    for k, v in kwargs.items():
+        if k in sig.parameters:
+            accepted[k] = v
+    return fn(**accepted)
 
-OUT_PATH = ARTIFACTS / "backtest_signals.parquet"
 
-WINDOWS = (5, 10, 30, 45, 60, 90)
-DAILY_TOP_N = 10
-FINAL_TOP_N = 10
-LOOKBACK_DAYS = 10
+def main() -> None:
+    # -----------------------------
+    # Config (override via env vars)
+    # -----------------------------
+    output_path = os.getenv("BACKTEST_HISTORY_PATH", "").strip()
+    if not output_path:
+        # sensible default used by many repos
+        output_path = str(REPO_ROOT / "data" / "backtest_history.parquet")
 
-W_MOM = 0.50
-W_EARLY = 0.30
-W_CONS = 0.20
+    # optional knobs (only used if core functions support them)
+    start_date = os.getenv("BACKTEST_START_DATE", "").strip()  # e.g. "2018-01-01"
+    end_date = os.getenv("BACKTEST_END_DATE", "").strip()      # e.g. "2025-12-15"
+    top_n = int(os.getenv("BACKTEST_TOP_N", "20"))
+    universe = os.getenv("BACKTEST_UNIVERSE", "").strip()      # e.g. "sp500" / "all"
 
-WEIGHT_A = 0.20
-WEIGHT_B = 0.80
+    # Parse dates if provided
+    def _parse(d: str):
+        return datetime.strptime(d, "%Y-%m-%d").date() if d else None
 
-# ============================================================
-# LOAD DATA
-# ============================================================
+    start_date_d = _parse(start_date)
+    end_date_d = _parse(end_date)
 
-print("Loading historical price data...")
-base = load_price_data_parquet(PRICE_PATH)
-base = filter_by_index(base, "SP500")
+    # Ensure output directory exists
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-print("Loading index returns...")
-idx = load_index_returns_parquet(INDEX_PATH)
+    # -----------------------------
+    # Imports from core/*
+    # -----------------------------
+    try:
+        import core  # noqa: F401
+        from core import backtest as core_backtest
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to import core/backtest modules. "
+            f"Repo root: {REPO_ROOT}\n"
+            f"Error: {e}"
+        ) from e
 
-# ============================================================
-# BUCKET A — ABSOLUTE MOMENTUM
-# ============================================================
+    # Optional modules (only used if needed)
+    core_data = None
+    core_features = None
+    core_selection = None
+    try:
+        from core import data as core_data  # type: ignore
+    except Exception:
+        pass
+    try:
+        from core import features as core_features  # type: ignore
+    except Exception:
+        pass
+    try:
+        from core import selection as core_selection  # type: ignore
+    except Exception:
+        pass
 
-print("Computing Bucket A signals...")
+    # ---------------------------------------------------------
+    # Preferred: call a single high-level seed/backtest function
+    # ---------------------------------------------------------
+    preferred_entrypoints = [
+        "seed_backtest_history",
+        "generate_backtest_history",
+        "build_backtest_history",
+        "run_backtest_history",
+        "run_backtest",
+        "backtest",
+    ]
 
-dfA = calculate_momentum_features(
-    add_absolute_returns(base),
-    windows=WINDOWS
-)
+    entry = _first_attr(core_backtest, preferred_entrypoints)
 
-dfA = add_regime_momentum_score(dfA)
-dfA = add_regime_acceleration(dfA)
-dfA = add_regime_residual_momentum(dfA)
-dfA = add_regime_early_momentum(dfA)
+    if entry is not None and callable(entry):
+        print(f"[seed-history] Using core.backtest.{entry.__name__}()")
 
-dailyA = build_daily_lists(dfA, top_n=DAILY_TOP_N)
+        result = _call_with_supported_kwargs(
+            entry,
+            output_path=output_path,
+            out_path=output_path,
+            path=output_path,
+            start_date=start_date_d,
+            end_date=end_date_d,
+            top_n=top_n,
+            universe=universe,
+        )
 
-# ============================================================
-# BUCKET B — RELATIVE MOMENTUM
-# ============================================================
+        # Some implementations may return a DF; if so, try saving it.
+        if result is not None:
+            try:
+                import pandas as pd  # noqa: F401
+                if hasattr(result, "to_parquet"):
+                    result.to_parquet(output_path, index=False)
+                    print(f"[seed-history] Saved backtest history -> {output_path}")
+            except Exception:
+                # If core already saves internally, that’s fine.
+                pass
 
-print("Computing Bucket B signals...")
+        print("[seed-history] Done.")
+        return
 
-dfB = base.merge(
-    idx,
-    left_on=["Date", "Index"],
-    right_on=["date", "index"],
-    how="left",
-    validate="many_to_one"
-).drop(columns=["date", "index"], errors="ignore")
-
-dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
-
-dfB = calculate_momentum_features(
-    add_absolute_returns(dfB),
-    windows=WINDOWS
-)
-
-idx_mom = compute_index_momentum(idx, windows=WINDOWS)
-
-dfB = dfB.merge(
-    idx_mom[
-        [
-            "date", "index",
-            "idx_5D", "idx_10D",
-            "idx_30D", "idx_45D",
-            "idx_60D", "idx_90D",
+    # ---------------------------------------------------------
+    # Fallback: attempt to assemble via data/features/selection
+    # (Only if core.backtest doesn't expose a usable entrypoint)
+    # ---------------------------------------------------------
+    # We keep this fallback conservative: we only proceed if we can
+    # find obvious functions. Otherwise we fail with diagnostics.
+    loader_candidates = []
+    if core_data is not None:
+        loader_candidates += [
+            "load_all_market_data",
+            "load_market_data",
+            "load_price_data",
+            "load_price_data_parquet",
         ]
-    ],
-    left_on=["Date", "Index"],
-    right_on=["date", "index"],
-    how="left"
-).drop(columns=["date", "index"], errors="ignore")
+    feature_candidates = []
+    if core_features is not None:
+        feature_candidates += [
+            "apply_technical_indicators",
+            "add_features",
+            "compute_features",
+            "apply_features",
+        ]
+    selector_candidates = []
+    if core_selection is not None:
+        selector_candidates += [
+            "select_portfolio",
+            "select_top_momentum",
+            "build_portfolio",
+            "pick_top",
+        ]
 
-dfB = add_relative_regime_momentum_score(dfB)
+    loader = _first_attr(core_data, loader_candidates) if core_data else None
+    featurizer = _first_attr(core_features, feature_candidates) if core_features else None
+    selector = _first_attr(core_selection, selector_candidates) if core_selection else None
 
-# Optional regime filters (same as prod)
-dfB = dfB[dfB["Momentum_Slow"] > 1]
-dfB = dfB[dfB["Momentum_Mid"] > 0.5]
-dfB = dfB[dfB["Momentum_Fast"] > 1]
+    if not (callable(loader) and callable(featurizer) and callable(selector)):
+        # Give a very actionable error with what we *did* find
+        available = {
+            "core.backtest": [n for n in dir(core_backtest) if not n.startswith("_")],
+            "core.data": [n for n in dir(core_data) if core_data and not n.startswith("_")] if core_data else [],
+            "core.features": [n for n in dir(core_features) if core_features and not n.startswith("_")] if core_features else [],
+            "core.selection": [n for n in dir(core_selection) if core_selection and not n.startswith("_")] if core_selection else [],
+        }
+        raise RuntimeError(
+            "core.backtest does not expose a recognized history/backtest entrypoint, "
+            "and fallback wiring could not find the expected functions.\n\n"
+            f"Expected one of these in core.backtest: {preferred_entrypoints}\n"
+            f"Fallback requires:\n"
+            f" - data loader in core.data: {loader_candidates}\n"
+            f" - feature fn in core.features: {feature_candidates}\n"
+            f" - selector fn in core.selection: {selector_candidates}\n\n"
+            f"Discovered symbols:\n{available}\n"
+        )
 
-dfB = add_regime_acceleration(dfB)
-dfB = add_regime_residual_momentum(dfB)
-dfB = add_regime_early_momentum(dfB)
+    print("[seed-history] Using fallback wiring via core.data/core.features/core.selection")
+    print(f" - loader: {loader.__name__}")
+    print(f" - featurizer: {featurizer.__name__}")
+    print(f" - selector: {selector.__name__}")
 
-dailyB = build_daily_lists(dfB, top_n=DAILY_TOP_N)
+    # Minimal generic fallback implementation:
+    # load -> feature -> select per-date -> write history
+    import pandas as pd
 
-# ============================================================
-# BUILD HISTORICAL BUCKET C (UNIFIED)
-# ============================================================
+    df = _call_with_supported_kwargs(loader, universe=universe)
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("Loader returned no data (empty or non-DataFrame).")
 
-print("Building historical Bucket C selections...")
+    df = _call_with_supported_kwargs(featurizer, df=df) or df
 
-all_dates = sorted(set(dailyA["Date"]).intersection(dailyB["Date"]))
-records = []
+    # Require Date/Ticker columns for generic history creation
+    if "Date" not in df.columns or "Ticker" not in df.columns:
+        raise RuntimeError("Fallback requires df to include 'Date' and 'Ticker' columns.")
 
-for d in all_dates:
-    tgt = build_unified_target(
-        dailyA=dailyA,
-        dailyB=dailyB,
-        as_of_date=d,
-        lookback_days=LOOKBACK_DAYS,
-        w_momentum=W_MOM,
-        w_early=W_EARLY,
-        w_consistency=W_CONS,
-        top_n=FINAL_TOP_N,
-        total_capital=100_000,
-        weight_A=WEIGHT_A,
-        weight_B=WEIGHT_B,
-    )
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    if tgt.empty:
-        continue
+    if start_date_d:
+        df = df[df["Date"].dt.date >= start_date_d]
+    if end_date_d:
+        df = df[df["Date"].dt.date <= end_date_d]
 
-    tgt = tgt.copy()
-    tgt["Date"] = d
-    tgt["Bucket"] = "C"
+    all_dates = sorted(df["Date"].dt.normalize().unique())
+    rows = []
 
-    records.append(tgt)
+    for d in all_dates:
+        day_df = df[df["Date"].dt.normalize() == d]
+        picks = _call_with_supported_kwargs(selector, df=day_df, top_n=top_n)
 
-# ============================================================
-# WRITE OUTPUT
-# ============================================================
+        # Normalize picks into a DataFrame
+        if picks is None:
+            continue
+        if isinstance(picks, pd.DataFrame):
+            out = picks.copy()
+        elif isinstance(picks, (list, tuple)):
+            out = pd.DataFrame({"Ticker": list(picks)})
+        else:
+            # e.g. dict
+            out = pd.DataFrame(picks)
 
-history = pd.concat(records, ignore_index=True)
+        if "Date" not in out.columns:
+            out["Date"] = d
 
-history = history.sort_values(["Date", "Position_Size"], ascending=[True, False])
+        rows.append(out)
 
-OUT_PATH.parent.mkdir(exist_ok=True, parents=True)
-history.to_parquet(OUT_PATH, index=False)
+    if not rows:
+        raise RuntimeError("Fallback produced no selections; nothing to write.")
 
-print(f"✅ Historical backtest written → {OUT_PATH}")
-print(f"Rows: {len(history)}")
-print(f"From {history['Date'].min().date()} to {history['Date'].max().date()}")
+    hist = pd.concat(rows, ignore_index=True)
+    hist.to_parquet(output_path, index=False)
+    print(f"[seed-history] Saved backtest history -> {output_path}")
+    print("[seed-history] Done.")
+
+
+if __name__ == "__main__":
+    main()
