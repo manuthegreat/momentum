@@ -39,33 +39,50 @@ def load_json(path: Path):
 
 def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
     """
-    One row per ticker:
+    Robust Bucket C cleaner:
+    - One row per ticker
     - Sum Position_Size
-    - Max scores
+    - Max of score columns
+    - Safe against missing / null columns
     """
-    if df.empty:
+    if df.empty or "Ticker" not in df.columns:
         return df
 
-    agg = {}
+    out = df[["Ticker"]].drop_duplicates().set_index("Ticker")
 
+    # Position size
     if "Position_Size" in df.columns:
-        agg["Position_Size"] = "sum"
+        out["Position_Size"] = (
+            df.groupby("Ticker")["Position_Size"]
+            .sum(min_count=1)
+        )
 
-    for col in [
+    # Score columns
+    score_cols = [
         "Weighted_Score",
         "Momentum Score",
         "Early Momentum Score",
         "Consistency",
-    ]:
-        if col in df.columns:
-            agg[col] = "max"
+    ]
 
-    return (
-        df.groupby("Ticker", as_index=False)
-        .agg(agg)
-        .sort_values("Position_Size", ascending=False)
+    for col in score_cols:
+        if col in df.columns:
+            out[col] = (
+                df.groupby("Ticker")[col]
+                .max()
+            )
+
+    out = (
+        out
+        .reset_index()
+        .sort_values(
+            "Position_Size" if "Position_Size" in out.columns else "Ticker",
+            ascending=False
+        )
         .reset_index(drop=True)
     )
+
+    return out
 
 # ============================================================
 # LOAD DATA
