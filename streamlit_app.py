@@ -25,13 +25,13 @@ STATS_PATH   = ARTIFACTS / "backtest_stats_C.json"
 # ============================================================
 
 @st.cache_data
-def load_parquet(path: Path) -> pd.DataFrame:
+def load_parquet(path: Path):
     if not path.exists():
         return pd.DataFrame()
     return pd.read_parquet(path)
 
 @st.cache_data
-def load_json(path: Path) -> dict:
+def load_json(path: Path):
     if not path.exists():
         return {}
     with open(path) as f:
@@ -39,35 +39,22 @@ def load_json(path: Path) -> dict:
 
 def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Robust Bucket C cleaner:
+    Final, defensive Bucket C cleaner
     - One row per ticker
-    - Sum position size (Position_Size OR Capital)
-    - Max of available score columns
-    - Schema-safe
+    - Sum Position_Size
+    - Max of all score columns
+    - Never errors if columns are missing
     """
     if df.empty or "Ticker" not in df.columns:
         return pd.DataFrame()
 
-    out = df[["Ticker"]].drop_duplicates().set_index("Ticker")
+    g = df.groupby("Ticker", as_index=False)
 
-    # --------------------------------------------------
-    # Position sizing (auto-detect)
-    # --------------------------------------------------
-    pos_col = None
+    out = pd.DataFrame({"Ticker": g["Ticker"].first()})
+
     if "Position_Size" in df.columns:
-        pos_col = "Position_Size"
-    elif "Capital" in df.columns:
-        pos_col = "Capital"
+        out["Position_Size"] = g["Position_Size"].sum()
 
-    if pos_col:
-        out["Position_Size"] = (
-            df.groupby("Ticker")[pos_col]
-            .sum(min_count=1)
-        )
-
-    # --------------------------------------------------
-    # Scores (max across duplicates)
-    # --------------------------------------------------
     score_cols = [
         "Weighted_Score",
         "Momentum Score",
@@ -77,18 +64,18 @@ def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in score_cols:
         if col in df.columns:
-            out[col] = df.groupby("Ticker")[col].max()
+            out[col] = g[col].max()
 
-    out = (
-        out.reset_index()
-        .sort_values(
-            "Position_Size" if "Position_Size" in out.columns else "Ticker",
-            ascending=False
-        )
-        .reset_index(drop=True)
+    # Sort by capital if available, else by score, else ticker
+    sort_col = (
+        "Position_Size"
+        if "Position_Size" in out.columns
+        else "Weighted_Score"
+        if "Weighted_Score" in out.columns
+        else "Ticker"
     )
 
-    return out
+    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
 # ============================================================
 # LOAD DATA
@@ -105,14 +92,14 @@ st.title("📈 Momentum Strategy Dashboard")
 # PERFORMANCE SUMMARY
 # ============================================================
 
-st.subheader("Performance Summary — Bucket C")
+st.subheader("Performance Summary (Bucket C)")
 
 if stats:
     cols = st.columns(len(stats))
     for col, (k, v) in zip(cols, stats.items()):
         col.metric(k, round(v, 2) if isinstance(v, (int, float)) else v)
 else:
-    st.info("No performance statistics available")
+    st.info("No performance stats available")
 
 # ============================================================
 # EQUITY CURVE
@@ -124,8 +111,10 @@ if not equity.empty and "Date" in equity.columns:
     equity = equity.sort_values("Date")
 
     value_col = (
-        "Equity" if "Equity" in equity.columns
-        else "Portfolio Value" if "Portfolio Value" in equity.columns
+        "Equity"
+        if "Equity" in equity.columns
+        else "Portfolio Value"
+        if "Portfolio Value" in equity.columns
         else None
     )
 
@@ -135,7 +124,7 @@ if not equity.empty and "Date" in equity.columns:
             width="stretch"
         )
     else:
-        st.info("No equity value column found in backtest output")
+        st.info("No equity value column found")
 else:
     st.info("Equity data not available")
 
@@ -150,7 +139,7 @@ if signals.empty or "Date" not in signals.columns:
 else:
     latest_date = signals["Date"].max()
     today = signals[
-        (signals.get("Bucket") == "C") &
+        (signals["Bucket"] == "C") &
         (signals["Date"] == latest_date)
     ]
 
@@ -159,28 +148,25 @@ else:
     else:
         clean_c = clean_bucket_c(today)
 
-        if clean_c.empty:
-            st.warning("Bucket C data found, but no position or score columns available.")
-            st.dataframe(today)
-        else:
-            display_cols = [
-                "Ticker",
-                "Position_Size",
-                "Weighted_Score",
-                "Momentum Score",
-                "Early Momentum Score",
-                "Consistency",
-            ]
+        # Display only columns that exist
+        preferred_cols = [
+            "Ticker",
+            "Position_Size",
+            "Weighted_Score",
+            "Momentum Score",
+            "Early Momentum Score",
+            "Consistency",
+        ]
 
-            safe_cols = [c for c in display_cols if c in clean_c.columns]
+        display_cols = [c for c in preferred_cols if c in clean_c.columns]
 
-            st.dataframe(
-                clean_c[safe_cols],
-                width="stretch"
-            )
+        st.dataframe(
+            clean_c[display_cols],
+            width="stretch"
+        )
 
 # ============================================================
-# ARTIFACTS EXPLORER
+# ARTIFACTS EXPLORER (MEANINGFUL RAW VIEW)
 # ============================================================
 
 st.subheader("📦 Artifacts Explorer")
