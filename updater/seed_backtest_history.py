@@ -27,7 +27,7 @@ from core.selection import (
 ARTIFACTS = Path("artifacts")
 
 PRICE_PATH = ARTIFACTS / "index_constituents_5yr.parquet"
-INDEX_PATH = ARTIFACTS / "index_returns_5yr.parquet"
+INDEX_PATH = ARTIFACTS / "index_returns_5y.parquet"
 OUT_PATH = ARTIFACTS / "backtest_signals.parquet"
 
 WINDOWS = (5, 10, 30, 45, 60, 90)
