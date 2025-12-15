@@ -4,29 +4,32 @@ import pandas as pd
 from pathlib import Path
 
 ARTIFACTS_DIR = Path("artifacts")
-OUTPUT_FILE = ARTIFACTS_DIR / "daily_signals.parquet"
+ARTIFACTS_DIR.mkdir(exist_ok=True)
+
 BASE_SIGNALS_FILE = ARTIFACTS_DIR / "today_C.parquet"
+OUTPUT_FILE = ARTIFACTS_DIR / "daily_signals.parquet"
 
 
 def normalize_date_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize date column.
-    Accepts: date, Date, asof
+    Accepts: Date / date / AsOf / asof
     Outputs: date (datetime64)
     """
     df = df.copy()
 
+    # 🔑 normalize column names FIRST
+    df.columns = [c.lower() for c in df.columns]
+
     if "date" in df.columns:
         col = "date"
-    elif "Date" in df.columns:
-        col = "Date"
     elif "asof" in df.columns:
         col = "asof"
     else:
         raise ValueError(f"No date column found. Columns: {df.columns.tolist()}")
 
     df["date"] = pd.to_datetime(df[col])
-    return df.drop(columns=[c for c in ["Date", "asof"] if c in df.columns])
+    return df.drop(columns=[c for c in ["asof"] if c in df.columns])
 
 
 def main():
@@ -35,20 +38,11 @@ def main():
     base = pd.read_parquet(BASE_SIGNALS_FILE)
     base = normalize_date_column(base)
 
-    # Enforce schema consistency
-    base = base.rename(columns={
-        "ticker": "ticker",
-        "count": "count",
-        "position_size": "position_size",
-        "action": "action",
-    })
-
     base = base.sort_values(["date", "ticker"])
 
-    ARTIFACTS_DIR.mkdir(exist_ok=True)
-
     base.to_parquet(OUTPUT_FILE, index=False)
-    print(f"Saved daily signals → {OUTPUT_FILE}")
+
+    print(f"✅ Daily signals written → {OUTPUT_FILE}")
     print(f"Rows: {len(base)} | Date: {base['date'].max().date()}")
 
 
