@@ -1,17 +1,15 @@
-# streamlit_app.py
-
 import json
-from pathlib import Path
-
+import numpy as np
 import pandas as pd
 import streamlit as st
+from pathlib import Path
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="Momentum Strategy Dashboard",
+    page_title="Momentum Dashboard",
     layout="wide",
 )
 
@@ -26,25 +24,50 @@ STATS_PATH   = ARTIFACTS / "backtest_stats_C.json"
 # HELPERS
 # ============================================================
 
+@st.cache_data
 def load_parquet(path: Path):
     if not path.exists():
-        st.warning(f"Missing artifact: {path.name}")
         return pd.DataFrame()
     return pd.read_parquet(path)
 
+@st.cache_data
 def load_json(path: Path):
     if not path.exists():
-        st.warning(f"Missing artifact: {path.name}")
         return {}
     with open(path) as f:
         return json.load(f)
 
-# ============================================================
-# HEADER
-# ============================================================
+def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per ticker:
+    - Sum Position_Size
+    - Take MAX score values
+    """
+    if df.empty:
+        return df
 
-st.title("📈 Momentum Strategy Dashboard")
-st.caption("Artifact-driven • Deterministic • Production-grade")
+    score_cols = [
+        "Momentum_Score",
+        "Early_Momentum_Score",
+        "Consistency",
+        "Weighted_Score",
+    ]
+
+    agg = {
+        "Position_Size": "sum",
+        "Date": "max",
+    }
+
+    for c in score_cols:
+        if c in df.columns:
+            agg[c] = "max"
+
+    return (
+        df.groupby("Ticker", as_index=False)
+        .agg(agg)
+        .sort_values("Position_Size", ascending=False)
+        .reset_index(drop=True)
+    )
 
 # ============================================================
 # LOAD DATA
@@ -55,94 +78,140 @@ equity  = load_parquet(EQUITY_PATH)
 trades  = load_parquet(TRADES_PATH)
 stats   = load_json(STATS_PATH)
 
-# Normalize equity column
-if not equity.empty and "Portfolio Value" in equity.columns:
-    equity = equity.rename(columns={"Portfolio Value": "Equity"})
+st.title("📈 Momentum Strategy Dashboard")
 
 # ============================================================
-# TODAY'S SIGNALS
+# PERFORMANCE SUMMARY
 # ============================================================
 
-st.header("🟢 Today’s Signals")
+st.subheader("Performance Summary (Bucket C)")
+
+if stats:
+    cols = st.columns(len(stats))
+    for col, (k, v) in zip(cols, stats.items()):
+        col.metric(k, round(v, 2) if isinstance(v, (int, float)) else v)
+else:
+    st.info("No performance stats available")
+
+# ============================================================
+# EQUITY CURVE
+# ============================================================
+
+st.subheader("Equity Curve")
+
+if not equity.empty and "Equity" in equity.columns:
+    equity = equity.sort_values("Date")
+    st.line_chart(
+        equity.set_index("Date")["Equity"],
+        width="stretch"
+    )
+else:
+    st.info("Equity data not available")
+
+# ============================================================
+# ROLLING PERFORMANCE
+# ============================================================
+
+st.subheader("Rolling Returns")
+
+if not equity.empty and "Equity" in equity.columns:
+    eq = equity.sort_values("Date").copy()
+    eq["Return"] = eq["Equity"].pct_change()
+
+    roll_20 = (1 + eq["Return"]).rolling(20).apply(np.prod, raw=True) - 1
+    roll_60 = (1 + eq["Return"]).rolling(60).apply(np.prod, raw=True) - 1
+
+    st.line_chart(
+        pd.DataFrame({
+            "20D Rolling Return": roll_20,
+            "60D Rolling Return": roll_60,
+        }).dropna(),
+        width="stretch"
+    )
+else:
+    st.info("Not enough equity history for rolling returns")
+
+# ============================================================
+# DRAWDOWNS
+# ============================================================
+
+st.subheader("Drawdowns")
+
+if not equity.empty and "Equity" in equity.columns:
+    roll_max = equity["Equity"].cummax()
+    drawdown = equity["Equity"] / roll_max - 1
+
+    st.area_chart(
+        drawdown,
+        width="stretch"
+    )
+else:
+    st.info("Drawdown data unavailable")
+
+# ============================================================
+# CURRENT PORTFOLIO — BUCKET C
+# ============================================================
+
+st.subheader("Current Portfolio — Bucket C")
 
 if signals.empty:
-    st.info("No signals available")
+    st.info("No signal data available")
 else:
     latest_date = signals["Date"].max()
-    today = signals[signals["Date"] == latest_date]
+    today = signals[
+        (signals["Bucket"] == "C") &
+        (signals["Date"] == latest_date)
+    ]
 
-    st.caption(f"As of {latest_date.date()}")
+    if today.empty:
+        st.info("No Bucket C positions for latest date")
+    else:
+        clean_c = clean_bucket_c(today)
+        st.dataframe(clean_c, width="stretch")
 
-    bucket = st.selectbox(
-        "Select Bucket",
-        sorted(today["Bucket"].unique())
-    )
-
-    df = today[today["Bucket"] == bucket].copy()
-
-    if "Position_Size" in df.columns:
-        df = df.sort_values("Position_Size", ascending=False)
-
-    st.dataframe(
-        df.reset_index(drop=True),
-        width="stretch",
-    )
-
-# ============================================================
-# BACKTEST RESULTS
-# ============================================================
-
-st.header("📊 Backtest Results — Bucket C")
-
-if equity.empty:
-    st.info("No backtest equity available")
-else:
-    col1, col2 = st.columns([3, 1])
-
-    with col1:
-        st.subheader("Equity Curve")
-        st.line_chart(
-            equity.set_index("Date")["Equity"]
-        )
-
-    with col2:
-        st.subheader("Performance Summary")
-        if stats:
-            stats_df = pd.DataFrame(
-                stats.items(),
-                columns=["Metric", "Value"]
+        # Signal strength visualization
+        if "Weighted_Score" in clean_c.columns:
+            st.subheader("Signal Strength (Weighted Score)")
+            st.bar_chart(
+                clean_c.set_index("Ticker")["Weighted_Score"],
+                width="stretch"
             )
-            st.dataframe(stats_df, hide_index=True, width="stretch")
-        else:
-            st.info("No performance stats available")
 
 # ============================================================
-# TRADES / TARGET ALLOCATIONS
+# TRADE ANALYTICS
 # ============================================================
 
-st.header("🧾 Latest Portfolio Allocation (Bucket C)")
+st.subheader("Trade Diagnostics")
 
 if trades.empty:
-    st.info("No trades / allocations available")
+    st.info("No trades available")
 else:
-    df = trades.copy()
+    if "Date" in trades.columns:
+        trades = trades.sort_values("Date", ascending=False)
 
-    # Smart ordering
-    if "Capital" in df.columns:
-        df = df.sort_values("Capital", ascending=False)
-    elif "Weight" in df.columns:
-        df = df.sort_values("Weight", ascending=False)
+    sells = trades[trades.get("Action") == "Sell"] if "Action" in trades.columns else pd.DataFrame()
 
-    st.dataframe(
-        df.reset_index(drop=True),
-        width="stretch",
-    )
+    if not sells.empty and "PnL" in sells.columns:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Closed Trades", len(sells))
+        col2.metric("Win Rate (%)", round((sells["PnL"] > 0).mean() * 100, 1))
+        col3.metric("Avg PnL ($)", round(sells["PnL"].mean(), 2))
+
+        st.dataframe(
+            sells.sort_values("PnL", ascending=False),
+            width="stretch"
+        )
+    else:
+        st.dataframe(trades, width="stretch")
 
 # ============================================================
-# FOOTER
+# RAW ARTIFACTS (DEBUG)
 # ============================================================
 
-st.caption(
-    "Absolute + Relative momentum • Regime aware • "
-    "Persistence weighted • Unified portfolio construction"
-)
+with st.expander("🔍 Raw Artifacts"):
+    st.write("Signals")
+    st.dataframe(signals.head(20))
+    st.write("Equity")
+    st.dataframe(equity.head(20))
+    st.write("Trades")
+    st.dataframe(trades.head(20))
