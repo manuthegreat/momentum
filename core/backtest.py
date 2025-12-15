@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-
+from core.selection import build_unified_target
 
 def get_last_price(price_table, ticker, date):
     try:
