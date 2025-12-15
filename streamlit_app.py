@@ -26,13 +26,13 @@ STATS_PATH   = ARTIFACTS / "backtest_stats_C.json"
 # HELPERS
 # ============================================================
 
-def load_parquet(path: Path, label: str) -> pd.DataFrame:
+def load_parquet(path: Path):
     if not path.exists():
         st.warning(f"Missing artifact: {path.name}")
         return pd.DataFrame()
     return pd.read_parquet(path)
 
-def load_json(path: Path, label: str) -> dict:
+def load_json(path: Path):
     if not path.exists():
         st.warning(f"Missing artifact: {path.name}")
         return {}
@@ -44,18 +44,18 @@ def load_json(path: Path, label: str) -> dict:
 # ============================================================
 
 st.title("📈 Momentum Strategy Dashboard")
-st.caption("Deterministic • Artifact-driven • Production-grade")
+st.caption("Artifact-driven • Deterministic • Production-grade")
 
 # ============================================================
 # LOAD DATA
 # ============================================================
 
-signals = load_parquet(SIGNALS_PATH, "Signals")
-equity  = load_parquet(EQUITY_PATH, "Equity")
-trades  = load_parquet(TRADES_PATH, "Trades")
-stats   = load_json(STATS_PATH, "Stats")
+signals = load_parquet(SIGNALS_PATH)
+equity  = load_parquet(EQUITY_PATH)
+trades  = load_parquet(TRADES_PATH)
+stats   = load_json(STATS_PATH)
 
-# Normalize equity column for UI
+# Normalize equity column
 if not equity.empty and "Portfolio Value" in equity.columns:
     equity = equity.rename(columns={"Portfolio Value": "Equity"})
 
@@ -69,29 +69,27 @@ if signals.empty:
     st.info("No signals available")
 else:
     latest_date = signals["Date"].max()
-    today = signals[signals["Date"] == latest_date].copy()
+    today = signals[signals["Date"] == latest_date]
 
     st.caption(f"As of {latest_date.date()}")
 
-    # Bucket selector
     bucket = st.selectbox(
         "Select Bucket",
         sorted(today["Bucket"].unique())
     )
 
-    df = today[today["Bucket"] == bucket]
+    df = today[today["Bucket"] == bucket].copy()
 
-    # Safe sort
     if "Position_Size" in df.columns:
         df = df.sort_values("Position_Size", ascending=False)
 
     st.dataframe(
         df.reset_index(drop=True),
-        use_container_width=True
+        width="stretch",
     )
 
 # ============================================================
-# BACKTEST RESULTS — BUCKET C
+# BACKTEST RESULTS
 # ============================================================
 
 st.header("📊 Backtest Results — Bucket C")
@@ -108,28 +106,36 @@ else:
         )
 
     with col2:
-        st.subheader("Summary Stats")
+        st.subheader("Performance Summary")
         if stats:
-            stats_df = (
-                pd.DataFrame(stats.items(), columns=["Metric", "Value"])
-                .sort_values("Metric")
+            stats_df = pd.DataFrame(
+                stats.items(),
+                columns=["Metric", "Value"]
             )
-            st.dataframe(stats_df, hide_index=True)
+            st.dataframe(stats_df, hide_index=True, width="stretch")
         else:
             st.info("No performance stats available")
 
 # ============================================================
-# TRADES
+# TRADES / TARGET ALLOCATIONS
 # ============================================================
 
-st.header("🧾 Trade History")
+st.header("🧾 Latest Portfolio Allocation (Bucket C)")
 
 if trades.empty:
-    st.info("No trades available")
+    st.info("No trades / allocations available")
 else:
+    df = trades.copy()
+
+    # Smart ordering
+    if "Capital" in df.columns:
+        df = df.sort_values("Capital", ascending=False)
+    elif "Weight" in df.columns:
+        df = df.sort_values("Weight", ascending=False)
+
     st.dataframe(
-        trades.sort_values("Date", ascending=False),
-        use_container_width=True
+        df.reset_index(drop=True),
+        width="stretch",
     )
 
 # ============================================================
@@ -137,6 +143,6 @@ else:
 # ============================================================
 
 st.caption(
-    "Momentum system • Absolute + Relative regimes • "
-    "Persistence-scored • Unified portfolio construction"
+    "Absolute + Relative momentum • Regime aware • "
+    "Persistence weighted • Unified portfolio construction"
 )
