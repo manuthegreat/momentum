@@ -4,23 +4,30 @@ from pathlib import Path
 def load_price_data_parquet(path: str | Path) -> pd.DataFrame:
     df = pd.read_parquet(path)
 
-    # Normalize date
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"])
+    required = {"Ticker", "Date"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-    # 🔑 Normalize price column ONCE
+    df["Date"] = pd.to_datetime(df["Date"])
+
     if "Price" not in df.columns:
         if "Adj Close" in df.columns:
             df["Price"] = df["Adj Close"]
         elif "Close" in df.columns:
             df["Price"] = df["Close"]
         else:
-            raise ValueError(
-                "No Price / Adj Close / Close column found in parquet"
-            )
+            raise ValueError("No Price / Adj Close / Close column found")
 
-    df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    return df
+    if "Index" not in df.columns:
+        raise ValueError("Index column required for momentum pipeline")
+
+    return (
+        df[["Ticker", "Date", "Price", "Index"]]
+        .drop_duplicates(["Ticker", "Date"])
+        .sort_values(["Ticker", "Date"])
+        .reset_index(drop=True)
+    )
 
 def load_index_returns_parquet(path: str) -> pd.DataFrame:
     """
