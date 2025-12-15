@@ -6,7 +6,7 @@ from pathlib import Path
 st.set_page_config(page_title="Momentum — Bucket C", layout="wide")
 
 @st.cache_data
-def load_artifacts():
+def load_today():
     df = pd.read_parquet("artifacts/today_C.parquet")
     meta_path = Path("artifacts/metadata.json")
     meta = {}
@@ -16,12 +16,17 @@ def load_artifacts():
 
 st.title("Momentum Strategy — Bucket C")
 
-df, meta = load_artifacts()
+try:
+    df, meta = load_today()
 
-if meta:
-    st.caption(f"As of: {meta.get('as_of', '-')}")
-    w = meta.get("weights", {})
-    if w:
-        st.caption(f"Weights: A={w.get('A', '-')}, B={w.get('B', '-')}")
+    if meta:
+        st.caption(f"As of: {meta.get('as_of', '-')}")
+        w = meta.get("weights", {})
+        if w:
+            st.caption(f"Weights — A: {w.get('A')}, B: {w.get('B')}")
 
-st.dataframe(df, use_container_width=True)
+    st.dataframe(df, use_container_width=True)
+
+except Exception as e:
+    st.warning("No daily output yet. Waiting for first automated run.")
+    st.code(str(e))
