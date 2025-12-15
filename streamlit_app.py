@@ -1,5 +1,4 @@
 import json
-import numpy as np
 import pandas as pd
 import streamlit as st
 from pathlib import Path
@@ -21,72 +20,27 @@ TRADES_PATH  = ARTIFACTS / "backtest_trades_C.parquet"
 STATS_PATH   = ARTIFACTS / "backtest_stats_C.json"
 
 # ============================================================
-# HELPERS
+# LOADERS (SAFE)
 # ============================================================
 
 @st.cache_data
 def load_parquet(path: Path):
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
+    try:
+        if path.exists():
+            return pd.read_parquet(path)
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 @st.cache_data
 def load_json(path: Path):
-    if not path.exists():
-        return {}
-    with open(path) as f:
-        return json.load(f)
-
-def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ultra-robust Bucket C cleaner.
-
-    Guarantees:
-    - Never raises KeyError
-    - One row per Ticker
-    - Sums Position_Size *if present*
-    - Max of score columns *if present*
-    """
-
-    if df.empty or "Ticker" not in df.columns:
-        return pd.DataFrame()
-
-    # Start with unique tickers
-    out = pd.DataFrame({"Ticker": df["Ticker"].unique()})
-
-    # Optional: Position size
-    if "Position_Size" in df.columns:
-        pos = (
-            df.groupby("Ticker", dropna=False)["Position_Size"]
-            .sum(min_count=1)
-            .reset_index()
-        )
-        out = out.merge(pos, on="Ticker", how="left")
-    else:
-        out["Position_Size"] = np.nan
-
-    # Optional score columns
-    score_cols = [
-        "Weighted_Score",
-        "Momentum Score",
-        "Early Momentum Score",
-        "Consistency",
-    ]
-
-    for col in score_cols:
-        if col in df.columns:
-            tmp = (
-                df.groupby("Ticker", dropna=False)[col]
-                .max()
-                .reset_index()
-            )
-            out = out.merge(tmp, on="Ticker", how="left")
-
-    # Final ordering
-    sort_col = "Position_Size" if "Position_Size" in out.columns else "Ticker"
-    out = out.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-    return out
+    try:
+        if path.exists():
+            with open(path) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
 
 # ============================================================
 # LOAD DATA
@@ -121,13 +75,11 @@ st.subheader("Equity Curve")
 if not equity.empty and "Date" in equity.columns:
     equity = equity.sort_values("Date")
 
-    value_col = (
-        "Equity"
-        if "Equity" in equity.columns
-        else "Portfolio Value"
-        if "Portfolio Value" in equity.columns
-        else None
-    )
+    value_col = None
+    if "Equity" in equity.columns:
+        value_col = "Equity"
+    elif "Portfolio Value" in equity.columns:
+        value_col = "Portfolio Value"
 
     if value_col:
         st.line_chart(
@@ -135,49 +87,36 @@ if not equity.empty and "Date" in equity.columns:
             width="stretch"
         )
     else:
-        st.info("No equity value column found")
+        st.info("Equity value column not found")
 else:
     st.info("Equity data not available")
 
 # ============================================================
-# CURRENT PORTFOLIO — BUCKET C
+# CURRENT PORTFOLIO — BUCKET C (RAW, ALL 20 ROWS)
 # ============================================================
 
-st.subheader("Current Portfolio — Bucket C")
+st.subheader("Current Portfolio — Bucket C (Raw)")
 
 if signals.empty or "Date" not in signals.columns:
     st.info("No signal data available")
 else:
     latest_date = signals["Date"].max()
+
     today = signals[
-        (signals["Bucket"] == "C") &
+        (signals.get("Bucket") == "C") &
         (signals["Date"] == latest_date)
     ]
 
     if today.empty:
-        st.info("No Bucket C positions for latest date")
+        st.info("No Bucket C rows for latest date")
     else:
-        clean_c = clean_bucket_c(today)
-
-        # Display only columns that exist
-        preferred_cols = [
-            "Ticker",
-            "Position_Size",
-            "Weighted_Score",
-            "Momentum Score",
-            "Early Momentum Score",
-            "Consistency",
-        ]
-
-        display_cols = [c for c in preferred_cols if c in clean_c.columns]
-
         st.dataframe(
-            clean_c[display_cols],
+            today.reset_index(drop=True),
             width="stretch"
         )
 
 # ============================================================
-# ARTIFACTS EXPLORER (MEANINGFUL RAW VIEW)
+# ARTIFACTS EXPLORER (RAW & HONEST)
 # ============================================================
 
 st.subheader("📦 Artifacts Explorer")
@@ -188,9 +127,11 @@ with tab1:
     if signals.empty:
         st.info("No signals available")
     else:
-        sort_cols = [c for c in ["Date", "Weighted_Score"] if c in signals.columns]
         st.dataframe(
-            signals.sort_values(sort_cols, ascending=False),
+            signals.sort_values(
+                "Date" if "Date" in signals.columns else signals.columns[0],
+                ascending=False
+            ),
             width="stretch"
         )
 
@@ -199,7 +140,10 @@ with tab2:
         st.info("No equity data available")
     else:
         st.dataframe(
-            equity.sort_values("Date", ascending=False),
+            equity.sort_values(
+                "Date" if "Date" in equity.columns else equity.columns[0],
+                ascending=False
+            ),
             width="stretch"
         )
 
@@ -207,6 +151,10 @@ with tab3:
     if trades.empty:
         st.info("No trades available")
     else:
-        if "Date" in trades.columns:
-            trades = trades.sort_values("Date", ascending=False)
-        st.dataframe(trades, width="stretch")
+        st.dataframe(
+            trades.sort_values(
+                "Date" if "Date" in trades.columns else trades.columns[0],
+                ascending=False
+            ),
+            width="stretch"
+        )
