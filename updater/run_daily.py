@@ -1,7 +1,11 @@
-import pandas as pd
 from pathlib import Path
+import pandas as pd
 
-from core.data import load_price_data_parquet, load_index_returns_parquet, filter_by_index
+from core.data import (
+    load_price_data_parquet,
+    load_index_returns_parquet,
+    filter_by_index,
+)
 from core.features import (
     add_absolute_returns,
     calculate_momentum_features,
@@ -39,6 +43,8 @@ TOTAL_CAPITAL = 100_000
 WEIGHT_A = 0.20
 WEIGHT_B = 0.80
 
+ARTIFACTS.mkdir(exist_ok=True)
+
 # =====================================================
 # LOAD DATA
 # =====================================================
@@ -69,20 +75,18 @@ todayA = final_selection_from_daily(
     top_n=FINAL_TOP_N,
 )
 
-todayA["Bucket"] = "A"
 todayA.to_parquet(ARTIFACTS / "today_A.parquet", index=False)
 
 # =====================================================
-# BUCKET B — RELATIVE MOMENTUM (FILTERED)
+# BUCKET B — RELATIVE MOMENTUM
 # =====================================================
 
-# Merge index returns
 dfB = base.merge(
     idx,
     left_on=["Date", "Index"],
     right_on=["date", "index"],
     how="left",
-    validate="many_to_one"
+    validate="many_to_one",
 ).drop(columns=["date", "index"], errors="ignore")
 
 dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
@@ -91,11 +95,11 @@ dfB = add_absolute_returns(dfB)
 dfB = calculate_momentum_features(dfB, windows=WINDOWS)
 dfB = add_regime_momentum_score(dfB)
 
-# Trend filter vs benchmark
+# Benchmark trend filter
 dfB = dfB[
-    (dfB["Momentum_Slow"] > 0.5) &
-    (dfB["Momentum_Mid"] > 0.25) &
-    (dfB["Momentum_Fast"] > 0.5)
+    (dfB["Momentum_Slow"] > 0.5)
+    & (dfB["Momentum_Mid"] > 0.25)
+    & (dfB["Momentum_Fast"] > 0.5)
 ]
 
 dfB = add_regime_acceleration(dfB)
@@ -112,11 +116,10 @@ todayB = final_selection_from_daily(
     top_n=FINAL_TOP_N,
 )
 
-todayB["Bucket"] = "B"
 todayB.to_parquet(ARTIFACTS / "today_B.parquet", index=False)
 
 # =====================================================
-# BUCKET C — UNIFIED (80/20)
+# BUCKET C — UNIFIED (80 / 20)
 # =====================================================
 
 todayC = build_unified_target(
@@ -135,7 +138,7 @@ todayC = build_unified_target(
 
 todayC.to_parquet(ARTIFACTS / "today_C.parquet", index=False)
 
-print("✅ Daily signals generated:")
+print("✅ Daily artifacts written:")
 print(" - today_A.parquet")
 print(" - today_B.parquet")
 print(" - today_C.parquet")
