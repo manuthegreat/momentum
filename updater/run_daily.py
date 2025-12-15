@@ -1,67 +1,141 @@
 import pandas as pd
 from pathlib import Path
-from datetime import date
 
-from core.data_utils import (
-    load_price_data_parquet,
-    filter_by_index,
+from core.data import load_price_data_parquet, load_index_returns_parquet, filter_by_index
+from core.features import (
+    add_absolute_returns,
+    calculate_momentum_features,
+    add_regime_momentum_score,
+    add_regime_acceleration,
+    add_regime_early_momentum,
+)
+from core.selection import (
+    build_daily_lists,
+    final_selection_from_daily,
+    build_unified_target,
 )
 
-from core.momentum_utils import (
-    compute_absolute_momentum,
-    compute_relative_momentum,
+# =====================================================
+# CONFIG
+# =====================================================
+
+ARTIFACTS = Path("artifacts")
+
+PRICE_PATH = ARTIFACTS / "index_constituents_5yr.parquet"
+INDEX_PATH = ARTIFACTS / "index_returns_5y.parquet"
+
+INDEX_NAME = "SP500"
+
+WINDOWS = (5, 10, 30, 45, 60, 90)
+DAILY_TOP_N = 10
+FINAL_TOP_N = 10
+LOOKBACK_DAYS = 10
+
+W_MOM = 0.50
+W_EARLY = 0.30
+W_CONS = 0.20
+
+TOTAL_CAPITAL = 100_000
+WEIGHT_A = 0.20
+WEIGHT_B = 0.80
+
+# =====================================================
+# LOAD DATA
+# =====================================================
+
+base = load_price_data_parquet(PRICE_PATH)
+base = filter_by_index(base, INDEX_NAME)
+
+idx = load_index_returns_parquet(INDEX_PATH)
+
+# =====================================================
+# BUCKET A — ABSOLUTE MOMENTUM
+# =====================================================
+
+dfA = add_absolute_returns(base)
+dfA = calculate_momentum_features(dfA, windows=WINDOWS)
+dfA = add_regime_momentum_score(dfA)
+dfA = add_regime_acceleration(dfA)
+dfA = add_regime_early_momentum(dfA)
+
+dailyA = build_daily_lists(dfA, top_n=DAILY_TOP_N)
+
+todayA = final_selection_from_daily(
+    dailyA,
+    lookback_days=LOOKBACK_DAYS,
+    w_momentum=W_MOM,
+    w_early=W_EARLY,
+    w_consistency=W_CONS,
+    top_n=FINAL_TOP_N,
 )
 
-ART = Path("artifacts")
-ART.mkdir(exist_ok=True)
+todayA["Bucket"] = "A"
+todayA.to_parquet(ARTIFACTS / "today_A.parquet", index=False)
 
-PRICE_PATH = ART / "index_constituents_5yr.parquet"
-BENCHMARK_TICKER = "^GSPC"
+# =====================================================
+# BUCKET B — RELATIVE MOMENTUM (FILTERED)
+# =====================================================
 
-def main():
-    base = load_price_data_parquet(PRICE_PATH)
-    base = filter_by_index(base, "SP500")
+# Merge index returns
+dfB = base.merge(
+    idx,
+    left_on=["Date", "Index"],
+    right_on=["date", "index"],
+    how="left",
+    validate="many_to_one"
+).drop(columns=["date", "index"], errors="ignore")
 
-    # --- Benchmark ---
-    bench = base[base["Ticker"] == BENCHMARK_TICKER].copy()
-    stocks = base[base["Ticker"] != BENCHMARK_TICKER].copy()
+dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
 
-    abs_mom = compute_absolute_momentum(stocks)
-    rel_mom = compute_relative_momentum(stocks, bench)
+dfB = add_absolute_returns(dfB)
+dfB = calculate_momentum_features(dfB, windows=WINDOWS)
+dfB = add_regime_momentum_score(dfB)
 
-    # --- Top selections ---
-    top_abs = (
-        abs_mom.sort_values("ret", ascending=False)
-        .groupby("Date")
-        .head(10)
-    )
+# Trend filter vs benchmark
+dfB = dfB[
+    (dfB["Momentum_Slow"] > 0.5) &
+    (dfB["Momentum_Mid"] > 0.25) &
+    (dfB["Momentum_Fast"] > 0.5)
+]
 
-    top_rel = (
-        rel_mom.sort_values("rel_ret", ascending=False)
-        .groupby("Date")
-        .head(10)
-    )
+dfB = add_regime_acceleration(dfB)
+dfB = add_regime_early_momentum(dfB)
 
-    # --- Today snapshot (Bucket C logic: 80/20 fixed) ---
-    today = abs_mom["Date"].max()
+dailyB = build_daily_lists(dfB, top_n=DAILY_TOP_N)
 
-    a_today = top_abs[top_abs["Date"] == today][["Ticker"]]
-    b_today = top_rel[top_rel["Date"] == today][["Ticker"]]
+todayB = final_selection_from_daily(
+    dailyB,
+    lookback_days=LOOKBACK_DAYS,
+    w_momentum=W_MOM,
+    w_early=W_EARLY,
+    w_consistency=W_CONS,
+    top_n=FINAL_TOP_N,
+)
 
-    out = (
-        pd.concat([a_today.assign(Bucket="A"),
-                   b_today.assign(Bucket="B")])
-        .value_counts(["Ticker"])
-        .reset_index(name="Count")
-    )
+todayB["Bucket"] = "B"
+todayB.to_parquet(ARTIFACTS / "today_B.parquet", index=False)
 
-    out["Position_Size"] = out["Count"].map({1: 2000, 2: 10000})
-    out["Action"] = "HOLD"
-    out["AsOf"] = date.today().isoformat()
+# =====================================================
+# BUCKET C — UNIFIED (80/20)
+# =====================================================
 
-    out.to_parquet(ART / "today_C.parquet", index=False)
+todayC = build_unified_target(
+    dailyA=dailyA,
+    dailyB=dailyB,
+    as_of_date=None,
+    lookback_days=LOOKBACK_DAYS,
+    w_momentum=W_MOM,
+    w_early=W_EARLY,
+    w_consistency=W_CONS,
+    top_n=FINAL_TOP_N,
+    total_capital=TOTAL_CAPITAL,
+    weight_A=WEIGHT_A,
+    weight_B=WEIGHT_B,
+)
 
-    print("✅ today_C.parquet written")
+todayC.to_parquet(ARTIFACTS / "today_C.parquet", index=False)
 
-if __name__ == "__main__":
-    main()
+print("✅ Daily signals generated:")
+print(" - today_A.parquet")
+print(" - today_B.parquet")
+print(" - today_C.parquet")
