@@ -39,33 +39,43 @@ def load_json(path: Path):
 
 def clean_bucket_c(df: pd.DataFrame) -> pd.DataFrame:
     """
-    One row per ticker:
+    Clean Bucket C:
+    - One row per ticker
     - Sum Position_Size
-    - Take MAX score values
+    - Take MAX of available score columns
+    - Never assume schema
     """
     if df.empty:
         return df
 
-    score_cols = [
-        "Momentum_Score",
-        "Early_Momentum_Score",
+    agg = {}
+
+    if "Position_Size" in df.columns:
+        agg["Position_Size"] = "sum"
+
+    if "Date" in df.columns:
+        agg["Date"] = "max"
+
+    # Score columns — only include if present
+    for col in [
+        "Momentum Score",
+        "Early Momentum Score",
         "Consistency",
         "Weighted_Score",
-    ]
+    ]:
+        if col in df.columns:
+            agg[col] = "max"
 
-    agg = {
-        "Position_Size": "sum",
-        "Date": "max",
-    }
-
-    for c in score_cols:
-        if c in df.columns:
-            agg[c] = "max"
+    if not agg:
+        return df
 
     return (
         df.groupby("Ticker", as_index=False)
         .agg(agg)
-        .sort_values("Position_Size", ascending=False)
+        .sort_values(
+            "Position_Size" if "Position_Size" in agg else df.columns[0],
+            ascending=False
+        )
         .reset_index(drop=True)
     )
 
@@ -109,7 +119,7 @@ else:
     st.info("Equity data not available")
 
 # ============================================================
-# ROLLING PERFORMANCE
+# ROLLING RETURNS
 # ============================================================
 
 st.subheader("Rolling Returns")
@@ -141,10 +151,7 @@ if not equity.empty and "Equity" in equity.columns:
     roll_max = equity["Equity"].cummax()
     drawdown = equity["Equity"] / roll_max - 1
 
-    st.area_chart(
-        drawdown,
-        width="stretch"
-    )
+    st.area_chart(drawdown, width="stretch")
 else:
     st.info("Drawdown data unavailable")
 
@@ -169,7 +176,6 @@ else:
         clean_c = clean_bucket_c(today)
         st.dataframe(clean_c, width="stretch")
 
-        # Signal strength visualization
         if "Weighted_Score" in clean_c.columns:
             st.subheader("Signal Strength (Weighted Score)")
             st.bar_chart(
@@ -189,29 +195,32 @@ else:
     if "Date" in trades.columns:
         trades = trades.sort_values("Date", ascending=False)
 
-    sells = trades[trades.get("Action") == "Sell"] if "Action" in trades.columns else pd.DataFrame()
+    if "Action" in trades.columns and "PnL" in trades.columns:
+        sells = trades[trades["Action"] == "Sell"]
 
-    if not sells.empty and "PnL" in sells.columns:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Closed Trades", len(sells))
-        col2.metric("Win Rate (%)", round((sells["PnL"] > 0).mean() * 100, 1))
-        col3.metric("Avg PnL ($)", round(sells["PnL"].mean(), 2))
+        if not sells.empty:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Closed Trades", len(sells))
+            col2.metric("Win Rate (%)", round((sells["PnL"] > 0).mean() * 100, 1))
+            col3.metric("Avg PnL ($)", round(sells["PnL"].mean(), 2))
 
-        st.dataframe(
-            sells.sort_values("PnL", ascending=False),
-            width="stretch"
-        )
+            st.dataframe(
+                sells.sort_values("PnL", ascending=False),
+                width="stretch"
+            )
+        else:
+            st.info("No closed trades yet")
     else:
         st.dataframe(trades, width="stretch")
 
 # ============================================================
-# RAW ARTIFACTS (DEBUG)
+# RAW DEBUG
 # ============================================================
 
 with st.expander("🔍 Raw Artifacts"):
-    st.write("Signals")
+    st.write("Signals (head)")
     st.dataframe(signals.head(20))
-    st.write("Equity")
+    st.write("Equity (head)")
     st.dataframe(equity.head(20))
-    st.write("Trades")
+    st.write("Trades (head)")
     st.dataframe(trades.head(20))
