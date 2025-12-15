@@ -1,4 +1,4 @@
-name: Run Momentum Backtest
+name: Run backtests
 
 on:
   workflow_dispatch:
@@ -10,28 +10,26 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Set PYTHONPATH
-        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
-
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run backtest
+      - name: Run backtest pipeline
         run: |
           python updater/run_backtest.py
 
       - name: Commit backtest artifacts
         run: |
-          git config user.name "github-actions"
+          git config user.name "actions-user"
           git config user.email "actions@github.com"
-          git add artifacts/
-          git commit -m "Backtest results update" || echo "No changes"
+          git add artifacts/history_*.parquet
+          git commit -m "Backtest artifacts update" || echo "No changes"
           git push
