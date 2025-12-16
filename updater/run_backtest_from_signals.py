@@ -413,35 +413,68 @@ def main():
     # NORMALIZE momentum column names for relative regime logic
     # --------------------------------------------------------
     
-    dfB = dfB.rename(
-        columns={
-            "5D zscore": "Momentum_Fast",
-            "30D zscore": "Momentum_Mid",
-            "60D zscore": "Momentum_Slow",
-        }
-    )
+    # --------------------------------------------------------
+    # Validate momentum columns produced by calculate_momentum_features
+    # --------------------------------------------------------
     
-    required = {"Momentum_Fast", "Momentum_Mid", "Momentum_Slow", "idx_5D"}
+    required = {"Momentum_Fast", "Momentum_Mid", "Momentum_Slow"}
     missing = required - set(dfB.columns)
+    
     if missing:
-        raise ValueError(f"Bucket B missing required columns: {missing}")
+        raise ValueError(
+            f"Bucket B missing momentum columns from calculate_momentum_features: {missing}. "
+            f"Columns present: {list(dfB.columns)}"
+        )
     
     # --------------------------------------------------------
     # Bucket B compatibility: early momentum expects Momentum Score
     # --------------------------------------------------------
     
-    if "Momentum Score" not in dfB.columns:
-        if "Relative_Momentum_Score" in dfB.columns:
-            dfB["Momentum Score"] = dfB["Relative_Momentum_Score"]
-        else:
+    # --- Ensure Bucket B always has the expected scoring columns ---
+    # Some upstream builders produce either "Momentum Score" or "Relative_Momentum_Score" (or neither),
+    # depending on which path ran. Normalize here so downstream never explodes.
+    
+    # 1) If Relative_Momentum_Score exists but Momentum Score doesn't, mirror it
+    if "Relative_Momentum_Score" in dfB.columns and "Momentum Score" not in dfB.columns:
+        dfB["Momentum Score"] = dfB["Relative_Momentum_Score"]
+    
+    # 2) If Momentum Score exists but Relative_Momentum_Score doesn't, mirror it
+    if "Momentum Score" in dfB.columns and "Relative_Momentum_Score" not in dfB.columns:
+        dfB["Relative_Momentum_Score"] = dfB["Momentum Score"]
+    
+    # 3) If neither exists, create a safe fallback from absolute returns (best effort)
+    if "Momentum Score" not in dfB.columns and "Relative_Momentum_Score" not in dfB.columns:
+        # Prefer an obvious absolute-return column name if present
+        candidates = [
+            "Absolute_Return",
+            "Absolute_Returns",
+            "abs_return",
+            "abs_returns",
+            "Return",
+            "Returns",
+            "Pct_Return",
+            "Pct_Returns",
+        ]
+        base_col = next((c for c in candidates if c in dfB.columns), None)
+    
+        if base_col is None:
             raise ValueError(
-                "Bucket B missing Momentum Score and Relative_Momentum_Score"
+                f"Bucket B missing Momentum Score and Relative_Momentum_Score, and no usable return column found. "
+                f"Columns present: {list(dfB.columns)}"
             )
+    
+        # Use base returns as momentum proxy, and rank-normalize into Relative_Momentum_Score
+        dfB["Momentum Score"] = dfB[base_col]
+        dfB["Relative_Momentum_Score"] = (
+            dfB.groupby("Date")["Momentum Score"]
+               .rank(ascending=False, method="average")
+        )
 
-    dfB = add_relative_regime_momentum_score(dfB)
+
+     add_relative_regime_momentum_score(dfB)
     
     # 8) Regime filters (same as local pipeline)
-    dfB = dfB[
+     dfB[
         (dfB["Momentum_Slow"] > 1.0) &
         (dfB["Momentum_Mid"] > 0.5) &
         (dfB["Momentum_Fast"] > 1.0)
