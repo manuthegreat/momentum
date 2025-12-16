@@ -74,6 +74,36 @@ else:
     st.info("Backtest stats not available")
 
 # ============================================================
+# EQUITY CURVE
+# ============================================================
+
+st.subheader("Equity Curve")
+
+if equity.empty or "Date" not in equity.columns:
+    st.info("Equity data not available")
+else:
+    eq = equity.sort_values("Date").copy()
+
+    value_col = None
+    if "Equity" in eq.columns:
+        value_col = "Equity"
+    elif "Portfolio Value" in eq.columns:
+        value_col = "Portfolio Value"
+
+    if value_col is None:
+        st.info("Equity value column not found")
+    else:
+        st.line_chart(
+            eq.set_index("Date")[value_col],
+            width="stretch"
+        )
+
+        st.caption(
+            f"Last equity date: {eq['Date'].max().date()}"
+        )
+
+
+# ============================================================
 # TODAY'S PORTFOLIO — EXECUTION VIEW
 # ============================================================
 
