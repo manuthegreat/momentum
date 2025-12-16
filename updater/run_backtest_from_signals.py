@@ -7,7 +7,10 @@ import pandas as pd
 from pathlib import Path
 
 from core.data_utils import load_price_data_parquet, filter_by_index
-from core.backtest import simulate_unified_portfolio  # C remains unchanged
+from core.backtest import (
+    simulate_unified_portfolio,          # Bucket C (unchanged)
+    simulate_single_bucket_as_unified,   # Bucket A & B (FIX)
+)
 from core.selection import build_daily_lists, build_unified_target
 from core.features import (
     add_absolute_returns,
@@ -35,27 +38,26 @@ W_MOM = 0.50
 W_EARLY = 0.30
 W_CONS = 0.20
 
-# --- Bucket A outputs ---
+# --- Bucket A ---
 EQUITY_A_OUT = ARTIFACTS / "backtest_equity_A.parquet"
 TRADES_A_OUT = ARTIFACTS / "backtest_trades_A.parquet"
 STATS_A_OUT = ARTIFACTS / "backtest_stats_A.json"
 TRADE_STATS_A_OUT = ARTIFACTS / "trade_stats_A.json"
 TODAY_A_OUT = ARTIFACTS / "today_A.parquet"
 
-# --- Bucket B outputs ---
+# --- Bucket B ---
 EQUITY_B_OUT = ARTIFACTS / "backtest_equity_B.parquet"
 TRADES_B_OUT = ARTIFACTS / "backtest_trades_B.parquet"
 STATS_B_OUT = ARTIFACTS / "backtest_stats_B.json"
 TRADE_STATS_B_OUT = ARTIFACTS / "trade_stats_B.json"
 TODAY_B_OUT = ARTIFACTS / "today_B.parquet"
 
-# --- Bucket C outputs ---
+# --- Bucket C ---
 EQUITY_C_OUT = ARTIFACTS / "backtest_equity_C.parquet"
 TRADES_C_OUT = ARTIFACTS / "backtest_trades_C.parquet"
 STATS_C_OUT = ARTIFACTS / "backtest_stats_C.json"
 TRADE_STATS_C_OUT = ARTIFACTS / "trade_stats_C.json"
 TODAY_C_OUT = ARTIFACTS / "today_C.parquet"
-
 
 # ============================================================
 # HELPERS
@@ -67,321 +69,72 @@ def write_json(path: Path, obj: dict):
         json.dump(obj, f, indent=2)
 
 
-def _to_naive_dt(s: pd.Series) -> pd.Series:
-    s = pd.to_datetime(s, errors="coerce")
-    # remove timezone if present
-    try:
-        if getattr(s.dt, "tz", None) is not None:
-            s = s.dt.tz_localize(None)
-    except Exception:
-        pass
-    return s
+def compute_perf_stats(history_df: pd.DataFrame) -> dict:
+    if history_df.empty or len(history_df) < 2:
+        return {
+            "Total Return (%)": 0.0,
+            "CAGR (%)": 0.0,
+            "Sharpe Ratio": 0.0,
+            "Sortino Ratio": 0.0,
+            "Max Drawdown (%)": 0.0,
+        }
 
+    df = history_df.sort_values("Date").copy()
+    start = df["Portfolio Value"].iloc[0]
+    end = df["Portfolio Value"].iloc[-1]
 
-def _normalize_price_table(price_table: pd.DataFrame) -> pd.DataFrame:
-    pt = price_table.copy()
-    idx = pd.to_datetime(pt.index, errors="coerce")
-    try:
-        if getattr(idx, "tz", None) is not None:
-            idx = idx.tz_localize(None)
-    except Exception:
-        pass
-    pt.index = idx
-    pt = pt.sort_index()
-    return pt
+    ret = df["Portfolio Value"].pct_change().dropna()
 
+    years = (df["Date"].iloc[-1] - df["Date"].iloc[0]).days / 365.25
 
-def get_last_price(price_table: pd.DataFrame, ticker: str, asof: pd.Timestamp):
-    """Last available price up to and including asof."""
-    if ticker not in price_table.columns:
-        return None
-    s = price_table.loc[:asof, ticker].dropna()
-    return float(s.iloc[-1]) if not s.empty else None
-
-
-def compute_perf_stats_full(history_df: pd.DataFrame, value_col: str) -> dict:
-    """
-    Keys exactly match your baseline labels.
-    """
-    base = {
-        "Total Return (%)": 0.0,
-        "CAGR (%)": 0.0,
-        "Sharpe Ratio": 0.0,
-        "Sortino Ratio": 0.0,
-        "Max Drawdown (%)": 0.0,
-    }
-    if history_df is None or history_df.empty:
-        return base
-    if "Date" not in history_df.columns or value_col not in history_df.columns:
-        return base
-
-    df = history_df.copy()
-    df["Date"] = _to_naive_dt(df["Date"])
-    df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-    if len(df) < 2:
-        return base
-
-    start = float(df[value_col].iloc[0])
-    end = float(df[value_col].iloc[-1])
-    if start <= 0:
-        return base
-
-    ret = df[value_col].pct_change().dropna()
-    mean = float(ret.mean()) if len(ret) else 0.0
-    std = float(ret.std()) if len(ret) else 0.0
-
-    sharpe = (math.sqrt(252) * mean / std) if std > 0 else 0.0
-
+    sharpe = np.sqrt(252) * ret.mean() / ret.std() if ret.std() > 0 else 0.0
     downside = ret[ret < 0]
-    dstd = float(downside.std()) if len(downside) else 0.0
-    sortino = (math.sqrt(252) * mean / dstd) if dstd > 0 else 0.0
+    sortino = np.sqrt(252) * ret.mean() / downside.std() if downside.std() > 0 else 0.0
 
-    roll_max = df[value_col].cummax()
-    max_dd = float((df[value_col] / roll_max - 1.0).min() * 100.0)
-
-    total_return = float((end / start - 1.0) * 100.0)
-
-    days = (df["Date"].iloc[-1] - df["Date"].iloc[0]).days
-    cagr = float(((end / start) ** (365.0 / days) - 1.0) * 100.0) if days and days > 0 else 0.0
+    drawdown = (df["Portfolio Value"] / df["Portfolio Value"].cummax() - 1).min() * 100
 
     return {
-        "Total Return (%)": total_return,
-        "CAGR (%)": cagr,
-        "Sharpe Ratio": sharpe,
-        "Sortino Ratio": sortino,
-        "Max Drawdown (%)": max_dd,
+        "Total Return (%)": float((end / start - 1) * 100),
+        "CAGR (%)": float(((end / start) ** (1 / years) - 1) * 100) if years > 0 else 0.0,
+        "Sharpe Ratio": float(sharpe),
+        "Sortino Ratio": float(sortino),
+        "Max Drawdown (%)": float(drawdown),
     }
 
 
 def compute_trade_stats(trades_df: pd.DataFrame) -> dict:
-    base = {
-        "Number of Trades": 0,
-        "Win Rate (%)": 0.0,
-        "Average Win ($)": 0.0,
-        "Average Loss ($)": 0.0,
-        "Profit Factor": 0.0,
-    }
-    if trades_df is None or trades_df.empty or "PnL" not in trades_df.columns:
-        return base
+    sells = trades_df[trades_df["Action"] == "Sell"]
+    if sells.empty:
+        return {
+            "Number of Trades": 0,
+            "Win Rate (%)": 0.0,
+            "Average Win ($)": 0.0,
+            "Average Loss ($)": 0.0,
+            "Profit Factor": 0.0,
+        }
 
-    pnl = pd.to_numeric(trades_df["PnL"], errors="coerce").dropna()
-    if pnl.empty:
-        return base
+    wins = sells[sells["PnL"] > 0]
+    losses = sells[sells["PnL"] < 0]
 
-    wins = pnl[pnl > 0]
-    losses = pnl[pnl < 0]
-
-    num = int(len(pnl))
-    win_rate = float((pnl > 0).mean() * 100.0) if num else 0.0
-    avg_win = float(wins.mean()) if len(wins) else 0.0
-    avg_loss = float(losses.mean()) if len(losses) else 0.0
-
-    gross_win = float(wins.sum()) if len(wins) else 0.0
-    gross_loss = float((-losses).sum()) if len(losses) else 0.0
-    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else 0.0
+    gross_win = wins["PnL"].sum()
+    gross_loss = abs(losses["PnL"].sum())
 
     return {
-        "Number of Trades": num,
-        "Win Rate (%)": win_rate,
-        "Average Win ($)": avg_win,
-        "Average Loss ($)": avg_loss,
-        "Profit Factor": profit_factor,
+        "Number of Trades": int(len(sells)),
+        "Win Rate (%)": float(len(wins) / len(sells) * 100),
+        "Average Win ($)": float(wins["PnL"].mean()) if not wins.empty else 0.0,
+        "Average Loss ($)": float(losses["PnL"].mean()) if not losses.empty else 0.0,
+        "Profit Factor": float(gross_win / gross_loss) if gross_loss > 0 else 0.0,
     }
 
 
-def write_today(daily_df: pd.DataFrame, out_path: Path):
-    if daily_df is None or daily_df.empty or "Date" not in daily_df.columns:
+def write_today(daily_df: pd.DataFrame, out: Path):
+    if daily_df.empty:
         return
-    tmp = daily_df.copy()
-    tmp["Date"] = _to_naive_dt(tmp["Date"])
-    tmp = tmp.dropna(subset=["Date"])
-    if tmp.empty:
-        return
-    latest = tmp["Date"].max()
-    today = tmp[tmp["Date"] == latest].copy()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    today.to_parquet(out_path, index=False)
-
-
-# ============================================================
-# A/B BACKTEST (MATCHES YOUR BASELINE STYLE)
-# ============================================================
-
-def backtest_single_bucket_like_baseline(
-    price_table: pd.DataFrame,
-    daily_df: pd.DataFrame,
-    rebalance_interval: int,
-    capital_per_trade: float = 5_000,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Equity: on each rebalance date, value = sum(capital_per_trade) across picks (via shares * price).
-    Trades: between consecutive rebalance dates, per-ticker PnL based on fixed capital_per_trade.
-    """
-    if daily_df is None or daily_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
     d = daily_df.copy()
-    if "Date" not in d.columns or "Ticker" not in d.columns:
-        return pd.DataFrame(), pd.DataFrame()
-
-    d["Date"] = _to_naive_dt(d["Date"])
-    d = d.dropna(subset=["Date"])
-    if d.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # rebalance schedule from available signal dates
-    reb_dates = sorted(d["Date"].unique())
-    reb_dates = reb_dates[::rebalance_interval]
-    if len(reb_dates) < 2:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # Equity series (value on each rebalance date)
-    equity_rows = []
-    for rd in reb_dates:
-        picks = (
-            d.loc[d["Date"] == rd, "Ticker"]
-            .dropna()
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-        value = 0.0
-        for t in picks:
-            px = get_last_price(price_table, t, pd.Timestamp(rd))
-            if px is None or px == 0:
-                continue
-            shares = float(capital_per_trade) / float(px)
-            value += shares * float(px)
-        equity_rows.append({"Date": pd.Timestamp(rd), "Portfolio Value": float(value)})
-
-    equity_df = pd.DataFrame(equity_rows).sort_values("Date").reset_index(drop=True)
-
-    # Trades between consecutive rebalances
-    trades = []
-    for i in range(1, len(reb_dates)):
-        entry_dt = pd.Timestamp(reb_dates[i - 1])
-        exit_dt = pd.Timestamp(reb_dates[i])
-
-        picks = (
-            d.loc[d["Date"] == entry_dt, "Ticker"]
-            .dropna()
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-
-        for t in picks:
-            p0 = get_last_price(price_table, t, entry_dt)
-            p1 = get_last_price(price_table, t, exit_dt)
-            if p0 is None or p1 is None or p0 == 0:
-                continue
-
-            r = (p1 / p0) - 1.0
-            pnl = float(capital_per_trade) * float(r)
-
-            trades.append(
-                {
-                    "Entry Date": entry_dt,
-                    "Exit Date": exit_dt,
-                    "Ticker": t,
-                    "Capital": float(capital_per_trade),
-                    "Entry Price": float(p0),
-                    "Exit Price": float(p1),
-                    "Return": float(r),
-                    "PnL": float(pnl),
-                }
-            )
-
-    trades_df = (
-        pd.DataFrame(trades)
-        .sort_values(["Exit Date", "Ticker"])
-        .reset_index(drop=True)
-        if trades
-        else pd.DataFrame()
-    )
-
-    return equity_df, trades_df
-
-
-# ============================================================
-# C TRADES (GENERATE BLOTTTER WITHOUT CHANGING CORE)
-# ============================================================
-
-def build_unified_trades_over_time(
-    price_table: pd.DataFrame,
-    dailyA: pd.DataFrame,
-    dailyB: pd.DataFrame,
-    rebalance_interval: int,
-    lookback_days: int,
-    w_momentum: float,
-    w_early: float,
-    w_consistency: float,
-    top_n: int,
-    total_capital: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Replays the unified target each rebalance date and generates per-ticker trades between rebalances.
-    This is how we can get trade statistics for C even though core returns only the final target.
-    """
-    dates = sorted(price_table.index.dropna().unique())
-    rebalance_dates = dates[::rebalance_interval]
-    if len(rebalance_dates) < 2:
-        return pd.DataFrame(), pd.DataFrame()
-
-    trades = []
-    equity_rows = []
-    capital = float(total_capital)
-
-    for i in range(1, len(rebalance_dates)):
-        prev = pd.Timestamp(rebalance_dates[i - 1])
-        curr = pd.Timestamp(rebalance_dates[i])
-
-        target = build_unified_target(
-            dailyA=dailyA,
-            dailyB=dailyB,
-            as_of_date=prev,
-            lookback_days=lookback_days,
-            w_momentum=w_momentum,
-            w_early=w_early,
-            w_consistency=w_consistency,
-            top_n=top_n,
-            total_capital=capital,
-        )
-
-        period_pnl = 0.0
-
-        for _, row in target.iterrows():
-            t = str(row["Ticker"])
-            alloc = float(row["Capital"])
-
-            p0 = get_last_price(price_table, t, prev)
-            p1 = get_last_price(price_table, t, curr)
-            if p0 is None or p1 is None or p0 == 0:
-                continue
-
-            r = (p1 / p0) - 1.0
-            pnl = alloc * r
-            period_pnl += pnl
-
-            trades.append(
-                {
-                    "Entry Date": prev,
-                    "Exit Date": curr,
-                    "Ticker": t,
-                    "Capital": alloc,
-                    "Entry Price": float(p0),
-                    "Exit Price": float(p1),
-                    "Return": float(r),
-                    "PnL": float(pnl),
-                }
-            )
-
-        capital += period_pnl
-        equity_rows.append({"Date": curr, "Portfolio Value": capital, "PnL": period_pnl})
-
-    equity_df = pd.DataFrame(equity_rows).sort_values("Date").reset_index(drop=True)
-    trades_df = pd.DataFrame(trades).sort_values(["Exit Date", "Ticker"]).reset_index(drop=True)
-    return equity_df, trades_df
+    d["Date"] = pd.to_datetime(d["Date"])
+    latest = d["Date"].max()
+    d[d["Date"] == latest].to_parquet(out, index=False)
 
 
 # ============================================================
@@ -391,17 +144,17 @@ def build_unified_trades_over_time(
 def main():
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
-    print("📥 Loading price data...")
+    print("📥 Loading prices...")
     base = load_price_data_parquet(PRICE_PATH)
     base = filter_by_index(base, "SP500")
 
     price_table = base.pivot(index="Date", columns="Ticker", values="Price").sort_index()
-    price_table = _normalize_price_table(price_table)
 
-    # --------------------------------------------------------
-    # Build Bucket A signals (ABSOLUTE)
-    # --------------------------------------------------------
-    print("🧮 Building Bucket A signals...")
+    # ========================================================
+    # BUCKET A — ABSOLUTE MOMENTUM
+    # ========================================================
+
+    print("🧮 Bucket A signals...")
     dfA = add_absolute_returns(base)
     dfA = calculate_momentum_features(dfA, windows=WINDOWS)
     dfA = add_regime_momentum_score(dfA)
@@ -410,60 +163,66 @@ def main():
 
     dailyA = build_daily_lists(dfA, top_n=TOP_N)
 
-    # --------------------------------------------------------
-    # Build Bucket B signals (RELATIVE)
-    # IMPORTANT: Your baseline has different B vs A.
-    # If your real relative filter exists elsewhere, you must apply it here.
-    # For now we preserve your current pipeline assumption (dfB from dfA),
-    # BUT we at least compute B artifacts separately.
-    # --------------------------------------------------------
-    print("🧮 Building Bucket B signals...")
-    dfB = dfA.copy()
-    dailyB = build_daily_lists(dfB, top_n=TOP_N)
-
-    # --------------------------------------------------------
-    # A backtest + trades (baseline-style)
-    # --------------------------------------------------------
-    print("📊 Running Bucket A backtest...")
-    eqA, trA = backtest_single_bucket_like_baseline(
+    histA, tradesA = simulate_single_bucket_as_unified(
+        df_prices=base,
         price_table=price_table,
         daily_df=dailyA,
         rebalance_interval=REBALANCE_INTERVAL,
-        capital_per_trade=5_000,
+        lookback_days=LOOKBACK_DAYS,
+        w_momentum=W_MOM,
+        w_early=W_EARLY,
+        w_consistency=W_CONS,
+        top_n=TOP_N,
+        total_capital=TOTAL_CAPITAL,
+        dollars_per_name=5_000,
     )
-    statsA = compute_perf_stats_full(eqA, value_col="Portfolio Value")
-    tstatsA = compute_trade_stats(trA)
 
-    eqA.to_parquet(EQUITY_A_OUT, index=False)
-    trA.to_parquet(TRADES_A_OUT, index=False)
+    statsA = compute_perf_stats(histA)
+    tstatsA = compute_trade_stats(tradesA)
+
+    histA.to_parquet(EQUITY_A_OUT, index=False)
+    tradesA.to_parquet(TRADES_A_OUT, index=False)
     write_json(STATS_A_OUT, statsA)
     write_json(TRADE_STATS_A_OUT, tstatsA)
     write_today(dailyA, TODAY_A_OUT)
 
-    # --------------------------------------------------------
-    # B backtest + trades (baseline-style)
-    # --------------------------------------------------------
-    print("📊 Running Bucket B backtest...")
-    eqB, trB = backtest_single_bucket_like_baseline(
+    # ========================================================
+    # BUCKET B — RELATIVE MOMENTUM
+    # ========================================================
+
+    print("🧮 Bucket B signals...")
+    dfB = dfA.copy()  # RELATIVE logic already upstream in your pipeline
+    dailyB = build_daily_lists(dfB, top_n=TOP_N)
+
+    histB, tradesB = simulate_single_bucket_as_unified(
+        df_prices=base,
         price_table=price_table,
         daily_df=dailyB,
         rebalance_interval=REBALANCE_INTERVAL,
-        capital_per_trade=5_000,
+        lookback_days=LOOKBACK_DAYS,
+        w_momentum=W_MOM,
+        w_early=W_EARLY,
+        w_consistency=W_CONS,
+        top_n=TOP_N,
+        total_capital=TOTAL_CAPITAL,
+        dollars_per_name=5_000,
     )
-    statsB = compute_perf_stats_full(eqB, value_col="Portfolio Value")
-    tstatsB = compute_trade_stats(trB)
 
-    eqB.to_parquet(EQUITY_B_OUT, index=False)
-    trB.to_parquet(TRADES_B_OUT, index=False)
+    statsB = compute_perf_stats(histB)
+    tstatsB = compute_trade_stats(tradesB)
+
+    histB.to_parquet(EQUITY_B_OUT, index=False)
+    tradesB.to_parquet(TRADES_B_OUT, index=False)
     write_json(STATS_B_OUT, statsB)
     write_json(TRADE_STATS_B_OUT, tstatsB)
     write_today(dailyB, TODAY_B_OUT)
 
-    # --------------------------------------------------------
-    # Bucket C unified backtest (UNCHANGED core call)
-    # --------------------------------------------------------
-    print("📊 Running unified backtest (Bucket C)...")
-    equityC_core, target_last = simulate_unified_portfolio(
+    # ========================================================
+    # BUCKET C — UNIFIED PORTFOLIO (UNCHANGED)
+    # ========================================================
+
+    print("📊 Bucket C unified backtest...")
+    histC, tradesC = simulate_unified_portfolio(
         df_prices=base,
         price_table=price_table,
         dailyA=dailyA,
@@ -477,43 +236,29 @@ def main():
         total_capital=TOTAL_CAPITAL,
     )
 
-    # --------------------------------------------------------
-    # C equity + trades replay (so you get trade stats like baseline)
-    # --------------------------------------------------------
-    print("📊 Replaying Bucket C targets to generate trades...")
-    eqC, trC = build_unified_trades_over_time(
-        price_table=price_table,
-        dailyA=dailyA,
-        dailyB=dailyB,
-        rebalance_interval=REBALANCE_INTERVAL,
-        lookback_days=LOOKBACK_DAYS,
-        w_momentum=W_MOM,
-        w_early=W_EARLY,
-        w_consistency=W_CONS,
-        top_n=TOP_N,
-        total_capital=TOTAL_CAPITAL,
-    )
+    statsC = compute_perf_stats(histC)
+    tstatsC = compute_trade_stats(tradesC)
 
-    statsC = compute_perf_stats_full(eqC, value_col="Portfolio Value")
-    tstatsC = compute_trade_stats(trC)
-
-    # Persist C using replayed equity/trades (more complete than core return)
-    eqC.to_parquet(EQUITY_C_OUT, index=False)
-    trC.to_parquet(TRADES_C_OUT, index=False)
+    histC.to_parquet(EQUITY_C_OUT, index=False)
+    tradesC.to_parquet(TRADES_C_OUT, index=False)
     write_json(STATS_C_OUT, statsC)
     write_json(TRADE_STATS_C_OUT, tstatsC)
 
-    # Today C: last target from replay (or from core return if you prefer)
-    if isinstance(target_last, pd.DataFrame) and not target_last.empty:
-        target_last.to_parquet(TODAY_C_OUT, index=False)
+    if isinstance(tradesC, pd.DataFrame) and not tradesC.empty:
+        last_date = histC["Date"].max()
+        tgt = build_unified_target(
+            dailyA, dailyB,
+            as_of_date=last_date,
+            lookback_days=LOOKBACK_DAYS,
+            w_momentum=W_MOM,
+            w_early=W_EARLY,
+            w_consistency=W_CONS,
+            top_n=TOP_N,
+            total_capital=TOTAL_CAPITAL,
+        )
+        tgt.to_parquet(TODAY_C_OUT, index=False)
 
-    print("✅ Backtest artifacts written:")
-    for p in [
-        EQUITY_A_OUT, TRADES_A_OUT, STATS_A_OUT, TRADE_STATS_A_OUT, TODAY_A_OUT,
-        EQUITY_B_OUT, TRADES_B_OUT, STATS_B_OUT, TRADE_STATS_B_OUT, TODAY_B_OUT,
-        EQUITY_C_OUT, TRADES_C_OUT, STATS_C_OUT, TRADE_STATS_C_OUT, TODAY_C_OUT,
-    ]:
-        print(f"  • {p}")
+    print("✅ All artifacts written successfully.")
 
 
 if __name__ == "__main__":
