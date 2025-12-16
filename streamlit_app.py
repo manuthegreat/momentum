@@ -126,20 +126,36 @@ if equity.empty or "Date" not in equity.columns:
     st.info("No equity history available")
 else:
     eq = equity.sort_values("Date").copy()
-    eq["Period PnL"] = eq["Equity"].diff()
 
-    if not signals.empty:
-        counts = (
-            signals[signals["Bucket"] == "C"]
-            .groupby("Date")["Ticker"]
-            .count()
+    # 🔑 Detect equity column safely
+    value_col = None
+    if "Equity" in eq.columns:
+        value_col = "Equity"
+    elif "Portfolio Value" in eq.columns:
+        value_col = "Portfolio Value"
+
+    if value_col is None:
+        st.info("Equity value column not found")
+    else:
+        eq = eq.rename(columns={value_col: "Equity"})
+
+        eq["Period PnL"] = eq["Equity"].diff()
+
+        # Optional: number of names held per rebalance
+        if not signals.empty and {"Date", "Bucket", "Ticker"}.issubset(signals.columns):
+            counts = (
+                signals[signals["Bucket"] == "C"]
+                .groupby("Date")["Ticker"]
+                .count()
+            )
+            eq["# Names"] = eq["Date"].map(counts)
+
+        timeline_cols = ["Date", "Equity", "Period PnL"]
+        if "# Names" in eq.columns:
+            timeline_cols.append("# Names")
+
+        st.dataframe(
+            eq[timeline_cols]
+            .sort_values("Date", ascending=False),
+            width="stretch"
         )
-        eq["# Names"] = eq["Date"].map(counts)
-
-    timeline = eq[["Date", "Equity", "Period PnL"] + (["# Names"] if "# Names" in eq.columns else [])]
-    timeline = timeline.rename(columns={"Equity": "Portfolio Equity"})
-
-    st.dataframe(
-        timeline.sort_values("Date", ascending=False),
-        width="stretch"
-    )
