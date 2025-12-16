@@ -7,7 +7,6 @@ import pandas as pd
 from pathlib import Path
 
 from core.data_utils import load_price_data_parquet, filter_by_index
-from core.backtest import simulate_unified_portfolio  # C remains unchanged
 from core.selection import build_daily_lists, build_unified_target
 from core.features import (
     add_absolute_returns,
@@ -15,6 +14,13 @@ from core.features import (
     add_regime_momentum_score,
     add_regime_acceleration,
     add_regime_early_momentum,
+    add_relative_regime_momentum_score,
+    compute_index_momentum,
+)
+
+from core.backtest import (
+    simulate_unified_portfolio,
+    simulate_single_bucket_as_unified,
 )
 
 # ============================================================
@@ -210,124 +216,6 @@ def write_today(daily_df: pd.DataFrame, out_path: Path):
 
 
 # ============================================================
-# BUCKET B: RELATIVE MOMENTUM (CROSS-SECTIONAL RANK)
-# ============================================================
-
-def make_relative_bucket(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    # 🔑 THIS is the real column name produced by your pipeline
-    score_col = "Momentum Score"
-
-    if score_col not in out.columns:
-        raise ValueError(
-            f"'{score_col}' not found. Available columns: {list(out.columns)}"
-        )
-
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    out = out.dropna(subset=["Date", score_col])
-
-    # Cross-sectional rank per day (relative momentum)
-    # Higher momentum = higher rank
-    out[score_col] = (
-        out.groupby("Date")[score_col]
-           .rank(pct=True, ascending=False)
-    )
-
-    return out
-
-
-# ============================================================
-# A/B BACKTEST (MATCHES YOUR BASELINE STYLE)
-# ============================================================
-
-def backtest_single_bucket_like_baseline(
-    price_table: pd.DataFrame,
-    daily_df: pd.DataFrame,
-    rebalance_interval: int,
-    capital_per_trade: float = 5_000,
-    start_capital: float | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-
-    if daily_df is None or daily_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    d = daily_df.copy()
-    if "Date" not in d.columns or "Ticker" not in d.columns:
-        return pd.DataFrame(), pd.DataFrame()
-
-    d["Date"] = _to_naive_dt(d["Date"])
-    d = d.dropna(subset=["Date"])
-    if d.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    reb_dates = sorted(d["Date"].unique())
-    reb_dates = reb_dates[::rebalance_interval]
-    if len(reb_dates) < 2:
-        return pd.DataFrame(), pd.DataFrame()
-
-    first_dt = pd.Timestamp(reb_dates[0])
-    first_picks = (
-        d.loc[d["Date"] == first_dt, "Ticker"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
-    capital = float(start_capital) if start_capital is not None else float(capital_per_trade) * float(len(first_picks))
-    if capital <= 0:
-        capital = float(capital_per_trade) * 10.0
-
-    trades = []
-    equity_rows = [{"Date": first_dt, "Portfolio Value": capital, "PnL": 0.0}]
-
-    for i in range(1, len(reb_dates)):
-        entry_dt = pd.Timestamp(reb_dates[i - 1])
-        exit_dt = pd.Timestamp(reb_dates[i])
-
-        picks = (
-            d.loc[d["Date"] == entry_dt, "Ticker"]
-            .dropna()
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-
-        period_pnl = 0.0
-
-        for t in picks:
-            p0 = get_last_price(price_table, t, entry_dt)
-            p1 = get_last_price(price_table, t, exit_dt)
-            if p0 is None or p1 is None or p0 == 0:
-                continue
-
-            r = (p1 / p0) - 1.0
-            pnl = float(capital_per_trade) * float(r)
-            period_pnl += pnl
-
-            trades.append(
-                {
-                    "Entry Date": entry_dt,
-                    "Exit Date": exit_dt,
-                    "Ticker": t,
-                    "Capital": float(capital_per_trade),
-                    "Entry Price": float(p0),
-                    "Exit Price": float(p1),
-                    "Return": float(r),
-                    "PnL": float(pnl),
-                }
-            )
-
-        capital += period_pnl
-        equity_rows.append({"Date": exit_dt, "Portfolio Value": float(capital), "PnL": float(period_pnl)})
-
-    equity_df = pd.DataFrame(equity_rows).sort_values("Date").reset_index(drop=True)
-    trades_df = pd.DataFrame(trades).sort_values(["Exit Date", "Ticker"]).reset_index(drop=True) if trades else pd.DataFrame()
-    return equity_df, trades_df
-
-
-# ============================================================
 # C TRADES (GENERATE BLOTTTER WITHOUT CHANGING CORE)
 # ============================================================
 
@@ -441,24 +329,86 @@ def main():
     # Build Bucket B signals (RELATIVE - cross-sectional rank)
     # --------------------------------------------------------
     print("🧮 Building Bucket B signals (relative ranking)...")
-    dfB = add_absolute_returns(base)
+
+    # --------------------------------------------------------
+    # Build Bucket B signals (TRUE RELATIVE MOMENTUM)
+    # --------------------------------------------------------
+    
+    # 1) Start from base universe
+    dfB = base.copy()
+    
+    # 2) Merge index returns (creates idx_ret_1d)
+    idx = pd.read_parquet(ARTIFACTS / "index_returns_5y.parquet")
+    idx.columns = idx.columns.str.lower().str.replace(" ", "_")
+    idx["date"] = pd.to_datetime(idx["date"])
+    
+    dfB = dfB.merge(
+        idx,
+        left_on=["Date", "Index"],
+        right_on=["date", "index"],
+        how="left",
+        validate="many_to_one"
+    ).drop(columns=["date", "index"], errors="ignore")
+    
+    # 3) Drop rows without index data
+    dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
+    
+    # 4) Absolute stock returns (needed for compounding)
+    dfB = add_absolute_returns(dfB)
+    
+    # 5) Stock momentum features
     dfB = calculate_momentum_features(dfB, windows=WINDOWS)
-    dfB = add_regime_momentum_score(dfB)   # SAME as A
-    dfB = make_relative_bucket(dfB)        # 🔥 KEY DIFFERENCE
+    
+    # 6) Index momentum
+    idx_mom = compute_index_momentum(idx, windows=WINDOWS)
+    
+    dfB = dfB.merge(
+        idx_mom[
+            [
+                "date", "index",
+                "idx_5D", "idx_10D",
+                "idx_30D", "idx_45D",
+                "idx_60D", "idx_90D",
+            ]
+        ],
+        left_on=["Date", "Index"],
+        right_on=["date", "index"],
+        how="left"
+    ).drop(columns=["date", "index"], errors="ignore")
+    
+    # 7) RELATIVE regime momentum (this is the key)
+    dfB = add_relative_regime_momentum_score(dfB)
+    
+    # 8) Regime filters (same as local pipeline)
+    dfB = dfB[
+        (dfB["Momentum_Slow"] > 1.0) &
+        (dfB["Momentum_Mid"] > 0.5) &
+        (dfB["Momentum_Fast"] > 1.0)
+    ].copy()
+    
+    # 9) Acceleration + early momentum
     dfB = add_regime_acceleration(dfB)
     dfB = add_regime_early_momentum(dfB)
-
+    
+    # 10) Daily lists
     dailyB = build_daily_lists(dfB, top_n=TOP_N)
 
     # --------------------------------------------------------
     # A backtest + trades (baseline-style)
     # --------------------------------------------------------
     print("📊 Running Bucket A backtest...")
-    eqA, trA = backtest_single_bucket_like_baseline(
+    eqA, trA = simulate_single_bucket_as_unified(
+        df_prices=base,
         price_table=price_table,
         daily_df=dailyA,
         rebalance_interval=REBALANCE_INTERVAL,
-        capital_per_trade=5_000,
+        lookback_days=LOOKBACK_DAYS,
+        w_momentum=W_MOM,
+        w_early=W_EARLY,
+        w_consistency=W_CONS,
+        top_n=TOP_N,
+        total_capital=TOTAL_CAPITAL,
+        dollars_per_name= 5_000
     )
     statsA = compute_perf_stats_full(eqA, value_col="Portfolio Value")
     tstatsA = compute_trade_stats(trA)
@@ -473,15 +423,22 @@ def main():
     # B backtest + trades (baseline-style)
     # --------------------------------------------------------
     print("📊 Running Bucket B backtest...")
-    eqB, trB = backtest_single_bucket_like_baseline(
+    eqB, trB = simulate_single_bucket_as_unified(
+        df_prices=base,
         price_table=price_table,
         daily_df=dailyB,
         rebalance_interval=REBALANCE_INTERVAL,
-        capital_per_trade=5_000,
+        lookback_days=LOOKBACK_DAYS,
+        w_momentum=W_MOM,
+        w_early=W_EARLY,
+        w_consistency=W_CONS,
+        top_n=TOP_N,
+        total_capital=TOTAL_CAPITAL,
+        dollars_per_name= 5_000
     )
     statsB = compute_perf_stats_full(eqB, value_col="Portfolio Value")
     tstatsB = compute_trade_stats(trB)
-
+    
     eqB.to_parquet(EQUITY_B_OUT, index=False)
     trB.to_parquet(TRADES_B_OUT, index=False)
     write_json(STATS_B_OUT, statsB)
