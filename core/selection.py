@@ -102,15 +102,25 @@ def build_unified_target(
 
     A_rank = score(A).head(top_n)
     B_rank = score(B).head(top_n)
-
-    A_rank["Bucket"] = "A"
-    B_rank["Bucket"] = "B"
-
-    A_rank["Capital"] = total_capital * weight_A / len(A_rank)
-    B_rank["Capital"] = total_capital * weight_B / len(B_rank)
-
-    final = pd.concat([A_rank, B_rank], ignore_index=True)
+    
+    frames = []
+    
+    if not A_rank.empty:
+        A_rank = A_rank.copy()
+        A_rank["Bucket"] = "A"
+        A_rank["Capital"] = (total_capital * weight_A) / len(A_rank)
+        frames.append(A_rank)
+    
+    if not B_rank.empty:
+        B_rank = B_rank.copy()
+        B_rank["Bucket"] = "B"
+        B_rank["Capital"] = (total_capital * weight_B) / len(B_rank)
+        frames.append(B_rank)
+    
+    if not frames:
+        return pd.DataFrame()
+    
+    final = pd.concat(frames, ignore_index=True)
     final["AsOf"] = as_of_date
-
     return final
 
