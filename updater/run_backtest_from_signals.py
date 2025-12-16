@@ -210,6 +210,64 @@ def write_today(daily_df: pd.DataFrame, out_path: Path):
 
 
 # ============================================================
+# BUCKET B: RELATIVE MOMENTUM (CROSS-SECTIONAL RANK)
+# ============================================================
+
+def make_relative_bucket(df: pd.DataFrame, windows: tuple[int, ...]) -> pd.DataFrame:
+    """
+    Convert an absolute-momentum feature table into a relative-momentum scoring table.
+
+    We build a single cross-sectional score each Date:
+    - pick one momentum feature (prefer longest window)
+    - rank tickers on that Date (higher = better)
+    - convert rank into [0, 1] "RelScore"
+    - write into RegimeMomentumScore so build_daily_lists can pick off it
+    """
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out = out.dropna(subset=["Date"])
+
+    # Choose a momentum column that likely exists after calculate_momentum_features()
+    # Try common patterns; fall back to any numeric "momentum-ish" column.
+    candidate_cols = []
+    for w in sorted(windows, reverse=True):
+        candidate_cols += [
+            f"Momentum_{w}",
+            f"momentum_{w}",
+            f"Return_{w}",
+            f"return_{w}",
+            f"AbsRet_{w}",
+        ]
+    mom_col = next((c for c in candidate_cols if c in out.columns), None)
+
+    if mom_col is None:
+        # fallback: find a numeric column with "mom" or "moment" in name
+        for c in out.columns:
+            if isinstance(c, str) and any(k in c.lower() for k in ["mom", "momentum"]):
+                if pd.api.types.is_numeric_dtype(out[c]):
+                    mom_col = c
+                    break
+
+    if mom_col is None:
+        raise ValueError("Could not find a momentum column to rank for Bucket B. Check calculate_momentum_features output.")
+
+    # cross-sectional rank per day
+    out["_mom"] = pd.to_numeric(out[mom_col], errors="coerce")
+    out = out.dropna(subset=["_mom"])
+
+    # pct rank => [0,1]
+    out["RelScore"] = out.groupby("Date")["_mom"].rank(pct=True, ascending=True)
+
+    # Put it into the column selection code is already expecting
+    # (build_daily_lists typically keys off RegimeMomentumScore or similar)
+    out["RegimeMomentumScore"] = out["RelScore"]
+
+    # cleanup
+    out.drop(columns=["_mom"], inplace=True, errors="ignore")
+    return out
+
+
+# ============================================================
 # A/B BACKTEST (MATCHES YOUR BASELINE STYLE)
 # ============================================================
 
@@ -220,12 +278,6 @@ def backtest_single_bucket_like_baseline(
     capital_per_trade: float = 5_000,
     start_capital: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Baseline-style A/B:
-    - On each rebalance date, buy equal fixed capital_per_trade per selected ticker
-    - Hold until next rebalance, then sell
-    - Equity curve compounds by summing PnL across trades each period
-    """
 
     if daily_df is None or daily_df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -239,13 +291,11 @@ def backtest_single_bucket_like_baseline(
     if d.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # rebalance schedule from available signal dates
     reb_dates = sorted(d["Date"].unique())
     reb_dates = reb_dates[::rebalance_interval]
     if len(reb_dates) < 2:
         return pd.DataFrame(), pd.DataFrame()
 
-    # initial picks (for initial capital if not provided)
     first_dt = pd.Timestamp(reb_dates[0])
     first_picks = (
         d.loc[d["Date"] == first_dt, "Ticker"]
@@ -257,8 +307,7 @@ def backtest_single_bucket_like_baseline(
 
     capital = float(start_capital) if start_capital is not None else float(capital_per_trade) * float(len(first_picks))
     if capital <= 0:
-        # fallback so we don't start at 0 and zero out stats
-        capital = float(capital_per_trade) * 10.0  # TOP_N-ish default
+        capital = float(capital_per_trade) * 10.0
 
     trades = []
     equity_rows = [{"Date": first_dt, "Portfolio Value": capital, "PnL": 0.0}]
@@ -324,17 +373,20 @@ def build_unified_trades_over_time(
     top_n: int,
     total_capital: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Replays the unified target each rebalance date and generates per-ticker trades between rebalances.
-    """
+
     dates = sorted(price_table.index.dropna().unique())
     rebalance_dates = dates[::rebalance_interval]
     if len(rebalance_dates) < 2:
         return pd.DataFrame(), pd.DataFrame()
 
     trades = []
-    equity_rows = []
     capital = float(total_capital)
+
+    equity_rows = [{
+        "Date": pd.Timestamp(rebalance_dates[0]),
+        "Portfolio Value": capital,
+        "PnL": 0.0,
+    }]
 
     for i in range(1, len(rebalance_dates)):
         prev = pd.Timestamp(rebalance_dates[i - 1])
@@ -377,12 +429,12 @@ def build_unified_trades_over_time(
                     "Exit Price": float(p1),
                     "Return": float(r),
                     "PnL": float(pnl),
-                    "Action": "Sell",  # ✅ FIX: prevent KeyError in trade stats
+                    "Action": "Sell",
                 }
             )
 
         capital += period_pnl
-        equity_rows.append({"Date": curr, "Portfolio Value": capital, "PnL": period_pnl})
+        equity_rows.append({"Date": curr, "Portfolio Value": float(capital), "PnL": float(period_pnl)})
 
     equity_df = pd.DataFrame(equity_rows).sort_values("Date").reset_index(drop=True)
     trades_df = pd.DataFrame(trades).sort_values(["Exit Date", "Ticker"]).reset_index(drop=True)
@@ -416,10 +468,15 @@ def main():
     dailyA = build_daily_lists(dfA, top_n=TOP_N)
 
     # --------------------------------------------------------
-    # Build Bucket B signals (RELATIVE) — placeholder
+    # Build Bucket B signals (RELATIVE - cross-sectional rank)
     # --------------------------------------------------------
-    print("🧮 Building Bucket B signals...")
-    dfB = dfA.copy()
+    print("🧮 Building Bucket B signals (relative ranking)...")
+    dfB = add_absolute_returns(base)
+    dfB = calculate_momentum_features(dfB, windows=WINDOWS)
+    dfB = make_relative_bucket(dfB, windows=WINDOWS)  # ✅ key change
+    dfB = add_regime_acceleration(dfB)
+    dfB = add_regime_early_momentum(dfB)
+
     dailyB = build_daily_lists(dfB, top_n=TOP_N)
 
     # --------------------------------------------------------
@@ -503,17 +560,10 @@ def main():
     write_json(STATS_C_OUT, statsC)
     write_json(TRADE_STATS_C_OUT, tstatsC)
 
-    # Today C: last target from core return (as before)
     if isinstance(target_last, pd.DataFrame) and not target_last.empty:
         target_last.to_parquet(TODAY_C_OUT, index=False)
 
-    print("✅ Backtest artifacts written:")
-    for p in [
-        EQUITY_A_OUT, TRADES_A_OUT, STATS_A_OUT, TRADE_STATS_A_OUT, TODAY_A_OUT,
-        EQUITY_B_OUT, TRADES_B_OUT, STATS_B_OUT, TRADE_STATS_B_OUT, TODAY_B_OUT,
-        EQUITY_C_OUT, TRADES_C_OUT, STATS_C_OUT, TRADE_STATS_C_OUT, TODAY_C_OUT,
-    ]:
-        print(f"  • {p}")
+    print("✅ Backtest artifacts written.")
 
 
 if __name__ == "__main__":
