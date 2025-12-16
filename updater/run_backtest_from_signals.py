@@ -342,12 +342,17 @@ def main():
     idx.columns = idx.columns.str.lower().str.replace(" ", "_")
     idx["date"] = pd.to_datetime(idx["date"])
     
+    # 🔧 normalize index column name ONCE
+    if "index" not in idx.columns:
+        for c in idx.columns:
+            if c in ("index_name", "benchmark", "symbol", "ticker"):
+                idx = idx.rename(columns={c: "index"})
+                break
     dfB = dfB.merge(
         idx,
         left_on=["Date", "Index"],
         right_on=["date", "index"],
-        how="left",
-        validate="many_to_one"
+        how="left"
     ).drop(columns=["date", "index"], errors="ignore")
     
     # 3) Drop rows without index data
@@ -361,7 +366,6 @@ def main():
     
     # 6) Index momentum
     idx_mom = compute_index_momentum(idx, windows=WINDOWS)
-    
     dfB = dfB.merge(
         idx_mom[
             [
