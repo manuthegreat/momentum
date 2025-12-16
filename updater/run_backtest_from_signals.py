@@ -355,6 +355,13 @@ def main():
         how="left"
     ).drop(columns=["date", "index"], errors="ignore")
     
+
+    # 4) Absolute stock returns (needed for compounding)
+    dfB = add_absolute_returns(dfB)
+    
+    # 5) Stock momentum features
+    dfB = calculate_momentum_features(dfB, windows=WINDOWS)
+
     # 3) Drop rows without index data
     # --------------------------------------------------------
     # Normalize index return column
@@ -384,12 +391,6 @@ def main():
         dfB = dfB.rename(columns={found: "idx_ret_1d"})
 
     dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
-
-    # 4) Absolute stock returns (needed for compounding)
-    dfB = add_absolute_returns(dfB)
-    
-    # 5) Stock momentum features
-    dfB = calculate_momentum_features(dfB, windows=WINDOWS)
     
     # 6) Index momentum
     idx_mom = compute_index_momentum(idx, windows=WINDOWS)
