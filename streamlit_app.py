@@ -52,24 +52,24 @@ st.title("📈 Momentum Strategy — Daily Execution")
 
 st.subheader("Backtest Summary (Bucket C)")
 
-if stats:
-    cagr = None
-    if not equity.empty and {"Date", "Equity"}.issubset(equity.columns):
-        eq_sorted = equity.sort_values("Date")
-        start_val = eq_sorted["Equity"].iloc[0]
-        end_val   = eq_sorted["Equity"].iloc[-1]
-        days = (eq_sorted["Date"].iloc[-1] - eq_sorted["Date"].iloc[0]).days
-        if days > 0:
-            cagr = (end_val / start_val) ** (365 / days) - 1
+if stats and not equity.empty and {"Date", "Equity"}.issubset(equity.columns):
+    eq = equity.sort_values("Date")
 
-    cols = st.columns(4)
-    cols[0].metric("Total Return (%)", round(stats.get("Total Return (%)", 0), 2))
-    cols[1].metric("Sharpe", round(stats.get("Sharpe", 0), 2))
-    cols[2].metric("Max Drawdown (%)", round(stats.get("Max Drawdown (%)", 0), 2))
-    cols[3].metric("CAGR (%)", round(cagr * 100, 2) if cagr else "—")
+    start_val = eq["Equity"].iloc[0]
+    end_val   = eq["Equity"].iloc[-1]
+    days = (eq["Date"].iloc[-1] - eq["Date"].iloc[0]).days
 
-    if not equity.empty:
-        st.caption(f"Last equity date: {equity['Date'].max().date()}")
+    cagr = (end_val / start_val) ** (365 / days) - 1 if days > 0 else None
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Return (%)", round(stats.get("Total Return (%)", 0), 2))
+    c2.metric("Sharpe", round(stats.get("Sharpe", 0), 2))
+    c3.metric("Max Drawdown (%)", round(stats.get("Max Drawdown (%)", 0), 2))
+    c4.metric("CAGR (%)", round(cagr * 100, 2) if cagr else "—")
+
+    st.caption(f"Last equity date: {eq['Date'].max().date()}")
+else:
+    st.info("Backtest stats unavailable")
 
 # ============================================================
 # EQUITY CURVE
@@ -77,29 +77,13 @@ if stats:
 
 st.subheader("Equity Curve")
 
-if not equity.empty and "Date" in equity.columns:
-    eq = equity.sort_values("Date").copy()
-    value_col = "Equity" if "Equity" in eq.columns else "Portfolio Value"
-
-    if value_col in eq.columns:
-        st.line_chart(eq.set_index("Date")[value_col], width="stretch")
+if not equity.empty and {"Date", "Equity"}.issubset(equity.columns):
+    st.line_chart(
+        equity.sort_values("Date").set_index("Date")["Equity"],
+        width="stretch"
+    )
 else:
     st.info("Equity data not available")
-
-# ============================================================
-# COLUMN NORMALIZATION (KEY FIX)
-# ============================================================
-
-def normalize_portfolio_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Makes portfolio tables readable regardless of upstream naming.
-    """
-    df = df.copy()
-
-    if "Capital" in df.columns and "Position_Size" not in df.columns:
-        df["Position_Size"] = df["Capital"]
-
-    return df
 
 # ============================================================
 # TODAY'S PORTFOLIO
@@ -107,19 +91,14 @@ def normalize_portfolio_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 st.subheader("Today's Portfolio — Bucket C")
 
-if signals.empty or "Date" not in signals.columns:
-    st.info("No signal data available")
-else:
+if not signals.empty and {"Date", "Bucket"}.issubset(signals.columns):
     latest_date = signals["Date"].max()
     today = signals[
         (signals["Bucket"] == "C") &
         (signals["Date"] == latest_date)
     ]
 
-    if today.empty:
-        st.info("No positions for latest rebalance")
-    else:
-        today = normalize_portfolio_columns(today)
+    if not today.empty:
         st.caption(f"Rebalance date: {latest_date.date()}")
 
         display_cols = [
@@ -148,6 +127,10 @@ else:
             .reset_index(drop=True),
             width="stretch"
         )
+    else:
+        st.info("No positions for latest rebalance")
+else:
+    st.info("Signal data unavailable")
 
 # ============================================================
 # REBALANCE TIMELINE
@@ -155,88 +138,92 @@ else:
 
 st.subheader("Rebalance Timeline")
 
-if not equity.empty and "Date" in equity.columns:
+if not equity.empty and {"Date", "Equity"}.issubset(equity.columns):
     eq = equity.sort_values("Date").copy()
-
-    # Detect equity column safely
-    if "Equity" in eq.columns:
-        eq_val = "Equity"
-    elif "Portfolio Value" in eq.columns:
-        eq = eq.rename(columns={"Portfolio Value": "Equity"})
-        eq_val = "Equity"
-    else:
-        st.info("Equity value column not found")
-        st.stop()
-    
-    # Now this is safe
     eq["Period PnL"] = eq["Equity"].diff()
 
-
-    counts = (
-        signals[signals["Bucket"] == "C"]
-        .groupby("Date")["Ticker"]
-        .count()
-    )
-    eq["# Names"] = eq["Date"].map(counts)
+    if not signals.empty and {"Date", "Bucket", "Ticker"}.issubset(signals.columns):
+        counts = (
+            signals[signals["Bucket"] == "C"]
+            .groupby("Date")["Ticker"]
+            .count()
+        )
+        eq["# Names"] = eq["Date"].map(counts)
 
     st.dataframe(
         eq[["Date", "Equity", "Period PnL", "# Names"]]
-        .sort_values("Date", ascending=False),
+        .sort_values("Date", ascending=False)
+        .reset_index(drop=True),
         width="stretch"
     )
+else:
+    st.info("No rebalance history available")
 
 # ============================================================
-# REBALANCE DRILL-DOWN
+# REBALANCE DRILL-DOWN (WITH TICKER PnL)
 # ============================================================
 
 st.subheader("Rebalance Portfolio Drill-Down")
 
-rebalance_dates = (
-    signals["Date"]
-    .dropna()
-    .sort_values(ascending=False)
-    .dt.date
-    .unique()
-    .tolist()
-)
+if not equity.empty and not signals.empty:
+    rebalance_dates = (
+        equity["Date"]
+        .dropna()
+        .sort_values(ascending=False)
+        .dt.date
+        .unique()
+        .tolist()
+    )
 
-if rebalance_dates:
     selected_date = st.selectbox("Select rebalance date", rebalance_dates)
-    selected_ts = pd.to_datetime(selected_date)
+    rebalance_ts = pd.to_datetime(selected_date)
 
-    rebalance_df = signals[
+    # Portfolio at rebalance
+    portfolio = signals[
         (signals["Bucket"] == "C") &
-        (signals["Date"] == selected_ts)
-    ]
+        (signals["Date"] == rebalance_ts)
+    ].copy()
 
-    if not rebalance_df.empty:
-        rebalance_df = normalize_portfolio_columns(rebalance_df)
-
-        display_cols = [
-            c for c in [
-                "Ticker",
-                "Position_Size",
-                "Weighted_Score",
-                "Momentum Score",
-                "Early Momentum Score",
-                "Consistency",
-            ]
-            if c in rebalance_df.columns
-        ]
-
-        sort_col = (
-            "Position_Size"
-            if "Position_Size" in rebalance_df.columns
-            else "Weighted_Score"
-            if "Weighted_Score" in rebalance_df.columns
-            else "Ticker"
-        )
-
-        st.dataframe(
-            rebalance_df[display_cols]
-            .sort_values(sort_col, ascending=False)
-            .reset_index(drop=True),
-            width="stretch"
-        )
+    # Next rebalance equity date (for PnL window)
+    next_dates = equity[equity["Date"] > rebalance_ts]["Date"]
+    if portfolio.empty or next_dates.empty:
+        st.info("No drill-down data available for selected date")
     else:
-        st.info("No portfolio for selected rebalance date")
+        next_ts = next_dates.min()
+
+        eq_start = equity.loc[equity["Date"] == rebalance_ts, "Equity"].values
+        eq_end   = equity.loc[equity["Date"] == next_ts, "Equity"].values
+
+        if len(eq_start) == 0 or len(eq_end) == 0:
+            st.info("PnL window incomplete for selected rebalance")
+        else:
+            total_pnl = eq_end[0] - eq_start[0]
+
+            # Allocate PnL proportionally by position size
+            if "Position_Size" in portfolio.columns:
+                w = portfolio["Position_Size"] / portfolio["Position_Size"].sum()
+                portfolio["PnL"] = w * total_pnl
+            else:
+                portfolio["PnL"] = np.nan
+
+            display_cols = [
+                c for c in [
+                    "Ticker",
+                    "Position_Size",
+                    "PnL",
+                    "Weighted_Score",
+                    "Momentum Score",
+                    "Early Momentum Score",
+                    "Consistency",
+                ]
+                if c in portfolio.columns
+            ]
+
+            st.dataframe(
+                portfolio[display_cols]
+                .sort_values("PnL", ascending=False)
+                .reset_index(drop=True),
+                width="stretch"
+            )
+else:
+    st.info("Insufficient data for drill-down")
