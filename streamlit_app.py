@@ -189,3 +189,59 @@ else:
             .sort_values("Date", ascending=False),
             width="stretch"
         )
+# ============================================================
+# REBALANCE DRILL-DOWN
+# ============================================================
+
+st.subheader("Rebalance Portfolio Drill-Down")
+
+if equity.empty or "Date" not in equity.columns:
+    st.info("No rebalance history available")
+else:
+    # Available rebalance dates (latest first)
+    rebalance_dates = (
+        equity["Date"]
+        .dropna()
+        .sort_values(ascending=False)
+        .dt.date
+        .unique()
+        .tolist()
+    )
+
+    selected_date = st.selectbox(
+        "Select rebalance date",
+        rebalance_dates,
+        index=0
+    )
+
+    # Convert back to timestamp for filtering
+    selected_ts = pd.to_datetime(selected_date)
+
+    rebalance_portfolio = signals[
+        (signals["Bucket"] == "C") &
+        (signals["Date"] == selected_ts)
+    ]
+
+    if rebalance_portfolio.empty:
+        st.info("No portfolio found for selected rebalance")
+    else:
+        display_cols = [
+            "Ticker",
+            "Position_Size",
+            "Weighted_Score",
+            "Momentum Score",
+            "Early Momentum Score",
+            "Consistency",
+        ]
+
+        display_cols = [c for c in display_cols if c in rebalance_portfolio.columns]
+
+        st.dataframe(
+            rebalance_portfolio[display_cols]
+            .sort_values(
+                "Position_Size" if "Position_Size" in display_cols else "Ticker",
+                ascending=False
+            )
+            .reset_index(drop=True),
+            width="stretch"
+        )
