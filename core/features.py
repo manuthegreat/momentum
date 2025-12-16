@@ -28,6 +28,28 @@ def calculate_momentum_features(df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90
 
     return df.fillna(0.0)
 
+def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    True relative momentum:
+    stock momentum minus index momentum across regimes
+    """
+
+    df = df.copy()
+
+    # Fast / Mid / Slow relative momentum
+    df["Rel_Momentum_Fast"] = df["Momentum_Fast"] - df["idx_5D"]
+    df["Rel_Momentum_Mid"]  = df["Momentum_Mid"]  - df["idx_30D"]
+    df["Rel_Momentum_Slow"] = df["Momentum_Slow"] - df["idx_90D"]
+
+    # Regime-style aggregation (same structure as absolute)
+    df["Regime_Momentum_Score"] = (
+        0.4 * df["Rel_Momentum_Fast"] +
+        0.3 * df["Rel_Momentum_Mid"] +
+        0.3 * df["Rel_Momentum_Slow"]
+    )
+
+    return df
+
 
 def add_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
