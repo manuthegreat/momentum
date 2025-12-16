@@ -157,7 +157,20 @@ st.subheader("Rebalance Timeline")
 
 if not equity.empty and "Date" in equity.columns:
     eq = equity.sort_values("Date").copy()
+
+    # Detect equity column safely
+    if "Equity" in eq.columns:
+        eq_val = "Equity"
+    elif "Portfolio Value" in eq.columns:
+        eq = eq.rename(columns={"Portfolio Value": "Equity"})
+        eq_val = "Equity"
+    else:
+        st.info("Equity value column not found")
+        st.stop()
+    
+    # Now this is safe
     eq["Period PnL"] = eq["Equity"].diff()
+
 
     counts = (
         signals[signals["Bucket"] == "C"]
