@@ -218,11 +218,15 @@ def backtest_single_bucket_like_baseline(
     daily_df: pd.DataFrame,
     rebalance_interval: int,
     capital_per_trade: float = 5_000,
+    start_capital: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Equity: on each rebalance date, value = sum(capital_per_trade) across picks.
-    Trades: between consecutive rebalance dates, per-ticker PnL based on fixed capital_per_trade.
+    Baseline-style A/B:
+    - On each rebalance date, buy equal fixed capital_per_trade per selected ticker
+    - Hold until next rebalance, then sell
+    - Equity curve compounds by summing PnL across trades each period
     """
+
     if daily_df is None or daily_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -241,29 +245,24 @@ def backtest_single_bucket_like_baseline(
     if len(reb_dates) < 2:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Equity series (value on each rebalance date)
-    equity_rows = []
-    for rd in reb_dates:
-        picks = (
-            d.loc[d["Date"] == rd, "Ticker"]
-            .dropna()
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-        value = 0.0
-        for t in picks:
-            px = get_last_price(price_table, t, pd.Timestamp(rd))
-            if px is None or px == 0:
-                continue
-            shares = float(capital_per_trade) / float(px)
-            value += shares * float(px)
-        equity_rows.append({"Date": pd.Timestamp(rd), "Portfolio Value": float(value)})
+    # initial picks (for initial capital if not provided)
+    first_dt = pd.Timestamp(reb_dates[0])
+    first_picks = (
+        d.loc[d["Date"] == first_dt, "Ticker"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
 
-    equity_df = pd.DataFrame(equity_rows).sort_values("Date").reset_index(drop=True)
+    capital = float(start_capital) if start_capital is not None else float(capital_per_trade) * float(len(first_picks))
+    if capital <= 0:
+        # fallback so we don't start at 0 and zero out stats
+        capital = float(capital_per_trade) * 10.0  # TOP_N-ish default
 
-    # Trades between consecutive rebalances
     trades = []
+    equity_rows = [{"Date": first_dt, "Portfolio Value": capital, "PnL": 0.0}]
+
     for i in range(1, len(reb_dates)):
         entry_dt = pd.Timestamp(reb_dates[i - 1])
         exit_dt = pd.Timestamp(reb_dates[i])
@@ -276,6 +275,8 @@ def backtest_single_bucket_like_baseline(
             .tolist()
         )
 
+        period_pnl = 0.0
+
         for t in picks:
             p0 = get_last_price(price_table, t, entry_dt)
             p1 = get_last_price(price_table, t, exit_dt)
@@ -284,6 +285,7 @@ def backtest_single_bucket_like_baseline(
 
             r = (p1 / p0) - 1.0
             pnl = float(capital_per_trade) * float(r)
+            period_pnl += pnl
 
             trades.append(
                 {
@@ -295,18 +297,14 @@ def backtest_single_bucket_like_baseline(
                     "Exit Price": float(p1),
                     "Return": float(r),
                     "PnL": float(pnl),
-                    "Action": "Sell",  # ✅ ensure Action exists everywhere
                 }
             )
 
-    trades_df = (
-        pd.DataFrame(trades)
-        .sort_values(["Exit Date", "Ticker"])
-        .reset_index(drop=True)
-        if trades
-        else pd.DataFrame()
-    )
+        capital += period_pnl
+        equity_rows.append({"Date": exit_dt, "Portfolio Value": float(capital), "PnL": float(period_pnl)})
 
+    equity_df = pd.DataFrame(equity_rows).sort_values("Date").reset_index(drop=True)
+    trades_df = pd.DataFrame(trades).sort_values(["Exit Date", "Ticker"]).reset_index(drop=True) if trades else pd.DataFrame()
     return equity_df, trades_df
 
 
