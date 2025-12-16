@@ -365,9 +365,19 @@ def main():
         right_on=["date", "index"],
         how="left",
     ).drop(columns=["date", "index"], errors="ignore")
+
+    # Excess momentum = stock momentum minus index momentum
+    dfB["Excess_Fast"] = dfB["Momentum_Fast"] - dfB["idx_5D"]
+    dfB["Excess_Mid"]  = dfB["Momentum_Mid"]  - dfB["idx_30D"]
+    dfB["Excess_Slow"] = dfB["Momentum_Slow"] - dfB["idx_60D"]
+    
+    # Replace momentum columns used downstream with excess versions
+    dfB["Momentum_Fast"] = dfB["Excess_Fast"]
+    dfB["Momentum_Mid"]  = dfB["Excess_Mid"]
+    dfB["Momentum_Slow"] = dfB["Excess_Slow"]
     
     # Relative regime momentum (✅ uses FIX 1 implementation)
-    dfB = add_relative_regime_momentum_score(dfB)
+    #dfB = add_relative_regime_momentum_score(dfB)
     
     # Regime filters
     dfB = dfB[
@@ -381,6 +391,11 @@ def main():
     dfB = add_regime_early_momentum(dfB)
     
     # Daily lists
+    # --------------------------------------------------------
+    # FIX: TRUE RELATIVE (EXCESS) MOMENTUM — PIPELINE CONSISTENT
+    # --------------------------------------------------------
+    
+
     dailyB = build_daily_lists(dfB, top_n=TOP_N)
 
 
