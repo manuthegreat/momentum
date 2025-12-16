@@ -26,6 +26,16 @@ from core.features import (
 ARTIFACTS = Path("artifacts")
 
 PRICE_PATH = ARTIFACTS / "index_constituents_5yr.parquet"
+
+# Bucket A artifacts
+A_TODAY_OUT = ARTIFACTS / "today_A.parquet"
+A_STATS_OUT = ARTIFACTS / "backtest_stats_A.json"
+
+# Bucket B artifacts
+B_TODAY_OUT = ARTIFACTS / "today_B.parquet"
+B_STATS_OUT = ARTIFACTS / "backtest_stats_B.json"
+
+# Bucket C artifacts
 EQUITY_OUT = ARTIFACTS / "backtest_equity_C.parquet"
 TRADES_OUT = ARTIFACTS / "backtest_trades_C.parquet"
 STATS_OUT  = ARTIFACTS / "backtest_stats_C.json"
@@ -56,7 +66,7 @@ def main():
     base = filter_by_index(base, "SP500")
 
     # --------------------------------------------------------
-    # Build Bucket A daily lists (ABSOLUTE)
+    # Build Bucket A — ABSOLUTE MOMENTUM
     # --------------------------------------------------------
 
     print("🧮 Building Bucket A signals...")
@@ -68,16 +78,53 @@ def main():
 
     dailyA = build_daily_lists(dfA, top_n=TOP_N)
 
+    # 👉 NEW: Persist Bucket A signals
+    dailyA.to_parquet(A_TODAY_OUT, index=False)
+
+    # Optional but included: A-only backtest stats (parity with CLI)
+    equity_A, _ = simulate_unified_portfolio(
+        df_prices=base,
+        price_table=base.pivot(index="Date", columns="Ticker", values="Price"),
+        dailyA=dailyA,
+        dailyB=dailyA,
+        rebalance_interval=REBALANCE_INTERVAL,
+        lookback_days=LOOKBACK_DAYS,
+        top_n=TOP_N,
+        total_capital=TOTAL_CAPITAL,
+    )
+    stats_A = compute_performance_stats(equity_A)
+
+    with open(A_STATS_OUT, "w") as f:
+        json.dump(stats_A, f, indent=2)
+
     # --------------------------------------------------------
-    # Build Bucket B daily lists (RELATIVE already baked in upstream)
+    # Build Bucket B — RELATIVE MOMENTUM
     # --------------------------------------------------------
 
     print("🧮 Building Bucket B signals...")
-    dfB = dfA.copy()  # Bucket B already filtered upstream in your pipeline
+    dfB = dfA.copy()  # relative filters already applied upstream
     dailyB = build_daily_lists(dfB, top_n=TOP_N)
 
+    # 👉 NEW: Persist Bucket B signals
+    dailyB.to_parquet(B_TODAY_OUT, index=False)
+
+    equity_B, _ = simulate_unified_portfolio(
+        df_prices=base,
+        price_table=base.pivot(index="Date", columns="Ticker", values="Price"),
+        dailyA=dailyB,
+        dailyB=dailyB,
+        rebalance_interval=REBALANCE_INTERVAL,
+        lookback_days=LOOKBACK_DAYS,
+        top_n=TOP_N,
+        total_capital=TOTAL_CAPITAL,
+    )
+    stats_B = compute_performance_stats(equity_B)
+
+    with open(B_STATS_OUT, "w") as f:
+        json.dump(stats_B, f, indent=2)
+
     # --------------------------------------------------------
-    # Price table for backtest
+    # Price table for unified backtest
     # --------------------------------------------------------
 
     price_table = (
@@ -86,12 +133,12 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Run unified backtest (Bucket C)
+    # Run Bucket C — UNIFIED (A + B)
     # --------------------------------------------------------
 
     print("📊 Running unified backtest (Bucket C)...")
 
-    equity, trades = simulate_unified_portfolio(
+    equity_C, trades_C = simulate_unified_portfolio(
         df_prices=base,
         price_table=price_table,
         dailyA=dailyA,
@@ -105,25 +152,29 @@ def main():
         total_capital=TOTAL_CAPITAL,
     )
 
-    stats = compute_performance_stats(equity)
+    stats_C = compute_performance_stats(equity_C)
 
     # --------------------------------------------------------
-    # Persist artifacts
+    # Persist Bucket C artifacts
     # --------------------------------------------------------
 
-    equity.to_parquet(EQUITY_OUT, index=False)
-    trades.to_parquet(TRADES_OUT, index=False)
+    equity_C.to_parquet(EQUITY_OUT, index=False)
+    trades_C.to_parquet(TRADES_OUT, index=False)
 
     with open(STATS_OUT, "w") as f:
-        json.dump(stats, f, indent=2)
+        json.dump(stats_C, f, indent=2)
 
     print("✅ Backtest artifacts written:")
+    print(f"  • {A_TODAY_OUT}")
+    print(f"  • {A_STATS_OUT}")
+    print(f"  • {B_TODAY_OUT}")
+    print(f"  • {B_STATS_OUT}")
     print(f"  • {EQUITY_OUT}")
     print(f"  • {TRADES_OUT}")
     print(f"  • {STATS_OUT}")
 
-    print("\n📈 Performance Summary:")
-    for k, v in stats.items():
+    print("\n📈 Bucket C Performance Summary:")
+    for k, v in stats_C.items():
         print(f"{k}: {v}")
 
 if __name__ == "__main__":
