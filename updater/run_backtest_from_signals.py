@@ -214,25 +214,30 @@ def write_today(daily_df: pd.DataFrame, out_path: Path):
 # ============================================================
 
 def make_relative_bucket(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert absolute momentum into relative (cross-sectional) momentum
-    by ranking RegimeMomentumScore within each Date.
-    """
     out = df.copy()
 
-    if "RegimeMomentumScore" not in out.columns:
+    # find the momentum column dynamically
+    candidates = [
+        "RegimeMomentumScore",
+        "Regime_Momentum_Score",
+        "MomentumScore",
+    ]
+
+    score_col = next((c for c in candidates if c in out.columns), None)
+
+    if score_col is None:
         raise ValueError(
-            "RegimeMomentumScore not found. "
-            "Did you forget to call add_regime_momentum_score()?"
+            f"No momentum score column found. "
+            f"Available columns: {list(out.columns)}"
         )
 
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    out = out.dropna(subset=["Date", "RegimeMomentumScore"])
+    out = out.dropna(subset=["Date", score_col])
 
-    # Cross-sectional rank per day → [0,1]
-    out["RegimeMomentumScore"] = (
-        out.groupby("Date")["RegimeMomentumScore"]
-           .rank(pct=True, ascending=True)
+    # Cross-sectional ranking (relative momentum)
+    out[score_col] = (
+        out.groupby("Date")[score_col]
+           .rank(pct=True, ascending=False)   # ← IMPORTANT
     )
 
     return out
