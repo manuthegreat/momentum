@@ -174,30 +174,30 @@ else:
     s["Date"] = pd.to_datetime(s["Date"], errors="coerce")
     s = s.dropna(subset=["Date"])
 
-    latest_signal_dt = s["Date"].max()
-    today = portfolio_for_date(s, latest_signal_dt)
+    latest_dt = s["Date"].max()
+    today = s[(s["Bucket"] == "C") & (s["Date"] == latest_dt)]
 
     if today.empty:
         st.info("No positions for latest rebalance date")
     else:
-        st.caption(f"Rebalance date: {latest_signal_dt.date()}")
+        st.caption(f"Rebalance date: {latest_dt.date()}")
 
-        display_cols = [
-            c for c in [
-                "Ticker",
-                "Position_Size",
-                "Weighted_Score",
-                "Momentum Score",
-                "Early Momentum Score",
-                "Consistency",
-            ]
-            if c in today.columns
-        ]
+        cols = ["Ticker"]
+        if "Position_Size" in today.columns:
+            cols.append("Position_Size")
+        if "Weighted_Score" in today.columns:
+            cols.append("Weighted_Score")
 
-        today = safe_sort(today, ["Position_Size", "Weighted_Score", "Ticker"], ascending=False)
+        sort_col = (
+            "Position_Size" if "Position_Size" in today.columns
+            else "Weighted_Score" if "Weighted_Score" in today.columns
+            else "Ticker"
+        )
 
         st.dataframe(
-            today[display_cols].reset_index(drop=True),
+            today[cols]
+            .sort_values(sort_col, ascending=False)
+            .reset_index(drop=True),
             width="stretch"
         )
 
@@ -241,52 +241,50 @@ st.subheader("Rebalance Portfolio Drill-Down")
 if equity.empty or signals.empty:
     st.info("No drill-down data available")
 else:
-    # use equity dates as the rebalance schedule (since the backtest writes those)
-    rebalance_dates = equity["Date"].dt.date.unique().tolist()
-    rebalance_dates = sorted(rebalance_dates, reverse=True)
+    dates = equity["Date"].dt.date.unique().tolist()
+    dates = sorted(dates, reverse=True)
 
-    selected_date = st.selectbox("Select rebalance date", rebalance_dates, index=0)
+    selected_date = st.selectbox("Select rebalance date", dates)
     selected_ts = pd.to_datetime(selected_date)
 
-    # next rebalance date (to compute period pnl)
-    future = equity[equity["Date"] > selected_ts]["Date"]
-    if future.empty:
-        st.info("Selected date is the last rebalance in equity history (no forward PnL window).")
+    port = signals[
+        (signals["Bucket"] == "C") &
+        (pd.to_datetime(signals["Date"], errors="coerce").dt.date == selected_date)
+    ]
+
+    if port.empty:
+        st.info("No portfolio for selected rebalance")
     else:
-        next_ts = future.min()
+        # Compute portfolio-level PnL
+        eq0 = equity.loc[equity["Date"].dt.date == selected_date, "Equity"]
+        eq1 = equity[equity["Date"] > pd.Timestamp(selected_date)]["Equity"].head(1)
 
-        eq0 = equity.loc[equity["Date"].dt.date == selected_ts.date(), "Equity"]
-        eq1 = equity.loc[equity["Date"].dt.date == next_ts.date(), "Equity"]
-
-        if eq0.empty or eq1.empty:
-            st.info("PnL window incomplete for the selected rebalance date.")
-        else:
+        period_pnl = None
+        if not eq0.empty and not eq1.empty:
             period_pnl = float(eq1.iloc[0] - eq0.iloc[0])
 
-            port = portfolio_for_date(signals, selected_ts)
-            if port.empty:
-                st.info("No portfolio rows found in signals for the selected rebalance date.")
-            else:
-                port = add_ticker_pnl_attribution(port, period_pnl)
+        st.caption(
+            f"Period PnL: {period_pnl:,.2f}" if period_pnl is not None
+            else "Period PnL unavailable"
+        )
 
-                st.caption(f"PnL window: {selected_ts.date()} → {next_ts.date()} | Period PnL: {period_pnl:,.2f}")
+        cols = ["Ticker"]
+        if "Position_Size" in port.columns:
+            cols.append("Position_Size")
 
-                display_cols = [
-                    c for c in [
-                        "Ticker",
-                        "Position_Size",
-                        "PnL",
-                        "Weighted_Score",
-                        "Momentum Score",
-                        "Early Momentum Score",
-                        "Consistency",
-                    ]
-                    if c in port.columns
-                ]
+        df = port[cols].copy()
 
-                port = safe_sort(port, ["PnL", "Position_Size", "Weighted_Score", "Ticker"], ascending=False)
+        # Only compute ticker PnL if possible
+        if period_pnl is not None and "Position_Size" in df.columns:
+            w = df["Position_Size"] / df["Position_Size"].sum()
+            df["PnL"] = w * period_pnl
+        else:
+            df["PnL"] = np.nan
 
-                st.dataframe(
-                    port[display_cols].reset_index(drop=True),
-                    width="stretch"
-                )
+        st.dataframe(
+            df.sort_values(
+                "PnL" if df["PnL"].notna().any() else "Ticker",
+                ascending=False
+            ).reset_index(drop=True),
+            width="stretch"
+        )
