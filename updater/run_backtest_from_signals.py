@@ -357,7 +357,7 @@ def main():
     
 
     # 4) Absolute stock returns (needed for compounding)
-    dfB = add_absolute_returns(dfB)
+    _absolute_returns(dfB)
     
     # 5) Stock momentum features
     dfB = calculate_momentum_features(dfB, windows=WINDOWS)
@@ -425,6 +425,18 @@ def main():
     missing = required - set(dfB.columns)
     if missing:
         raise ValueError(f"Bucket B missing required columns: {missing}")
+    
+    # --------------------------------------------------------
+    # Bucket B compatibility: early momentum expects Momentum Score
+    # --------------------------------------------------------
+    
+    if "Momentum Score" not in dfB.columns:
+        if "Relative_Momentum_Score" in dfB.columns:
+            dfB["Momentum Score"] = dfB["Relative_Momentum_Score"]
+        else:
+            raise ValueError(
+                "Bucket B missing Momentum Score and Relative_Momentum_Score"
+            )
 
     dfB = add_relative_regime_momentum_score(dfB)
     
