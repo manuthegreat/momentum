@@ -27,13 +27,20 @@ jobs:
         run: |
           export PYTHONPATH=$PWD
           python updater/run_backtest_from_signals.py
-
+      
       - name: Commit backtest artifacts
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+      
+          git add artifacts/today_A.parquet
+          git add artifacts/backtest_stats_A.json
+          git add artifacts/today_B.parquet
+          git add artifacts/backtest_stats_B.json
+      
           git add artifacts/backtest_equity_C.parquet
           git add artifacts/backtest_trades_C.parquet
           git add artifacts/backtest_stats_C.json
-          git commit -m "Update Bucket C backtest artifacts" || echo "No changes to commit"
+      
+          git commit -m "Update Bucket A, B, C backtest artifacts" || echo "No changes to commit"
           git push
