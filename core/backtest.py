@@ -37,6 +37,74 @@ def simulate_single_bucket(
 
     return pd.DataFrame(history)
 
+def simulate_single_bucket_as_unified(
+    df_prices,
+    price_table,
+    daily_df,
+    rebalance_interval,
+    lookback_days,
+    w_momentum,
+    w_early,
+    w_consistency,
+    top_n,
+    total_capital,
+    dollars_per_name,
+):
+    """
+    Single-bucket backtest that mirrors the unified capital mechanics.
+    This is what your PC baseline effectively does for A and B.
+    """
+
+    dates = sorted(price_table.index.unique())
+    rebalance_dates = dates[::rebalance_interval]
+
+    equity = []
+    trades = []
+    capital = total_capital
+
+    for i in range(1, len(rebalance_dates)):
+        prev = rebalance_dates[i - 1]
+        curr = rebalance_dates[i]
+
+        picks = daily_df[daily_df["Date"] == prev]["Ticker"].dropna().unique().tolist()
+        if not picks:
+            equity.append({"Date": curr, "Portfolio Value": capital})
+            continue
+
+        period_pnl = 0.0
+
+        for t in picks:
+            if t not in price_table.columns:
+                continue
+
+            p0 = price_table.loc[prev, t]
+            p1 = price_table.loc[curr, t]
+
+            if pd.isna(p0) or pd.isna(p1) or p0 == 0:
+                continue
+
+            alloc = dollars_per_name
+            r = (p1 / p0 - 1.0)
+            pnl = alloc * r
+            period_pnl += pnl
+
+            trades.append({
+                "Entry Date": prev,
+                "Exit Date": curr,
+                "Ticker": t,
+                "Capital": alloc,
+                "Entry Price": float(p0),
+                "Exit Price": float(p1),
+                "Return": float(r),
+                "PnL": float(pnl),
+                "Action": "Sell",
+            })
+
+        capital += period_pnl
+        equity.append({"Date": curr, "Portfolio Value": capital})
+
+    return pd.DataFrame(equity), pd.DataFrame(trades)
+
 
 def compute_performance_stats(history_df):
     if len(history_df) < 2:
