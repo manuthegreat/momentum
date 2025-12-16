@@ -356,8 +356,35 @@ def main():
     ).drop(columns=["date", "index"], errors="ignore")
     
     # 3) Drop rows without index data
-    dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
+    # --------------------------------------------------------
+    # Normalize index return column
+    # --------------------------------------------------------
     
+    idx_ret_candidates = [
+        "idx_ret_1d",
+        "index_ret_1d",
+        "ret_1d",
+        "return_1d",
+        "daily_return",
+    ]
+    
+    found = None
+    for c in idx_ret_candidates:
+        if c in dfB.columns:
+            found = c
+            break
+    
+    if found is None:
+        raise ValueError(
+            f"No daily index return column found after merge. Columns: {dfB.columns.tolist()}"
+        )
+    
+    # standardize name
+    if found != "idx_ret_1d":
+        dfB = dfB.rename(columns={found: "idx_ret_1d"})
+
+    dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
+
     # 4) Absolute stock returns (needed for compounding)
     dfB = add_absolute_returns(dfB)
     
