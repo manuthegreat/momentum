@@ -9,25 +9,63 @@ def add_absolute_returns(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_index_momentum(idx_df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90)) -> pd.DataFrame:
     """
-    Computes rolling momentum for index returns.
-    Expected input columns (lowercase):
-      - date
-      - index
-      - idx_ret_1d
+    Computes rolling momentum for indices using daily returns.
+    Robust to different column names in index parquet.
     """
 
     df = idx_df.copy()
 
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values(["index", "date"])
+    # -----------------------------------------
+    # Normalize column names
+    # -----------------------------------------
+    df.columns = df.columns.str.lower().str.replace(" ", "_")
 
-    for w in windows:
-        df[f"idx_{w}D"] = (
-            df.groupby("index")["idx_ret_1d"]
-              .transform(lambda x: (1 + x).rolling(w).apply(np.prod, raw=True) - 1)
+    # normalize index column
+    if "index" not in df.columns:
+        for c in df.columns:
+            if c in ("index_name", "benchmark", "symbol", "ticker"):
+                df = df.rename(columns={c: "index"})
+                break
+
+    # normalize daily return column
+    ret_candidates = [
+        "idx_ret_1d",
+        "index_ret_1d",
+        "ret_1d",
+        "return_1d",
+        "daily_return",
+    ]
+
+    ret_col = None
+    for c in ret_candidates:
+        if c in df.columns:
+            ret_col = c
+            break
+
+    if ret_col is None:
+        raise ValueError(
+            f"compute_index_momentum: no daily return column found. Columns={df.columns.tolist()}"
         )
 
-    return df
+    if ret_col != "idx_ret_1d":
+        df = df.rename(columns={ret_col: "idx_ret_1d"})
+
+    # -----------------------------------------
+    # Compute momentum
+    # -----------------------------------------
+    df = df.sort_values(["index", "date"])
+
+    out = df[["date", "index"]].copy()
+
+    for w in windows:
+        out[f"idx_{w}D"] = (
+            df.groupby("index")["idx_ret_1d"]
+              .rolling(w)
+              .apply(lambda x: np.prod(1 + x) - 1, raw=False)
+              .reset_index(level=0, drop=True)
+        )
+
+    return out.dropna()
 
 
 def calculate_momentum_features(df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90)) -> pd.DataFrame:
