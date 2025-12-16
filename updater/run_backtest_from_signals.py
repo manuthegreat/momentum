@@ -333,159 +333,52 @@ def main():
     # --------------------------------------------------------
     # Build Bucket B signals (TRUE RELATIVE MOMENTUM)
     # --------------------------------------------------------
-    
-    # 1) Start from base universe
+    print("🧮 Building Bucket B signals (true relative momentum)...")
+
     dfB = base.copy()
     
-    # 2) Merge index returns (creates idx_ret_1d)
-    idx = pd.read_parquet(ARTIFACTS / "index_returns_5y.parquet")
-    idx.columns = idx.columns.str.lower().str.replace(" ", "_")
-    idx["date"] = pd.to_datetime(idx["date"])
-    
-    # 🔧 normalize index column name ONCE
-    if "index" not in idx.columns:
-        for c in idx.columns:
-            if c in ("index_name", "benchmark", "symbol", "ticker"):
-                idx = idx.rename(columns={c: "index"})
-                break
+    # Merge index daily returns (adds idx_ret_1d)
     dfB = dfB.merge(
         idx,
         left_on=["Date", "Index"],
         right_on=["date", "index"],
-        how="left"
+        how="left",
+        validate="many_to_one",
     ).drop(columns=["date", "index"], errors="ignore")
     
-
-    # 4) Absolute stock returns (needed for compounding)
-    dfB = add_absolute_returns(dfB)
-    
-    # 5) Stock momentum features
-    dfB = calculate_momentum_features(dfB, windows=WINDOWS)
-
-    # 3) Drop rows without index data
-    # --------------------------------------------------------
-    # Normalize index return column
-    # --------------------------------------------------------
-    
-    idx_ret_candidates = [
-        "idx_ret_1d",
-        "index_ret_1d",
-        "ret_1d",
-        "return_1d",
-        "daily_return",
-    ]
-    
-    found = None
-    for c in idx_ret_candidates:
-        if c in dfB.columns:
-            found = c
-            break
-    
-    if found is None:
-        raise ValueError(
-            f"No daily index return column found after merge. Columns: {dfB.columns.tolist()}"
-        )
-    
-    # standardize name
-    if found != "idx_ret_1d":
-        dfB = dfB.rename(columns={found: "idx_ret_1d"})
-
+    # Drop rows without index return
     dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
     
-    # 6) Index momentum
+    # Stock returns + momentum features
+    dfB = add_absolute_returns(dfB)
+    dfB = calculate_momentum_features(dfB, windows=WINDOWS)
+    
+    # Index momentum + merge
     idx_mom = compute_index_momentum(idx, windows=WINDOWS)
     dfB = dfB.merge(
-        idx_mom[
-            [
-                "date", "index",
-                "idx_5D", "idx_10D",
-                "idx_30D", "idx_45D",
-                "idx_60D", "idx_90D",
-            ]
-        ],
+        idx_mom[["date", "index", "idx_5D", "idx_10D", "idx_30D", "idx_45D", "idx_60D", "idx_90D"]],
         left_on=["Date", "Index"],
         right_on=["date", "index"],
-        how="left"
+        how="left",
     ).drop(columns=["date", "index"], errors="ignore")
     
-    # 7) RELATIVE regime momentum (this is the key)
-    # --------------------------------------------------------
-    # NORMALIZE momentum column names for relative regime logic
-    # --------------------------------------------------------
+    # Relative regime momentum (✅ uses FIX 1 implementation)
+    dfB = add_relative_regime_momentum_score(dfB)
     
-    # --------------------------------------------------------
-    # Validate momentum columns produced by calculate_momentum_features
-    # --------------------------------------------------------
-    
-    required = {"Momentum_Fast", "Momentum_Mid", "Momentum_Slow"}
-    missing = required - set(dfB.columns)
-    
-    if missing:
-        raise ValueError(
-            f"Bucket B missing momentum columns from calculate_momentum_features: {missing}. "
-            f"Columns present: {list(dfB.columns)}"
-        )
-    
-    # --------------------------------------------------------
-    # Bucket B compatibility: early momentum expects Momentum Score
-    # --------------------------------------------------------
-    
-    # --- Ensure Bucket B always has the expected scoring columns ---
-    # Some upstream builders produce either "Momentum Score" or "Relative_Momentum_Score" (or neither),
-    # depending on which path ran. Normalize here so downstream never explodes.
-    
-    # 1) If Relative_Momentum_Score exists but Momentum Score doesn't, mirror it
-    if "Relative_Momentum_Score" in dfB.columns and "Momentum Score" not in dfB.columns:
-        dfB["Momentum Score"] = dfB["Relative_Momentum_Score"]
-    
-    # 2) If Momentum Score exists but Relative_Momentum_Score doesn't, mirror it
-    if "Momentum Score" in dfB.columns and "Relative_Momentum_Score" not in dfB.columns:
-        dfB["Relative_Momentum_Score"] = dfB["Momentum Score"]
-    
-    # 3) If neither exists, create a safe fallback from absolute returns (best effort)
-    if "Momentum Score" not in dfB.columns and "Relative_Momentum_Score" not in dfB.columns:
-        # Prefer an obvious absolute-return column name if present
-        candidates = [
-            "Absolute_Return",
-            "Absolute_Returns",
-            "abs_return",
-            "abs_returns",
-            "Return",
-            "Returns",
-            "Pct_Return",
-            "Pct_Returns",
-        ]
-        base_col = next((c for c in candidates if c in dfB.columns), None)
-    
-        if base_col is None:
-            raise ValueError(
-                f"Bucket B missing Momentum Score and Relative_Momentum_Score, and no usable return column found. "
-                f"Columns present: {list(dfB.columns)}"
-            )
-    
-        # Use base returns as momentum proxy, and rank-normalize into Relative_Momentum_Score
-        dfB["Momentum Score"] = dfB[base_col]
-        dfB["Relative_Momentum_Score"] = (
-            dfB.groupby("Date")["Momentum Score"]
-               .rank(ascending=False, method="average")
-        )
-
-
-     add_relative_regime_momentum_score(dfB)
-    
-    # 8) Regime filters (same as local pipeline)
-     dfB[
+    # Regime filters
+    dfB = dfB[
         (dfB["Momentum_Slow"] > 1.0) &
         (dfB["Momentum_Mid"] > 0.5) &
         (dfB["Momentum_Fast"] > 1.0)
     ].copy()
     
-    # 9) Acceleration + early momentum
+    # Acceleration + early momentum
     dfB = add_regime_acceleration(dfB)
     dfB = add_regime_early_momentum(dfB)
     
-    # 10) Daily lists
+    # Daily lists
     dailyB = build_daily_lists(dfB, top_n=TOP_N)
+
 
     # --------------------------------------------------------
     # A backtest + trades (baseline-style)
