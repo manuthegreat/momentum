@@ -90,38 +90,47 @@ def calculate_momentum_features(df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90
 
 def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Relative momentum vs index.
-    Requires stock momentum + index momentum.
-    Gracefully skips if fast/mid/slow not present.
-    """
+    True relative regime momentum:
+    - Build relative returns vs index momentum (benchmark subtraction)
+    - Cross-sectional z-score AFTER subtraction
+    - Define Momentum_Fast/Mid/Slow from RELATIVE z-scores
+    - Define Momentum Score from those regimes
 
+    Requires:
+      - Stock columns: 5D Return, 10D Return, 30D Return, 45D Return, 60D Return, 90D Return
+      - Index columns: idx_5D, idx_10D, idx_30D, idx_45D, idx_60D, idx_90D
+    """
     out = df.copy()
 
-    required = {
-        "Momentum_Fast": "idx_5D",
-        "Momentum_Mid": "idx_30D",
-        "Momentum_Slow": "idx_90D",
-    }
+    required_stock = {"5D Return", "10D Return", "30D Return", "45D Return", "60D Return", "90D Return"}
+    required_idx = {"idx_5D", "idx_10D", "idx_30D", "idx_45D", "idx_60D", "idx_90D"}
+    missing = (required_stock | required_idx) - set(out.columns)
+    if missing:
+        raise ValueError(f"add_relative_regime_momentum_score missing columns: {sorted(missing)}")
 
-    for stock_col, idx_col in required.items():
-        if stock_col not in out.columns or idx_col not in out.columns:
-            raise ValueError(
-                f"Relative momentum requires {stock_col} and {idx_col}. "
-                f"Available columns: {out.columns.tolist()}"
-            )
+    # --- Relative returns (stock minus index) using your local weighting ---
+    out["Rel_Slow"] = (0.5 * out["60D Return"] + 0.5 * out["90D Return"]) - (0.5 * out["idx_60D"] + 0.5 * out["idx_90D"])
+    out["Rel_Mid"]  = (0.5 * out["30D Return"] + 0.5 * out["45D Return"]) - (0.5 * out["idx_30D"] + 0.5 * out["idx_45D"])
+    out["Rel_Fast"] = (0.6 * out["5D Return"]  + 0.4 * out["10D Return"]) - (0.6 * out["idx_5D"]  + 0.4 * out["idx_10D"])
 
-    out["Rel_Momentum_Fast"] = out["Momentum_Fast"] - out["idx_5D"]
-    out["Rel_Momentum_Mid"] = out["Momentum_Mid"] - out["idx_30D"]
-    out["Rel_Momentum_Slow"] = out["Momentum_Slow"] - out["idx_90D"]
+    # --- Cross-sectional z-scores AFTER benchmark subtraction ---
+    for col in ["Rel_Slow", "Rel_Mid", "Rel_Fast"]:
+        mean = out.groupby("Date")[col].transform("mean")
+        std = out.groupby("Date")[col].transform("std").replace(0, np.nan)
+        out[col + "_z"] = ((out[col] - mean) / std).fillna(0.0)
 
-    out["Rel_Regime_Momentum"] = (
-        0.4 * out["Rel_Momentum_Fast"] +
-        0.3 * out["Rel_Momentum_Mid"] +
-        0.3 * out["Rel_Momentum_Slow"]
+    # --- Define regimes from relative z-scores ---
+    out["Momentum_Slow"] = out["Rel_Slow_z"]
+    out["Momentum_Mid"]  = out["Rel_Mid_z"]
+    out["Momentum_Fast"] = out["Rel_Fast_z"]
+
+    out["Momentum Score"] = (
+        0.5 * out["Momentum_Slow"] +
+        0.3 * out["Momentum_Mid"] +
+        0.2 * out["Momentum_Fast"]
     )
 
-    return out
-
+    return out.fillna(0.0)
 
 def add_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
