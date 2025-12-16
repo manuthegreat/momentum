@@ -216,28 +216,22 @@ def write_today(daily_df: pd.DataFrame, out_path: Path):
 def make_relative_bucket(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    # find the momentum column dynamically
-    candidates = [
-        "RegimeMomentumScore",
-        "Regime_Momentum_Score",
-        "MomentumScore",
-    ]
+    # 🔑 THIS is the real column name produced by your pipeline
+    score_col = "Momentum Score"
 
-    score_col = next((c for c in candidates if c in out.columns), None)
-
-    if score_col is None:
+    if score_col not in out.columns:
         raise ValueError(
-            f"No momentum score column found. "
-            f"Available columns: {list(out.columns)}"
+            f"'{score_col}' not found. Available columns: {list(out.columns)}"
         )
 
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
     out = out.dropna(subset=["Date", score_col])
 
-    # Cross-sectional ranking (relative momentum)
+    # Cross-sectional rank per day (relative momentum)
+    # Higher momentum = higher rank
     out[score_col] = (
         out.groupby("Date")[score_col]
-           .rank(pct=True, ascending=False)   # ← IMPORTANT
+           .rank(pct=True, ascending=False)
     )
 
     return out
