@@ -366,6 +366,8 @@ def main():
         how="left",
     ).drop(columns=["date", "index"], errors="ignore")
 
+    dfB = add_regime_momentum_score(dfB)
+
     # Excess momentum = stock momentum minus index momentum
     dfB["Excess_Fast"] = dfB["Momentum_Fast"] - dfB["idx_5D"]
     dfB["Excess_Mid"]  = dfB["Momentum_Mid"]  - dfB["idx_30D"]
