@@ -213,57 +213,28 @@ def write_today(daily_df: pd.DataFrame, out_path: Path):
 # BUCKET B: RELATIVE MOMENTUM (CROSS-SECTIONAL RANK)
 # ============================================================
 
-def make_relative_bucket(df: pd.DataFrame, windows: tuple[int, ...]) -> pd.DataFrame:
+def make_relative_bucket(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert an absolute-momentum feature table into a relative-momentum scoring table.
-
-    We build a single cross-sectional score each Date:
-    - pick one momentum feature (prefer longest window)
-    - rank tickers on that Date (higher = better)
-    - convert rank into [0, 1] "RelScore"
-    - write into RegimeMomentumScore so build_daily_lists can pick off it
+    Convert absolute momentum into relative (cross-sectional) momentum
+    by ranking RegimeMomentumScore within each Date.
     """
     out = df.copy()
+
+    if "RegimeMomentumScore" not in out.columns:
+        raise ValueError(
+            "RegimeMomentumScore not found. "
+            "Did you forget to call add_regime_momentum_score()?"
+        )
+
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    out = out.dropna(subset=["Date"])
+    out = out.dropna(subset=["Date", "RegimeMomentumScore"])
 
-    # Choose a momentum column that likely exists after calculate_momentum_features()
-    # Try common patterns; fall back to any numeric "momentum-ish" column.
-    candidate_cols = []
-    for w in sorted(windows, reverse=True):
-        candidate_cols += [
-            f"Momentum_{w}",
-            f"momentum_{w}",
-            f"Return_{w}",
-            f"return_{w}",
-            f"AbsRet_{w}",
-        ]
-    mom_col = next((c for c in candidate_cols if c in out.columns), None)
+    # Cross-sectional rank per day → [0,1]
+    out["RegimeMomentumScore"] = (
+        out.groupby("Date")["RegimeMomentumScore"]
+           .rank(pct=True, ascending=True)
+    )
 
-    if mom_col is None:
-        # fallback: find a numeric column with "mom" or "moment" in name
-        for c in out.columns:
-            if isinstance(c, str) and any(k in c.lower() for k in ["mom", "momentum"]):
-                if pd.api.types.is_numeric_dtype(out[c]):
-                    mom_col = c
-                    break
-
-    if mom_col is None:
-        raise ValueError("Could not find a momentum column to rank for Bucket B. Check calculate_momentum_features output.")
-
-    # cross-sectional rank per day
-    out["_mom"] = pd.to_numeric(out[mom_col], errors="coerce")
-    out = out.dropna(subset=["_mom"])
-
-    # pct rank => [0,1]
-    out["RelScore"] = out.groupby("Date")["_mom"].rank(pct=True, ascending=True)
-
-    # Put it into the column selection code is already expecting
-    # (build_daily_lists typically keys off RegimeMomentumScore or similar)
-    out["RegimeMomentumScore"] = out["RelScore"]
-
-    # cleanup
-    out.drop(columns=["_mom"], inplace=True, errors="ignore")
     return out
 
 
@@ -473,7 +444,8 @@ def main():
     print("🧮 Building Bucket B signals (relative ranking)...")
     dfB = add_absolute_returns(base)
     dfB = calculate_momentum_features(dfB, windows=WINDOWS)
-    dfB = make_relative_bucket(dfB, windows=WINDOWS)  # ✅ key change
+    dfB = add_regime_momentum_score(dfB)   # SAME as A
+    dfB = make_relative_bucket(dfB)        # 🔥 KEY DIFFERENCE
     dfB = add_regime_acceleration(dfB)
     dfB = add_regime_early_momentum(dfB)
 
