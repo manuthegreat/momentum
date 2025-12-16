@@ -147,6 +147,8 @@ def simulate_unified_portfolio(
     equity = []
     capital = total_capital
 
+    target = pd.DataFrame()
+
     for i in range(1, len(rebalance_dates)):
         prev = rebalance_dates[i - 1]
         curr = rebalance_dates[i]
