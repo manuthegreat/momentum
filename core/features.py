@@ -90,25 +90,37 @@ def calculate_momentum_features(df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90
 
 def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
     """
-    True relative momentum:
-    stock momentum minus index momentum across regimes
+    Relative momentum vs index.
+    Requires stock momentum + index momentum.
+    Gracefully skips if fast/mid/slow not present.
     """
 
-    df = df.copy()
+    out = df.copy()
 
-    # Fast / Mid / Slow relative momentum
-    df["Rel_Momentum_Fast"] = df["Momentum_Fast"] - df["idx_5D"]
-    df["Rel_Momentum_Mid"]  = df["Momentum_Mid"]  - df["idx_30D"]
-    df["Rel_Momentum_Slow"] = df["Momentum_Slow"] - df["idx_90D"]
+    required = {
+        "Momentum_Fast": "idx_5D",
+        "Momentum_Mid": "idx_30D",
+        "Momentum_Slow": "idx_90D",
+    }
 
-    # Regime-style aggregation (same structure as absolute)
-    df["Regime_Momentum_Score"] = (
-        0.4 * df["Rel_Momentum_Fast"] +
-        0.3 * df["Rel_Momentum_Mid"] +
-        0.3 * df["Rel_Momentum_Slow"]
+    for stock_col, idx_col in required.items():
+        if stock_col not in out.columns or idx_col not in out.columns:
+            raise ValueError(
+                f"Relative momentum requires {stock_col} and {idx_col}. "
+                f"Available columns: {out.columns.tolist()}"
+            )
+
+    out["Rel_Momentum_Fast"] = out["Momentum_Fast"] - out["idx_5D"]
+    out["Rel_Momentum_Mid"] = out["Momentum_Mid"] - out["idx_30D"]
+    out["Rel_Momentum_Slow"] = out["Momentum_Slow"] - out["idx_90D"]
+
+    out["Rel_Regime_Momentum"] = (
+        0.4 * out["Rel_Momentum_Fast"] +
+        0.3 * out["Rel_Momentum_Mid"] +
+        0.3 * out["Rel_Momentum_Slow"]
     )
 
-    return df
+    return out
 
 
 def add_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
