@@ -409,6 +409,23 @@ def main():
     ).drop(columns=["date", "index"], errors="ignore")
     
     # 7) RELATIVE regime momentum (this is the key)
+    # --------------------------------------------------------
+    # NORMALIZE momentum column names for relative regime logic
+    # --------------------------------------------------------
+    
+    dfB = dfB.rename(
+        columns={
+            "5D zscore": "Momentum_Fast",
+            "30D zscore": "Momentum_Mid",
+            "60D zscore": "Momentum_Slow",
+        }
+    )
+    
+    required = {"Momentum_Fast", "Momentum_Mid", "Momentum_Slow", "idx_5D"}
+    missing = required - set(dfB.columns)
+    if missing:
+        raise ValueError(f"Bucket B missing required columns: {missing}")
+
     dfB = add_relative_regime_momentum_score(dfB)
     
     # 8) Regime filters (same as local pipeline)
