@@ -9,7 +9,7 @@ from pathlib import Path
 # ============================================================
 
 st.set_page_config(
-    page_title="Momentum Strategy — Execution View",
+    page_title="Momentum Strategy — Daily Execution",
     layout="wide",
 )
 
@@ -53,7 +53,6 @@ st.title("📈 Momentum Strategy — Daily Execution")
 st.subheader("Backtest Summary (Bucket C)")
 
 if stats:
-    # Derive CAGR if equity exists
     cagr = None
     if not equity.empty and {"Date", "Equity"}.issubset(equity.columns):
         equity = equity.sort_values("Date")
@@ -64,14 +63,10 @@ if stats:
             cagr = (end_val / start_val) ** (365 / days) - 1
 
     cols = st.columns(4)
-
     cols[0].metric("Total Return (%)", round(stats.get("Total Return (%)", 0), 2))
     cols[1].metric("Sharpe", round(stats.get("Sharpe", 0), 2))
     cols[2].metric("Max Drawdown (%)", round(stats.get("Max Drawdown (%)", 0), 2))
-    cols[3].metric(
-        "CAGR (%)",
-        round(cagr * 100, 2) if cagr is not None else "—"
-    )
+    cols[3].metric("CAGR (%)", round(cagr * 100, 2) if cagr else "—")
 
     if not equity.empty and "Date" in equity.columns:
         st.caption(f"Last equity date: {equity['Date'].max().date()}")
@@ -79,7 +74,7 @@ else:
     st.info("Backtest stats not available")
 
 # ============================================================
-# TODAY'S PORTFOLIO (EXECUTION VIEW)
+# TODAY'S PORTFOLIO — EXECUTION VIEW
 # ============================================================
 
 st.subheader("Today's Portfolio — Bucket C")
@@ -88,7 +83,6 @@ if signals.empty or "Date" not in signals.columns:
     st.info("No signal data available")
 else:
     latest_date = signals["Date"].max()
-
     today = signals[
         (signals["Bucket"] == "C") &
         (signals["Date"] == latest_date)
@@ -97,6 +91,8 @@ else:
     if today.empty:
         st.info("No positions for latest rebalance date")
     else:
+        st.caption(f"Rebalance date: {latest_date.date()}")
+
         display_cols = [
             c for c in [
                 "Ticker",
@@ -109,10 +105,14 @@ else:
             if c in today.columns
         ]
 
-        st.caption(f"Rebalance date: {latest_date.date()}")
+        # 🔑 Safe sorting logic
+        if "Position_Size" in today.columns:
+            today = today.sort_values("Position_Size", ascending=False)
+        elif "Weighted_Score" in today.columns:
+            today = today.sort_values("Weighted_Score", ascending=False)
+
         st.dataframe(
-            today[display_cols]
-            .sort_values("Position_Size", ascending=False),
+            today[display_cols],
             width="stretch"
         )
 
@@ -126,9 +126,7 @@ if equity.empty or "Date" not in equity.columns:
     st.info("No equity history available")
 else:
     eq = equity.sort_values("Date").copy()
-
-    eq["Period_PnL"] = eq["Equity"].diff()
-    eq["Num_Names"] = np.nan
+    eq["Period PnL"] = eq["Equity"].diff()
 
     if not signals.empty:
         counts = (
@@ -136,14 +134,10 @@ else:
             .groupby("Date")["Ticker"]
             .count()
         )
-        eq["Num_Names"] = eq["Date"].map(counts)
+        eq["# Names"] = eq["Date"].map(counts)
 
-    timeline = eq[["Date", "Equity", "Period_PnL", "Num_Names"]].copy()
-    timeline = timeline.rename(columns={
-        "Equity": "Portfolio Equity",
-        "Period_PnL": "Period PnL",
-        "Num_Names": "# Names",
-    })
+    timeline = eq[["Date", "Equity", "Period PnL"] + (["# Names"] if "# Names" in eq.columns else [])]
+    timeline = timeline.rename(columns={"Equity": "Portfolio Equity"})
 
     st.dataframe(
         timeline.sort_values("Date", ascending=False),
