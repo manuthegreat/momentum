@@ -33,11 +33,17 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
       
+          # --- Bucket A ---
           git add artifacts/today_A.parquet
+          git add artifacts/backtest_equity_A.parquet
           git add artifacts/backtest_stats_A.json
+      
+          # --- Bucket B ---
           git add artifacts/today_B.parquet
+          git add artifacts/backtest_equity_B.parquet
           git add artifacts/backtest_stats_B.json
       
+          # --- Bucket C ---
           git add artifacts/backtest_equity_C.parquet
           git add artifacts/backtest_trades_C.parquet
           git add artifacts/backtest_stats_C.json
