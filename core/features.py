@@ -7,6 +7,28 @@ def add_absolute_returns(df: pd.DataFrame) -> pd.DataFrame:
     df["1D Return"] = df.groupby("Ticker")["Price"].pct_change() + 1.0
     return df
 
+def compute_index_momentum(idx_df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90)) -> pd.DataFrame:
+    """
+    Computes rolling momentum for index returns.
+    Expected input columns (lowercase):
+      - date
+      - index
+      - idx_ret_1d
+    """
+
+    df = idx_df.copy()
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["index", "date"])
+
+    for w in windows:
+        df[f"idx_{w}D"] = (
+            df.groupby("index")["idx_ret_1d"]
+              .transform(lambda x: (1 + x).rolling(w).apply(np.prod, raw=True) - 1)
+        )
+
+    return df
+
 
 def calculate_momentum_features(df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90)) -> pd.DataFrame:
     df = df.copy()
