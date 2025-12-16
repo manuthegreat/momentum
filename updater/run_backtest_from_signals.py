@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from core.data_utils import load_price_data_parquet, filter_by_index
+from core.data_utils import load_price_data_parquet, load_index_returns_parquet, filter_by_index
 from core.selection import build_daily_lists, build_unified_target
 from core.features import (
     add_absolute_returns,
@@ -309,6 +309,10 @@ def main():
     print("📥 Loading price data...")
     base = load_price_data_parquet(PRICE_PATH)
     base = filter_by_index(base, "SP500")
+
+    print("📥 Loading index returns...")
+    idx = load_index_returns_parquet(ARTIFACTS / "index_returns_5y.parquet")
+
 
     price_table = base.pivot(index="Date", columns="Ticker", values="Price").sort_index()
     price_table = _normalize_price_table(price_table)
