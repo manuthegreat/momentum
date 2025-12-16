@@ -357,7 +357,7 @@ def main():
     
 
     # 4) Absolute stock returns (needed for compounding)
-    _absolute_returns(dfB)
+    dfB = add_absolute_returns(dfB)
     
     # 5) Stock momentum features
     dfB = calculate_momentum_features(dfB, windows=WINDOWS)
