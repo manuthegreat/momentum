@@ -709,7 +709,7 @@ def get_today_trades_from_final_selection(
 
     return out
 
-def plot_equity_curve(history_df: pd.DataFrame, title: str):
+def plot_equity_and_drawdown(history_df: pd.DataFrame, title: str):
     if history_df.empty:
         st.info("No equity history to display.")
         return
@@ -718,10 +718,11 @@ def plot_equity_curve(history_df: pd.DataFrame, title: str):
     df["Rolling_Max"] = df["Portfolio Value"].cummax()
     df["Drawdown"] = (df["Portfolio Value"] - df["Rolling_Max"]) / df["Rolling_Max"]
 
-    fig = go.Figure()
-
-    # --- Equity curve ---
-    fig.add_trace(
+    # =======================
+    # Equity curve (TOP)
+    # =======================
+    fig_eq = go.Figure()
+    fig_eq.add_trace(
         go.Scatter(
             x=df["Date"],
             y=df["Portfolio Value"],
@@ -731,53 +732,43 @@ def plot_equity_curve(history_df: pd.DataFrame, title: str):
         )
     )
 
-    # --- Drawdown (secondary visual, subtle) ---
-    fig.add_trace(
+    fig_eq.update_layout(
+        title=f"{title} — Equity Curve",
+        height=380,
+        margin=dict(l=40, r=40, t=60, b=40),
+        hovermode="x unified",
+        xaxis=dict(title="Date", showgrid=False),
+        yaxis=dict(title="Portfolio Value", tickformat=",.0f"),
+        template="plotly_white",
+    )
+
+    st.plotly_chart(fig_eq, use_container_width=True)
+
+    # =======================
+    # Drawdown (BOTTOM)
+    # =======================
+    fig_dd = go.Figure()
+    fig_dd.add_trace(
         go.Scatter(
             x=df["Date"],
             y=df["Drawdown"],
             mode="lines",
             name="Drawdown",
-            yaxis="y2",
-            line=dict(width=1, dash="dot"),
-            opacity=0.4,
+            line=dict(width=1.5, color="firebrick"),
         )
     )
 
-    fig.update_layout(
-        title=title,
-        height=420,
-        margin=dict(l=40, r=40, t=60, b=40),
+    fig_dd.update_layout(
+        title=f"{title} — Drawdown",
+        height=220,
+        margin=dict(l=40, r=40, t=50, b=40),
         hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        ),
-        xaxis=dict(
-            title="Date",
-            showgrid=False
-        ),
-        yaxis=dict(
-            title="Portfolio Value",
-            tickformat=",.0f",
-            showgrid=True,
-            zeroline=False
-        ),
-        yaxis2=dict(
-            title="Drawdown",
-            overlaying="y",
-            side="right",
-            tickformat=".0%",
-            showgrid=False,
-            range=[df["Drawdown"].min() * 1.1, 0]
-        ),
-        template="plotly_white"
+        xaxis=dict(title="Date", showgrid=False),
+        yaxis=dict(title="Drawdown", tickformat=".0%"),
+        template="plotly_white",
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig_dd, use_container_width=True)
 
 
 def get_today_trades_bucket_c(
@@ -1280,12 +1271,15 @@ def render_bucket(title, bucket):
         st.markdown("### TRADE STATISTICS")
         st.dataframe(_stats_to_df(bucket["trade_stats"]), use_container_width=True)
 
-    st.markdown("### Equity Curve (Portfolio Value)")
-    hist = bucket["history"].sort_values("Date").copy()
-    if hist.empty or "Portfolio Value" not in hist.columns:
-        st.info("Not enough history.")
-    else:
-        plot_equity_curve(hist, f"{title} — Equity Curve")
+    
+    st.markdown("### Equity & Drawdown")
+    
+    plot_equity_and_drawdown(
+        bucket["history"],
+        title=title
+    )
+
+
 
     st.markdown("### TODAY'S TRADES")
     today = bucket["today"]
