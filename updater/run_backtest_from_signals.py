@@ -114,6 +114,7 @@ def main():
         w_consistency=W_CONS,
         top_n=TOP_N,
         total_capital=TOTAL_CAPITAL,
+        dollars_per_name=5_000, 
     )
 
     eqA.to_parquet(EQUITY_A_OUT, index=False)
@@ -166,6 +167,7 @@ def main():
         w_consistency=W_CONS,
         top_n=TOP_N,
         total_capital=TOTAL_CAPITAL,
+        dollars_per_name=5_000, 
     )
 
     eqB.to_parquet(EQUITY_B_OUT, index=False)
