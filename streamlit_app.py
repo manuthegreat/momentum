@@ -5,7 +5,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+
 
 st.set_page_config(page_title="Momentum Strategy Dashboard", layout="wide")
 
@@ -708,6 +709,76 @@ def get_today_trades_from_final_selection(
 
     return out
 
+def plot_equity_curve(history_df: pd.DataFrame, title: str):
+    if history_df.empty:
+        st.info("No equity history to display.")
+        return
+
+    df = history_df.sort_values("Date").copy()
+    df["Rolling_Max"] = df["Portfolio Value"].cummax()
+    df["Drawdown"] = (df["Portfolio Value"] - df["Rolling_Max"]) / df["Rolling_Max"]
+
+    fig = go.Figure()
+
+    # --- Equity curve ---
+    fig.add_trace(
+        go.Scatter(
+            x=df["Date"],
+            y=df["Portfolio Value"],
+            mode="lines",
+            name="Portfolio Value",
+            line=dict(width=2),
+        )
+    )
+
+    # --- Drawdown (secondary visual, subtle) ---
+    fig.add_trace(
+        go.Scatter(
+            x=df["Date"],
+            y=df["Drawdown"],
+            mode="lines",
+            name="Drawdown",
+            yaxis="y2",
+            line=dict(width=1, dash="dot"),
+            opacity=0.4,
+        )
+    )
+
+    fig.update_layout(
+        title=title,
+        height=420,
+        margin=dict(l=40, r=40, t=60, b=40),
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        xaxis=dict(
+            title="Date",
+            showgrid=False
+        ),
+        yaxis=dict(
+            title="Portfolio Value",
+            tickformat=",.0f",
+            showgrid=True,
+            zeroline=False
+        ),
+        yaxis2=dict(
+            title="Drawdown",
+            overlaying="y",
+            side="right",
+            tickformat=".0%",
+            showgrid=False,
+            range=[df["Drawdown"].min() * 1.1, 0]
+        ),
+        template="plotly_white"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
 
 def get_today_trades_bucket_c(
     dailyA: pd.DataFrame,
@@ -1214,11 +1285,7 @@ def render_bucket(title, bucket):
     if hist.empty or "Portfolio Value" not in hist.columns:
         st.info("Not enough history.")
     else:
-        fig, ax = plt.subplots()
-        ax.plot(hist["Date"], hist["Portfolio Value"])
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Portfolio Value")
-        st.pyplot(fig, clear_figure=True)
+        plot_equity_curve(hist, f"{title} — Equity Curve")
 
     st.markdown("### TODAY'S TRADES")
     today = bucket["today"]
