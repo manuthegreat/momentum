@@ -4,3 +4,4 @@ pyarrow
 yfinance
 matplotlib
 streamlit
+plotly
