@@ -47,63 +47,89 @@ def simulate_single_bucket_as_unified(
     w_early,
     w_consistency,
     top_n,
-    total_capital,
-    dollars_per_name,
+    total_capital=100_000.0,
+    dollars_per_name=5_000.0
 ):
-    """
-    Single-bucket backtest that mirrors the unified capital mechanics.
-    This is what your PC baseline effectively does for A and B.
-    """
+    cash = total_capital
+    portfolio = {}        # ticker -> shares
+    cost_basis = {}       # ticker -> invested dollars
 
-    dates = sorted(price_table.index.unique())
-    rebalance_dates = dates[::rebalance_interval]
-
-    equity = []
+    history = []
     trades = []
-    capital = total_capital
 
-    for i in range(1, len(rebalance_dates)):
-        prev = rebalance_dates[i - 1]
-        curr = rebalance_dates[i]
+    rebalance_dates = sorted(df_prices["Date"].unique())[::rebalance_interval]
 
-        picks = daily_df[daily_df["Date"] == prev]["Ticker"].dropna().unique().tolist()
-        if not picks:
-            equity.append({"Date": curr, "Portfolio Value": capital})
-            continue
+    for d in rebalance_dates:
 
-        period_pnl = 0.0
+        # ---- build target ----
+        sel = final_selection_from_daily(
+            daily_df,
+            lookback_days=lookback_days,
+            w_momentum=w_momentum,
+            w_early=w_early,
+            w_consistency=w_consistency,
+            as_of_date=d,
+            top_n=top_n,
+        )
 
-        for t in picks:
-            if t not in price_table.columns:
+        target = set(sel["Ticker"]) if not sel.empty else set()
+        target_sizes = {t: dollars_per_name for t in target}
+        held = set(portfolio)
+
+        # ---- SELL removed ----
+        for t in held - target:
+            px = get_last_price(price_table, t, d)
+            if px is not None:
+                shares = portfolio[t]
+                proceeds = shares * px
+                pnl = proceeds - cost_basis[t]
+                cash += proceeds
+                trades.append(
+                    {"Date": d, "Ticker": t, "Action": "Sell", "Price": px, "PnL": pnl}
+                )
+            portfolio.pop(t, None)
+            cost_basis.pop(t, None)
+
+        # ---- BUY / RESIZE ----
+        for t in target:
+            px = get_last_price(price_table, t, d)
+            if px is None:
                 continue
 
-            p0 = price_table.loc[prev, t]
-            p1 = price_table.loc[curr, t]
+            target_value = target_sizes[t]
+            current_shares = portfolio.get(t, 0.0)
+            current_value = current_shares * px
+            delta = target_value - current_value
 
-            if pd.isna(p0) or pd.isna(p1) or p0 == 0:
-                continue
+            if delta > 0 and delta <= cash:
+                shares = delta / px
+                portfolio[t] = current_shares + shares
+                cost_basis[t] = cost_basis.get(t, 0.0) + delta
+                cash -= delta
+                trades.append(
+                    {"Date": d, "Ticker": t, "Action": "Buy", "Price": px, "PnL": 0.0}
+                )
 
-            alloc = dollars_per_name
-            r = (p1 / p0 - 1.0)
-            pnl = alloc * r
-            period_pnl += pnl
+            elif delta < 0:
+                trim_value = -delta
+                trim_shares = trim_value / px
+                portfolio[t] = current_shares - trim_shares
+                cost_basis[t] -= trim_value
+                cash += trim_value
+                trades.append(
+                    {"Date": d, "Ticker": t, "Action": "Resize", "Price": px, "PnL": 0.0}
+                )
 
-            trades.append({
-                "Entry Date": prev,
-                "Exit Date": curr,
-                "Ticker": t,
-                "Capital": alloc,
-                "Entry Price": float(p0),
-                "Exit Price": float(p1),
-                "Return": float(r),
-                "PnL": float(pnl),
-                "Action": "Sell",
-            })
+        # ---- ALWAYS MARK TO MARKET (THIS IS THE FIX) ----
+        nav = cash + sum(
+            get_last_price(price_table, t, d) * s
+            for t, s in portfolio.items()
+            if get_last_price(price_table, t, d) is not None
+        )
 
-        capital += period_pnl
-        equity.append({"Date": curr, "Portfolio Value": capital})
+        history.append({"Date": d, "Portfolio Value": nav})
 
-    return pd.DataFrame(equity), pd.DataFrame(trades)
+    return pd.DataFrame(history), pd.DataFrame(trades)
 
 
 def compute_performance_stats(history_df):
@@ -129,68 +155,98 @@ def simulate_unified_portfolio(
     price_table,
     dailyA,
     dailyB,
-    rebalance_interval=10,
-    lookback_days=10,
-    w_momentum=0.5,
-    w_early=0.3,
-    w_consistency=0.2,
-    top_n=10,
-    total_capital=100_000,
+    rebalance_interval,
+    lookback_days,
+    w_momentum,
+    w_early,
+    w_consistency,
+    top_n,
+    total_capital=100_000.0,
 ):
-    """
-    Unified backtest: recompute combined portfolio at each rebalance date
-    """
+    cash = total_capital
+    portfolio = {}
+    cost_basis = {}
 
-    dates = sorted(price_table.index.unique())
-    rebalance_dates = dates[::rebalance_interval]
+    history = []
+    trades = []
 
-    equity = []
-    capital = total_capital
+    rebalance_dates = sorted(df_prices["Date"].unique())[::rebalance_interval]
 
-    target = pd.DataFrame()
+    for d in rebalance_dates:
 
-    for i in range(1, len(rebalance_dates)):
-        prev = rebalance_dates[i - 1]
-        curr = rebalance_dates[i]
-
-        target = build_unified_target(
-            dailyA=dailyA,
-            dailyB=dailyB,
-            as_of_date=prev,
+        target_df = build_unified_target(
+            dailyA,
+            dailyB,
+            as_of_date=d,
             lookback_days=lookback_days,
             w_momentum=w_momentum,
             w_early=w_early,
             w_consistency=w_consistency,
             top_n=top_n,
-            total_capital=capital,
+            total_capital=total_capital,
+            weight_A=0.20,
+            weight_B=0.80,
         )
 
-        pnl = 0.0
-
-        for _, row in target.iterrows():
-            t = row["Ticker"]
-            alloc = row["Capital"]
-
-            if t not in price_table.columns:
-                continue
-
-            p0 = price_table.loc[prev, t]
-            p1 = price_table.loc[curr, t]
-
-            if pd.isna(p0) or pd.isna(p1):
-                continue
-
-            pnl += alloc * (p1 / p0 - 1)
-
-        capital += pnl
-
-        equity.append(
-            {
-                "Date": curr,
-                "Portfolio Value": capital,
-                "PnL": pnl,
-            }
+        target_sizes = (
+            dict(zip(target_df["Ticker"], target_df["Position_Size"]))
+            if not target_df.empty
+            else {}
         )
-        
-    equity_df = pd.DataFrame(equity).sort_values("Date").reset_index(drop=True)
-    return pd.DataFrame(equity), target
+
+        target = set(target_sizes)
+        held = set(portfolio)
+
+        # ---- SELL removed ----
+        for t in held - target:
+            px = get_last_price(price_table, t, d)
+            if px is not None:
+                shares = portfolio[t]
+                proceeds = shares * px
+                pnl = proceeds - cost_basis.get(t, 0.0)
+                cash += proceeds
+                trades.append(
+                    {"Date": d, "Ticker": t, "Action": "Sell", "Price": px, "PnL": pnl}
+                )
+            portfolio.pop(t, None)
+            cost_basis.pop(t, None)
+
+        # ---- BUY / RESIZE ----
+        for t, target_value in target_sizes.items():
+            px = get_last_price(price_table, t, d)
+            if px is None:
+                continue
+
+            current_shares = portfolio.get(t, 0.0)
+            current_value = current_shares * px
+            delta = target_value - current_value
+
+            if delta > 0 and delta <= cash:
+                shares = delta / px
+                portfolio[t] = current_shares + shares
+                cost_basis[t] = cost_basis.get(t, 0.0) + delta
+                cash -= delta
+                trades.append(
+                    {"Date": d, "Ticker": t, "Action": "Buy", "Price": px, "PnL": 0.0}
+                )
+
+            elif delta < 0:
+                trim_value = -delta
+                trim_shares = trim_value / px
+                portfolio[t] = current_shares - trim_shares
+                cost_basis[t] -= trim_value
+                cash += trim_value
+                trades.append(
+                    {"Date": d, "Ticker": t, "Action": "Resize", "Price": px, "PnL": 0.0}
+                )
+
+        # ---- ALWAYS MARK TO MARKET (THIS IS THE FIX) ----
+        nav = cash + sum(
+            get_last_price(price_table, t, d) * s
+            for t, s in portfolio.items()
+            if get_last_price(price_table, t, d) is not None
+        )
+
+        history.append({"Date": d, "Portfolio Value": nav})
+
+    return pd.DataFrame(history), pd.DataFrame(trades)
