@@ -48,11 +48,11 @@ def simulate_single_bucket_as_unified(
     w_consistency,
     top_n,
     total_capital=100_000.0,
-    dollars_per_name=5_000.0
+    dollars_per_name=5_000.0,
 ):
     cash = total_capital
-    portfolio = {}        # ticker -> shares
-    cost_basis = {}       # ticker -> invested dollars
+    portfolio = {}
+    cost_basis = {}
 
     history = []
     trades = []
@@ -61,41 +61,47 @@ def simulate_single_bucket_as_unified(
 
     for d in rebalance_dates:
 
-        # ---- build target ----
-        sel = final_selection_from_daily(
-            daily_df,
-            lookback_days=lookback_days,
-            w_momentum=w_momentum,
-            w_early=w_early,
-            w_consistency=w_consistency,
-            as_of_date=d,
-            top_n=top_n,
+        # ---- BUILD TARGET INLINE (NO EXTERNAL DEPENDENCY) ----
+        window = daily_df[daily_df["Date"] <= d].tail(lookback_days)
+        if window.empty:
+            continue
+
+        agg = (
+            window.groupby("Ticker")
+            .agg(
+                Momentum=("Momentum Score", "mean"),
+                Early=("Early Momentum Score", "mean"),
+                Appearances=("Date", "count"),
+            )
+            .reset_index()
         )
 
-        target = set(sel["Ticker"]) if not sel.empty else set()
+        agg["Consistency"] = agg["Appearances"] / lookback_days
+        agg["Score"] = (
+            w_momentum * agg["Momentum"]
+            + w_early * agg["Early"]
+            + w_consistency * agg["Consistency"]
+        )
+
+        sel = agg.sort_values("Score", ascending=False).head(top_n)
+        target = set(sel["Ticker"])
         target_sizes = {t: dollars_per_name for t in target}
         held = set(portfolio)
 
-        # ---- SELL removed ----
+        # ---- SELL ----
         for t in held - target:
-            px = get_last_price(price_table, t, d)
-            if px is not None:
-                shares = portfolio[t]
-                proceeds = shares * px
-                pnl = proceeds - cost_basis[t]
-                cash += proceeds
-                trades.append(
-                    {"Date": d, "Ticker": t, "Action": "Sell", "Price": px, "PnL": pnl}
-                )
-            portfolio.pop(t, None)
-            cost_basis.pop(t, None)
+            px = price_table.loc[:d, t].dropna().iloc[-1]
+            shares = portfolio[t]
+            proceeds = shares * px
+            pnl = proceeds - cost_basis[t]
+            cash += proceeds
+            trades.append({"Date": d, "Ticker": t, "Action": "Sell", "Price": px, "PnL": pnl})
+            portfolio.pop(t)
+            cost_basis.pop(t)
 
         # ---- BUY / RESIZE ----
         for t in target:
-            px = get_last_price(price_table, t, d)
-            if px is None:
-                continue
-
+            px = price_table.loc[:d, t].dropna().iloc[-1]
             target_value = target_sizes[t]
             current_shares = portfolio.get(t, 0.0)
             current_value = current_shares * px
@@ -106,31 +112,24 @@ def simulate_single_bucket_as_unified(
                 portfolio[t] = current_shares + shares
                 cost_basis[t] = cost_basis.get(t, 0.0) + delta
                 cash -= delta
-                trades.append(
-                    {"Date": d, "Ticker": t, "Action": "Buy", "Price": px, "PnL": 0.0}
-                )
+                trades.append({"Date": d, "Ticker": t, "Action": "Buy", "Price": px, "PnL": 0.0})
 
             elif delta < 0:
                 trim_value = -delta
-                trim_shares = trim_value / px
-                portfolio[t] = current_shares - trim_shares
+                portfolio[t] = current_shares - (trim_value / px)
                 cost_basis[t] -= trim_value
                 cash += trim_value
-                trades.append(
-                    {"Date": d, "Ticker": t, "Action": "Resize", "Price": px, "PnL": 0.0}
-                )
+                trades.append({"Date": d, "Ticker": t, "Action": "Resize", "Price": px, "PnL": 0.0})
 
-        # ---- ALWAYS MARK TO MARKET (THIS IS THE FIX) ----
+        # ---- ALWAYS MARK TO MARKET ----
         nav = cash + sum(
-            get_last_price(price_table, t, d) * s
+            price_table.loc[:d, t].dropna().iloc[-1] * s
             for t, s in portfolio.items()
-            if get_last_price(price_table, t, d) is not None
         )
 
         history.append({"Date": d, "Portfolio Value": nav})
 
     return pd.DataFrame(history), pd.DataFrame(trades)
-
 
 def compute_performance_stats(history_df):
     if len(history_df) < 2:
