@@ -70,57 +70,66 @@ def build_unified_target(
     weight_B=0.8,
 ):
     """
-    Combine Bucket A + B daily rankings into a single capital-weighted portfolio
+    Combine Bucket A + B into a single executable target:
+    RETURNS: Ticker | Position_Size
     """
 
     if as_of_date is None:
         as_of_date = max(dailyA["Date"].max(), dailyB["Date"].max())
 
-    start = as_of_date - pd.Timedelta(days=lookback_days)
+    frames = []
 
-    A = dailyA[dailyA["Date"].between(start, as_of_date)].copy()
-    B = dailyB[dailyB["Date"].between(start, as_of_date)].copy()
+    def select_bucket(daily_df, weight):
+        if daily_df is None or daily_df.empty:
+            return None
 
-    def score(df):
+        window = daily_df[daily_df["Date"] <= as_of_date].tail(lookback_days)
+        if window.empty:
+            return None
+
         agg = (
-            df.groupby("Ticker")
+            window.groupby("Ticker")
             .agg(
                 momentum=("Momentum Score", "mean"),
                 early=("Early Momentum Score", "mean"),
-                consistency=("Ticker", "count"),
+                appearances=("Date", "count"),
             )
             .reset_index()
         )
 
-        agg["Score"] = (
+        agg["consistency"] = agg["appearances"] / lookback_days
+        agg["score"] = (
             w_momentum * agg["momentum"]
             + w_early * agg["early"]
-            + w_consistency * (agg["consistency"] / lookback_days)
+            + w_consistency * agg["consistency"]
         )
 
-        return agg.sort_values("Score", ascending=False)
+        sel = agg.sort_values("score", ascending=False).head(top_n)
+        if sel.empty:
+            return None
 
-    A_rank = score(A).head(top_n)
-    B_rank = score(B).head(top_n)
-    
-    frames = []
-    
-    if not A_rank.empty:
-        A_rank = A_rank.copy()
-        A_rank["Bucket"] = "A"
-        A_rank["Capital"] = (total_capital * weight_A) / len(A_rank)
-        frames.append(A_rank)
-    
-    if not B_rank.empty:
-        B_rank = B_rank.copy()
-        B_rank["Bucket"] = "B"
-        B_rank["Capital"] = (total_capital * weight_B) / len(B_rank)
-        frames.append(B_rank)
-    
+        dollars_per_name = (total_capital * weight) / len(sel)
+
+        out = sel[["Ticker"]].copy()
+        out["Position_Size"] = dollars_per_name
+        return out
+
+    partA = select_bucket(dailyA, weight_A)
+    partB = select_bucket(dailyB, weight_B)
+
+    if partA is not None:
+        frames.append(partA)
+    if partB is not None:
+        frames.append(partB)
+
     if not frames:
-        return pd.DataFrame()
-    
-    final = pd.concat(frames, ignore_index=True)
-    final["AsOf"] = as_of_date
-    return final
+        return pd.DataFrame(columns=["Ticker", "Position_Size"])
 
+    combined = pd.concat(frames, ignore_index=True)
+
+    # Consolidate overlaps (CRITICAL)
+    return (
+        combined
+        .groupby("Ticker", as_index=False)["Position_Size"]
+        .sum()
+    )
