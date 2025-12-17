@@ -1,143 +1,194 @@
-import json
-import pandas as pd
 import streamlit as st
-from pathlib import Path
-import math
+import pandas as pd
+import numpy as np
 
-st.set_page_config(page_title="Momentum Strategy Dashboard", layout="wide")
-ARTIFACTS = Path("artifacts")
+st.set_page_config(layout="wide")
 
-# -------------------------------------------------
-# Helpers
-# -------------------------------------------------
+# ============================================================
+# 1) DATA LOADING
+# ============================================================
 
-def load_json(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    with open(path, "r") as f:
-        return json.load(f)
+def load_price_data_parquet(path: str) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    df["Date"] = pd.to_datetime(df["Date"])
 
-def load_parquet(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
+    if "Adj Close" in df.columns:
+        df["Price"] = df["Adj Close"]
+    elif "Close" in df.columns:
+        df["Price"] = df["Close"]
+    else:
+        raise ValueError("No 'Adj Close' or 'Close' found in parquet.")
 
-def fmt(x):
-    try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
-            return "—"
-        return f"{float(x):.2f}"
-    except Exception:
-        return "—"
+    keep = ["Ticker", "Date", "Price", "Index"]
+    df = df[keep].drop_duplicates(subset=["Ticker", "Date"], keep="last")
+    return df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Force canonical column names so Streamlit never guesses.
-    """
-    if df.empty:
-        return df
 
-    rename_map = {
-        "Weighted Score": "Weighted_Score",
-        "Momentum Score": "Momentum_Score",
-        "Early Momentum Score": "Early_Momentum_Score",
-        "Position Size": "Position_Size",
-    }
-    return df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+def load_index_returns_parquet(path: str) -> pd.DataFrame:
+    idx = pd.read_parquet(path)
+    idx.columns = idx.columns.str.lower().str.replace(" ", "_")
+    idx["date"] = pd.to_datetime(idx["date"])
 
-# -------------------------------------------------
-# UI Blocks
-# -------------------------------------------------
+    if "index_name" in idx.columns:
+        idx = idx.rename(columns={"index_name": "index"})
 
-def metric_row(title: str, stats: dict):
-    st.subheader(title)
-    cols = st.columns(5)
-    cols[0].metric("Total Return (%)", fmt(stats.get("Total Return (%)")))
-    cols[1].metric("CAGR (%)", fmt(stats.get("CAGR (%)")))
-    cols[2].metric("Sharpe Ratio", fmt(stats.get("Sharpe Ratio")))
-    cols[3].metric("Sortino Ratio", fmt(stats.get("Sortino Ratio")))
-    cols[4].metric("Max Drawdown (%)", fmt(stats.get("Max Drawdown (%)")))
+    frames = []
+    for _, g in idx.groupby("index"):
+        g = g.sort_values("date").copy()
+        close = g["close"]
 
-def trade_stats_row(title: str, tstats: dict):
-    st.subheader(title)
-    cols = st.columns(5)
-    cols[0].metric("Number of Trades", int(tstats.get("Number of Trades", 0)))
-    cols[1].metric("Win Rate (%)", fmt(tstats.get("Win Rate (%)")))
-    cols[2].metric("Average Win ($)", fmt(tstats.get("Average Win ($)")))
-    cols[3].metric("Average Loss ($)", fmt(tstats.get("Average Loss ($)")))
-    cols[4].metric("Profit Factor", fmt(tstats.get("Profit Factor")))
+        g["idx_ret_1d"] = close.pct_change()
+        g["idx_ret_20d"] = close.pct_change(20)
+        g["idx_ret_60d"] = close.pct_change(60)
+        g["idx_uptrend"] = (g["idx_ret_60d"] > 0).astype(int)
 
-def show_today_table(title: str, df: pd.DataFrame, preferred_cols: list[str]):
-    st.subheader(title)
+        frames.append(
+            g[["date", "index", "idx_ret_1d", "idx_ret_20d", "idx_ret_60d", "idx_uptrend"]]
+        )
 
-    if df.empty:
-        st.info("No rows available.")
-        return
+    return pd.concat(frames, ignore_index=True)
 
-    df = normalize_columns(df)
 
-    cols = [c for c in preferred_cols if c in df.columns]
-    if not cols:
-        st.dataframe(df, width="stretch")
-        return
+def filter_by_index(df: pd.DataFrame, index_name: str) -> pd.DataFrame:
+    return df[df["Index"] == index_name].reset_index(drop=True)
 
-    # deterministic sorting
-    for sort_col in ["Position_Size", "Weighted_Score", "Momentum_Score"]:
-        if sort_col in df.columns:
-            df = df.sort_values(sort_col, ascending=False)
-            break
+# ============================================================
+# 2) RETURNS
+# ============================================================
 
-    st.dataframe(df[cols].reset_index(drop=True), width="stretch")
+def add_absolute_returns(df):
+    df = df.copy()
+    df["1D Return"] = df.groupby("Ticker")["Price"].pct_change() + 1
+    return df
 
-# -------------------------------------------------
-# Load artifacts
-# -------------------------------------------------
 
-statsA = load_json(ARTIFACTS / "backtest_stats_A.json")
-statsB = load_json(ARTIFACTS / "backtest_stats_B.json")
-statsC = load_json(ARTIFACTS / "backtest_stats_C.json")
+def compute_index_momentum(idx, windows):
+    idx = idx.sort_values(["index", "date"]).copy()
+    idx["idx_1d"] = 1.0 + idx["idx_ret_1d"]
 
-tstatsA = load_json(ARTIFACTS / "trade_stats_A.json")
-tstatsB = load_json(ARTIFACTS / "trade_stats_B.json")
-tstatsC = load_json(ARTIFACTS / "trade_stats_C.json")
+    for w in windows:
+        idx[f"idx_{w}D"] = (
+            idx.groupby("index")["idx_1d"]
+            .rolling(w, min_periods=w)
+            .apply(np.prod, raw=True)
+            .reset_index(level=0, drop=True) - 1
+        )
 
-todayA = load_parquet(ARTIFACTS / "today_A.parquet")
-todayB = load_parquet(ARTIFACTS / "today_B.parquet")
-todayC = load_parquet(ARTIFACTS / "today_C.parquet")
+    return idx
 
-# -------------------------------------------------
-# Page
-# -------------------------------------------------
+# ============================================================
+# 3) MOMENTUM ENGINE (UNCHANGED)
+# ============================================================
 
-st.title("📈 Momentum Strategy Dashboard")
-st.caption("If you just ran GitHub Actions and numbers look stale/wrong, hard refresh your browser tab.")
+def calculate_momentum_features(df, windows):
+    df = df.copy()
+    for w in windows:
+        r = f"{w}D Return"
+        z = f"{w}D zscore"
+        dz = f"{w}D zscore change"
 
-# ---------------- Bucket A ----------------
-st.markdown("## ================= BUCKET A — ABSOLUTE MOMENTUM ================")
-metric_row("BUCKET A — BACKTEST PERFORMANCE", statsA)
-trade_stats_row("BUCKET A — TRADE STATISTICS", tstatsA)
-show_today_table(
-    "BUCKET A — TODAY'S TRADES (FINAL SELECTION)",
-    todayA,
-    ["Ticker", "Action", "Weighted_Score", "Momentum_Score", "Early_Momentum_Score", "Consistency"]
-)
+        df[r] = (
+            df.groupby("Ticker")["1D Return"]
+            .rolling(w, min_periods=w)
+            .apply(np.prod, raw=True)
+            .reset_index(level=0, drop=True) - 1
+        )
 
-# ---------------- Bucket B ----------------
-st.markdown("## ================= BUCKET B — RELATIVE MOMENTUM ================")
-metric_row("BUCKET B — BACKTEST PERFORMANCE", statsB)
-trade_stats_row("BUCKET B — TRADE STATISTICS", tstatsB)
-show_today_table(
-    "BUCKET B — TODAY'S TRADES (FINAL SELECTION)",
-    todayB,
-    ["Ticker", "Action", "Weighted_Score", "Momentum_Score", "Early_Momentum_Score", "Consistency"]
-)
+        mean = df.groupby("Date")[r].transform("mean")
+        std = df.groupby("Date")[r].transform("std").replace(0, np.nan)
+        df[z] = ((df[r] - mean) / std)
 
-# ---------------- Bucket C ----------------
-st.markdown("## ================= BUCKET C — COMBINED PORTFOLIO ================")
-metric_row("BUCKET C — BACKTEST PERFORMANCE", statsC)
-trade_stats_row("BUCKET C — TRADE STATISTICS", tstatsC)
-show_today_table(
-    "BUCKET C — TODAY'S TRADES (FINAL, 80/20 ALLOCATION)",
-    todayC,
-    ["Ticker", "Position_Size", "Action"]
-)
+        df[dz] = (
+            df.groupby("Ticker")[z]
+            .diff()
+            .ewm(span=w, adjust=False)
+            .mean()
+        )
+
+    df[df.select_dtypes("number").columns] = df.select_dtypes("number").fillna(0)
+    return df
+
+
+def add_regime_momentum_score(df):
+    df = df.copy()
+    df["Momentum_Fast"] = 0.6 * df["5D zscore"] + 0.4 * df["10D zscore"]
+    df["Momentum_Mid"]  = 0.5 * df["30D zscore"] + 0.5 * df["45D zscore"]
+    df["Momentum_Slow"] = 0.5 * df["60D zscore"] + 0.5 * df["90D zscore"]
+
+    df["Momentum Score"] = (
+        0.5 * df["Momentum_Slow"] +
+        0.3 * df["Momentum_Mid"] +
+        0.2 * df["Momentum_Fast"]
+    )
+    return df.fillna(0)
+
+
+def add_regime_acceleration(df):
+    df = df.copy()
+    df["Accel_Fast"] = df.groupby("Ticker")["Momentum_Fast"].diff()
+    df["Accel_Mid"]  = df.groupby("Ticker")["Momentum_Mid"].diff()
+    df["Accel_Slow"] = df.groupby("Ticker")["Momentum_Slow"].diff()
+
+    def z(x):
+        s = x.std()
+        return ((x - x.mean()) / s).fillna(0) if s and s > 0 else (x - x.mean()).fillna(0)
+
+    df["Accel_Fast_z"] = df.groupby("Date")["Accel_Fast"].transform(z)
+    df["Accel_Mid_z"]  = df.groupby("Date")["Accel_Mid"].transform(z)
+    df["Accel_Slow_z"] = df.groupby("Date")["Accel_Slow"].transform(z)
+
+    return df.fillna(0)
+
+
+def add_regime_early_momentum(df):
+    df = df.copy()
+    df["Early Momentum Score"] = (
+        0.5 * (0.5 * df["Accel_Slow_z"] + 0.5 * df["Momentum_Slow"]) +
+        0.3 * (0.5 * df["Accel_Mid_z"]  + 0.5 * df["Momentum_Mid"]) +
+        0.2 * (0.6 * df["Accel_Fast_z"] + 0.4 * df["Momentum_Fast"])
+    )
+    return df.fillna(0)
+
+# ============================================================
+# 4) DAILY LISTS
+# ============================================================
+
+def build_daily_lists(df, top_n):
+    out = []
+    for d in sorted(df["Date"].unique()):
+        snap = df[df["Date"] == d].sort_values("Momentum Score", ascending=False).head(top_n)
+        for _, r in snap.iterrows():
+            out.append({
+                "Date": d,
+                "Ticker": r["Ticker"],
+                "Momentum Score": r["Momentum Score"],
+                "Early Momentum Score": r["Early Momentum Score"]
+            })
+    return pd.DataFrame(out)
+
+# ============================================================
+# MAIN (PIPELINE EXECUTION)
+# ============================================================
+
+st.title("📈 Momentum Strategy — Pipeline Replica")
+
+ARTIFACTS = "artifacts"
+PRICE_PATH = f"{ARTIFACTS}/index_constituents_5yr.parquet"
+INDEX_PATH = f"{ARTIFACTS}/index_returns_5y.parquet"
+
+WINDOWS = (5, 10, 30, 45, 60, 90)
+TOP_N = 10
+
+base = load_price_data_parquet(PRICE_PATH)
+base = filter_by_index(base, "SP500")
+idx = load_index_returns_parquet(INDEX_PATH)
+
+dfA = calculate_momentum_features(add_absolute_returns(base), WINDOWS)
+dfA = add_regime_momentum_score(dfA)
+dfA = add_regime_acceleration(dfA)
+dfA = add_regime_early_momentum(dfA)
+
+dailyA = build_daily_lists(dfA, TOP_N)
+
+st.subheader("Bucket A — Daily Signals")
+st.dataframe(dailyA.tail(20), use_container_width=True)
