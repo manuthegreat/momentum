@@ -22,7 +22,6 @@ from core.features import (
     calculate_momentum_features,
     add_regime_momentum_score,
     add_regime_acceleration,
-    add_regime_residual_momentum,
     add_regime_early_momentum,
     add_relative_regime_momentum_score,
     compute_index_momentum,
@@ -88,11 +87,11 @@ def write_today(daily_df: pd.DataFrame, out_path: Path):
     daily_df[daily_df["Date"] == latest].to_parquet(out_path, index=False)
 
 
-def compute_perf_stats_full(history_df: pd.DataFrame, value_col="Portfolio Value") -> dict:
-    if history_df.empty or len(history_df) < 2:
+def compute_perf_stats_full(df: pd.DataFrame, value_col="Portfolio Value") -> dict:
+    if df.empty or len(df) < 2:
         return {}
 
-    df = history_df.sort_values("Date")
+    df = df.sort_values("Date")
     start, end = df[value_col].iloc[0], df[value_col].iloc[-1]
     ret = df[value_col].pct_change().dropna()
 
@@ -142,25 +141,23 @@ def main():
 
     idx = load_index_returns_parquet(INDEX_PATH)
 
-    # ========================================================
-    # BUCKET A — ABSOLUTE MOMENTUM (PIPELINE IDENTICAL)
-    # ========================================================
+    price_table = base.pivot(index="Date", columns="Ticker", values="Price").sort_index()
 
-    dfA = calculate_momentum_features(
-        add_absolute_returns(base),
-        windows=WINDOWS
-    )
+    # =========================
+    # BUCKET A — ABSOLUTE
+    # =========================
+
+    dfA = add_absolute_returns(base)
+    dfA = calculate_momentum_features(dfA, windows=WINDOWS)
     dfA = add_regime_momentum_score(dfA)
     dfA = add_regime_acceleration(dfA)
-    dfA = add_regime_residual_momentum(dfA)
     dfA = add_regime_early_momentum(dfA)
 
-    priceA = dfA.pivot(index="Date", columns="Ticker", values="Price").sort_index()
     dailyA = build_daily_lists(dfA, top_n=TOP_N)
 
     eqA, trA = simulate_single_bucket_as_unified(
         df_prices=base,
-        price_table=priceA,
+        price_table=price_table,
         daily_df=dailyA,
         rebalance_interval=REBALANCE_INTERVAL,
         lookback_days=LOOKBACK_DAYS,
@@ -172,42 +169,32 @@ def main():
         dollars_per_name=5_000,
     )
 
-    write_json(STATS_A_OUT, compute_perf_stats_full(eqA))
-    write_json(TRADE_STATS_A_OUT, compute_trade_stats(trA))
     eqA.to_parquet(EQUITY_A_OUT, index=False)
     trA.to_parquet(TRADES_A_OUT, index=False)
+    write_json(STATS_A_OUT, compute_perf_stats_full(eqA))
+    write_json(TRADE_STATS_A_OUT, compute_trade_stats(trA))
     write_today(dailyA, TODAY_A_OUT)
 
-    # ========================================================
-    # BUCKET B — RELATIVE REGIME MOMENTUM (PIPELINE IDENTICAL)
-    # ========================================================
+    # =========================
+    # BUCKET B — RELATIVE
+    # =========================
 
-    dfB = base.copy()
-
-    dfB = dfB.merge(
+    dfB = base.merge(
         idx,
         left_on=["Date", "Index"],
         right_on=["date", "index"],
         how="left",
-        validate="many_to_one",
     ).drop(columns=["date", "index"], errors="ignore")
 
     dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
 
-    dfB = calculate_momentum_features(
-        add_absolute_returns(dfB),
-        windows=WINDOWS
-    )
+    dfB = add_absolute_returns(dfB)
+    dfB = calculate_momentum_features(dfB, windows=WINDOWS)
 
     idx_mom = compute_index_momentum(idx, windows=WINDOWS)
 
     dfB = dfB.merge(
-        idx_mom[
-            ["date", "index",
-             "idx_5D", "idx_10D",
-             "idx_30D", "idx_45D",
-             "idx_60D", "idx_90D"]
-        ],
+        idx_mom,
         left_on=["Date", "Index"],
         right_on=["date", "index"],
         how="left",
@@ -215,28 +202,21 @@ def main():
 
     dfB = add_relative_regime_momentum_score(dfB)
 
-    dfB["Momentum Score"] = (
-        0.5 * dfB["Rel_Slow_z"] +
-        0.3 * dfB["Rel_Mid_z"] +
-        0.2 * dfB["Rel_Fast_z"]
-    )
-
+    # Regime filters
     dfB = dfB[
-        (dfB["Momentum_Slow"] > 1) &
+        (dfB["Momentum_Slow"] > 1.0) &
         (dfB["Momentum_Mid"] > 0.5) &
-        (dfB["Momentum_Fast"] > 1)
+        (dfB["Momentum_Fast"] > 1.0)
     ].copy()
-
+    
     dfB = add_regime_acceleration(dfB)
-    dfB = add_regime_residual_momentum(dfB)
     dfB = add_regime_early_momentum(dfB)
 
-    priceB = dfB.pivot(index="Date", columns="Ticker", values="Price").sort_index()
     dailyB = build_daily_lists(dfB, top_n=TOP_N)
 
     eqB, trB = simulate_single_bucket_as_unified(
         df_prices=base,
-        price_table=priceB,
+        price_table=price_table,
         daily_df=dailyB,
         rebalance_interval=REBALANCE_INTERVAL,
         lookback_days=LOOKBACK_DAYS,
@@ -248,19 +228,19 @@ def main():
         dollars_per_name=5_000,
     )
 
-    write_json(STATS_B_OUT, compute_perf_stats_full(eqB))
-    write_json(TRADE_STATS_B_OUT, compute_trade_stats(trB))
     eqB.to_parquet(EQUITY_B_OUT, index=False)
     trB.to_parquet(TRADES_B_OUT, index=False)
+    write_json(STATS_B_OUT, compute_perf_stats_full(eqB))
+    write_json(TRADE_STATS_B_OUT, compute_trade_stats(trB))
     write_today(dailyB, TODAY_B_OUT)
 
-    # ========================================================
-    # BUCKET C — UNIFIED (PIPELINE IDENTICAL)
-    # ========================================================
+    # =========================
+    # BUCKET C — UNIFIED
+    # =========================
 
-    eqC, trC = simulate_unified_portfolio(
+    eqC, target_last = simulate_unified_portfolio(
         df_prices=base,
-        price_table=priceA,
+        price_table=price_table,
         dailyA=dailyA,
         dailyB=dailyB,
         rebalance_interval=REBALANCE_INTERVAL,
@@ -272,12 +252,13 @@ def main():
         total_capital=TOTAL_CAPITAL,
     )
 
-    write_json(STATS_C_OUT, compute_perf_stats_full(eqC))
-    write_json(TRADE_STATS_C_OUT, compute_trade_stats(trC))
     eqC.to_parquet(EQUITY_C_OUT, index=False)
-    trC.to_parquet(TRADES_C_OUT, index=False)
+    write_json(STATS_C_OUT, compute_perf_stats_full(eqC))
 
-    print("✅ Pipeline-identical backtest complete.")
+    if isinstance(target_last, pd.DataFrame):
+        target_last.to_parquet(TODAY_C_OUT, index=False)
+
+    print("✅ GitHub backtest now matches pipeline.")
 
 
 if __name__ == "__main__":
