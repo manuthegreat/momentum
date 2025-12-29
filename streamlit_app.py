@@ -1570,7 +1570,9 @@ def _stats_to_df(d: dict) -> pd.DataFrame:
 # ============================================================
 
 st.title("📈 Momentum Portfolio")
-st.caption("Combined portfolio (Bucket C). PM-friendly view from latest GitHub Actions artifacts.")
+st.caption(
+    "This strategy seeks to capture persistent equity momentum by systematically ranking stocks on both absolute price strength and alpha-based momentum relative to the broader market. Momentum candidates are selected using a disciplined, multi-horizon process that emphasizes consistency and trend persistence rather than short-term price moves. The portfolio is rebalanced monthly on the first trading day, rotating capital into the strongest opportunities while exiting positions where momentum has deteriorated. Positions are held as long as momentum persists, with no fixed take-profit targets—allowing winners to compound while enforcing objective exits through the rebalance process."
+)
 
 with st.spinner("Running full pipeline from artifacts…"):
     out = run_full_pipeline()
