@@ -1094,7 +1094,7 @@ def month_end_dates(dates: pd.Series) -> list:
         return []
     df = pd.DataFrame({"Date": sorted(d)})
     df["Month"] = df["Date"].dt.to_period("M")
-    return df.groupby("Month")["Date"].max().tolist()
+    return df.groupby("Month")["Date"].min().tolist()
 
 
 def compute_targets_over_dates(
