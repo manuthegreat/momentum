@@ -1,6 +1,11 @@
 # streamlit_app.py
 # FULL, 1:1 PIPELINE MIRROR (same functions, same order, same math)
-# Only difference: reads parquet paths from GitHub Actions artifacts folder.
+# Only differences (additive + schedule-only):
+#   1) Rebalance schedule is MONTH-END (monthly) instead of every N trading days
+#      -> implemented by using monthly_rebalance_dates() in the two simulators.
+#   2) Current Portfolio tab now marks-to-market from last monthly rebalance date
+#      to the latest available price date (so P&L is not forced to 0).
+# All momentum / scoring / filters are untouched.
 
 import streamlit as st
 import pandas as pd
@@ -709,6 +714,7 @@ def get_today_trades_from_final_selection(
 
     return out
 
+
 def plot_equity_and_drawdown(history_df: pd.DataFrame, title: str):
     if history_df.empty:
         st.info("No equity history to display.")
@@ -788,7 +794,7 @@ def get_today_trades_bucket_c(
     Final BUY / HOLD / SELL list for unified Bucket C
     """
 
-    # Get sorted rebalance dates
+    # Get sorted rebalance dates (monthly schedule is handled in sims; here remains "latest common date")
     all_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
     if len(all_dates) < 2:
         return pd.DataFrame()
@@ -847,12 +853,30 @@ def get_today_trades_bucket_c(
     ).reset_index(drop=True)
 
 
+# ============================================================
+# ✅ MONTHLY REBALANCE SCHEDULE (NEW, additive)
+# ============================================================
+
+def monthly_rebalance_dates(df_prices: pd.DataFrame) -> list:
+    """Month-end rebalance dates = last available trading day in each month."""
+    dates = pd.to_datetime(df_prices["Date"]).dropna().sort_values().unique()
+    if len(dates) == 0:
+        return []
+    tmp = pd.DataFrame({"Date": dates})
+    tmp["Month"] = tmp["Date"].dt.to_period("M")
+    return tmp.groupby("Month")["Date"].max().tolist()
+
+
+# ============================================================
+# BACKTEST ENGINES (ONLY CHANGE = REBALANCE DATES)
+# ============================================================
+
 def simulate_unified_portfolio(
     df_prices: pd.DataFrame,
     price_table: pd.DataFrame,
     dailyA: pd.DataFrame,
     dailyB: pd.DataFrame,
-    rebalance_interval: int = 10,
+    rebalance_interval: int = 10,  # kept for signature compatibility; unused in monthly mode
     lookback_days: int = 10,
     w_momentum: float = 0.50,
     w_early: float = 0.30,
@@ -866,9 +890,11 @@ def simulate_unified_portfolio(
     - $2,500 per bucket per name
     - Name in both A & B gets $5,000
     - Cash-constrained, no leverage
+
+    ✅ Rebalance schedule: MONTH-END (monthly_rebalance_dates)
     """
 
-    rebalance_dates = sorted(df_prices["Date"].unique())[::rebalance_interval]
+    rebalance_dates = monthly_rebalance_dates(df_prices)
 
     cash = total_capital
     portfolio = {}   # ticker -> shares
@@ -960,7 +986,7 @@ def simulate_single_bucket_as_unified(
     df_prices,
     price_table,
     daily_df,
-    rebalance_interval,
+    rebalance_interval,  # kept for signature compatibility; unused in monthly mode
     lookback_days,
     w_momentum,
     w_early,
@@ -971,6 +997,8 @@ def simulate_single_bucket_as_unified(
 ):
     """
     Runs Bucket A or B using the SAME capital mechanics as Bucket C.
+
+    ✅ Rebalance schedule: MONTH-END (monthly_rebalance_dates)
     """
 
     def build_single_target(as_of_date):
@@ -990,7 +1018,7 @@ def simulate_single_bucket_as_unified(
         sel["Position_Size"] = dollars_per_name
         return sel[["Ticker", "Position_Size"]]
 
-    rebalance_dates = sorted(df_prices["Date"].unique())[::rebalance_interval]
+    rebalance_dates = monthly_rebalance_dates(df_prices)
 
     cash = total_capital
     portfolio = {}
@@ -1054,6 +1082,10 @@ def simulate_single_bucket_as_unified(
 
     return pd.DataFrame(history), pd.DataFrame(trades)
 
+
+# ============================================================
+# MONTH-END DATES / TARGETS / MARK-TO-MARKET TABLES (UNCHANGED)
+# ============================================================
 
 def month_end_dates(dates: pd.Series) -> list:
     """Pick the last available trading date in each month."""
@@ -1203,6 +1235,7 @@ def trade_diagnostics(trades_df: pd.DataFrame) -> dict:
         "monthly_table": monthly
     }
 
+
 def portfolio_mark_to_market(
     price_table: pd.DataFrame,
     target_df: pd.DataFrame,
@@ -1333,7 +1366,8 @@ def run_full_pipeline():
     parquet_path = "artifacts/index_constituents_5yr.parquet"
     index_path = "artifacts/index_returns_5y.parquet"
 
-    # Strategy knobs (shared) — identical to pipeline
+    # Strategy knobs (shared) — identical to pipeline (momentum logic untouched)
+    # Note: REBALANCE_INTERVAL is kept for parity but monthly schedule is enforced in the simulators above.
     REBALANCE_INTERVAL = 10
     DAILY_TOP_N = 10
     FINAL_TOP_N = 10
@@ -1366,7 +1400,7 @@ def run_full_pipeline():
         df_prices=base,
         price_table=priceA,
         daily_df=dailyA,
-        rebalance_interval=REBALANCE_INTERVAL,
+        rebalance_interval=REBALANCE_INTERVAL,  # unused in monthly mode
         lookback_days=LOOKBACK_DAYS,
         w_momentum=W_MOM,
         w_early=W_EARLY,
@@ -1446,7 +1480,7 @@ def run_full_pipeline():
         df_prices=base,
         price_table=priceB,
         daily_df=dailyB,
-        rebalance_interval=REBALANCE_INTERVAL,
+        rebalance_interval=REBALANCE_INTERVAL,  # unused in monthly mode
         lookback_days=LOOKBACK_DAYS,
         w_momentum=W_MOM,
         w_early=W_EARLY,
@@ -1474,7 +1508,7 @@ def run_full_pipeline():
         price_table=priceA,   # same price table (exactly as pipeline)
         dailyA=dailyA,
         dailyB=dailyB,
-        rebalance_interval=REBALANCE_INTERVAL,
+        rebalance_interval=REBALANCE_INTERVAL,  # unused in monthly mode
         lookback_days=LOOKBACK_DAYS,
         w_momentum=W_MOM,
         w_early=W_EARLY,
@@ -1517,7 +1551,7 @@ def run_full_pipeline():
         "BucketB": {"history": histB, "trades": tradesB, "stats": statsB, "trade_stats": trade_statsB, "today": todayB},
         "BucketC": {"history": histU, "trades": tradesU, "stats": statsU, "trade_stats": trade_statsU, "today": todayC},
 
-        # ✅ NEW: expose the intermediates needed for current portfolio + monthly rebalances
+        # expose intermediates needed for current portfolio + monthly rebalances
         "internals": {
             "base": base,
             "dailyA": dailyA,
@@ -1527,10 +1561,13 @@ def run_full_pipeline():
     }
 
 
-
 def _stats_to_df(d: dict) -> pd.DataFrame:
     return pd.DataFrame({"Metric": list(d.keys()), "Value": list(d.values())})
 
+
+# ============================================================
+# UI
+# ============================================================
 
 st.title("📈 Momentum Portfolio")
 st.caption("Combined portfolio (Bucket C). PM-friendly view from latest GitHub Actions artifacts.")
@@ -1552,14 +1589,11 @@ trades = bucketC["trades"]
 stats = bucketC["stats"]
 trade_stats = bucketC["trade_stats"]
 
-def _stats_to_df(d: dict) -> pd.DataFrame:
-    return pd.DataFrame({"Metric": list(d.keys()), "Value": list(d.values())})
-
 # --- common dates across A and B ---
 all_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
 today = all_dates[-1] if all_dates else None
 
-# --- month-end rebalance dates ---
+# --- month-end rebalance dates (reporting + now also the rebalance schedule) ---
 m_dates = month_end_dates(all_dates)
 
 # --- targets/actions for each month-end ---
@@ -1579,20 +1613,17 @@ bundle = compute_targets_over_dates(
 targets_by_month = bundle["targets"]
 actions_by_month = bundle["actions"]
 
-# choose "current" as latest month-end; fallback to last available date
-as_of = m_dates[-1] if m_dates else today
-current_target = targets_by_month.get(as_of, pd.DataFrame())
+# ✅ Current portfolio: entry at LAST MONTH-END rebalance date; mark to latest available price date.
+entry_date = m_dates[-1] if m_dates else today
+latest_price_date = priceA.index.max() if len(priceA.index) else entry_date
 
-# Mark to latest available price date in price table
-latest_price_date = priceA.index.max() if len(priceA.index) else as_of
-
+current_target = targets_by_month.get(entry_date, pd.DataFrame())
 current_port = portfolio_mark_to_market(
     price_table=priceA,
     target_df=current_target,
-    entry_date=as_of,              # entry at last month-end rebalance
-    mark_date=latest_price_date    # mark to latest available price
+    entry_date=entry_date,          # entry at last month-end rebalance
+    mark_date=latest_price_date     # mark to latest available price (can be > entry_date)
 )
-
 
 tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Current Portfolio", "Monthly Rebalances", "Diagnostics"])
 
@@ -1610,13 +1641,27 @@ with tab1:
     st.dataframe(_stats_to_df(trade_stats), use_container_width=True)
 
 with tab2:
-    st.markdown(f"### Current Portfolio (as of {pd.to_datetime(as_of).date() if as_of is not None else 'N/A'})")
+    st.markdown(
+        f"### Current Portfolio (rebalance: {pd.to_datetime(entry_date).date() if entry_date is not None else 'N/A'} → "
+        f"marked: {pd.to_datetime(latest_price_date).date() if latest_price_date is not None else 'N/A'})"
+    )
+
     if current_port is None or current_port.empty:
         st.info("No portfolio could be constructed.")
     else:
         st.dataframe(current_port, use_container_width=True)
-        top5 = float(current_port["Weight_%"].head(5).sum())
+
+        # Top 5 weight (exclude TOTAL)
+        dfw = current_port[current_port["Ticker"] != "TOTAL"].copy()
+        top5 = float(dfw["Weight_%"].head(5).sum()) if not dfw.empty else 0.0
         st.metric("Top 5 weight (%)", f"{top5:.1f}")
+
+        # Portfolio PnL (from TOTAL row)
+        try:
+            total_row = current_port[current_port["Ticker"] == "TOTAL"].iloc[0]
+            st.metric("Portfolio P&L ($)", f"{float(total_row['PnL_$']):,.0f}")
+        except Exception:
+            pass
 
 with tab3:
     st.markdown("### Monthly Rebalance History")
@@ -1627,21 +1672,25 @@ with tab3:
         month_labels = [pd.to_datetime(d).strftime("%Y-%m") for d in m_dates]
         choice = st.selectbox("Select month", options=month_labels, index=len(month_labels) - 1)
         chosen_date = m_dates[month_labels.index(choice)]
+
         # Monthly P&L summary for the whole strategy (month-end to next month-end)
-        monthly_summary = monthly_pnl_table(price_table=priceA, targets_by_month=targets_by_month, month_end_dates_list=m_dates)
+        monthly_summary = monthly_pnl_table(
+            price_table=priceA,
+            targets_by_month=targets_by_month,
+            month_end_dates_list=m_dates
+        )
         st.markdown("#### Monthly performance (month-end to next month-end)")
         st.dataframe(monthly_summary, use_container_width=True)
 
-
         st.markdown(f"#### Target portfolio — {choice} (rebalance date: {pd.to_datetime(chosen_date).date()})")
-        
+
         # If there's a next month, show P&L to next month-end; otherwise mark to latest price
         idx_choice = month_labels.index(choice)
         if idx_choice < len(m_dates) - 1:
             exit_date = m_dates[idx_choice + 1]
         else:
             exit_date = priceA.index.max() if len(priceA.index) else chosen_date
-        
+
         tgt = targets_by_month.get(chosen_date, pd.DataFrame())
         mtm_month = portfolio_mark_to_market(
             price_table=priceA,
@@ -1649,9 +1698,9 @@ with tab3:
             entry_date=chosen_date,
             mark_date=exit_date
         )
-        
+
         st.dataframe(mtm_month, use_container_width=True)
-        
+
         st.markdown("#### Actions vs previous month")
         st.dataframe(actions_by_month[chosen_date], use_container_width=True)
 
