@@ -1055,6 +1055,156 @@ def simulate_single_bucket_as_unified(
     return pd.DataFrame(history), pd.DataFrame(trades)
 
 
+def month_end_dates(dates: pd.Series) -> list:
+    """Pick the last available trading date in each month."""
+    d = pd.to_datetime(pd.Series(dates).dropna().unique())
+    if len(d) == 0:
+        return []
+    df = pd.DataFrame({"Date": sorted(d)})
+    df["Month"] = df["Date"].dt.to_period("M")
+    return df.groupby("Month")["Date"].max().tolist()
+
+
+def compute_targets_over_dates(
+    dailyA: pd.DataFrame,
+    dailyB: pd.DataFrame,
+    dates: list,
+    lookback_days: int,
+    w_momentum: float,
+    w_early: float,
+    w_consistency: float,
+    top_n: int,
+    total_capital: float,
+    weight_A: float = 0.20,
+    weight_B: float = 0.80
+) -> dict:
+    """
+    For each date:
+      - compute unified target (Ticker, Position_Size)
+      - compute actions vs previous date (BUY/HOLD/SELL)
+    """
+    targets = {}
+    actions = {}
+
+    prev_set = set()
+    for d in dates:
+        tgt = build_unified_target(
+            dailyA=dailyA,
+            dailyB=dailyB,
+            as_of_date=d,
+            lookback_days=lookback_days,
+            w_momentum=w_momentum,
+            w_early=w_early,
+            w_consistency=w_consistency,
+            top_n=top_n,
+            total_capital=total_capital,
+            weight_A=weight_A,
+            weight_B=weight_B
+        )
+
+        if tgt is None or tgt.empty:
+            targets[d] = pd.DataFrame(columns=["Ticker", "Position_Size"])
+            actions[d] = pd.DataFrame(columns=["Ticker", "Position_Size", "Action"])
+            continue
+
+        today_set = set(tgt["Ticker"])
+        out = tgt.copy()
+        out["Action"] = "BUY"
+        out.loc[out["Ticker"].isin(prev_set), "Action"] = "HOLD"
+
+        sells = prev_set - today_set
+        if sells:
+            sell_df = pd.DataFrame({"Ticker": list(sells)})
+            sell_df["Position_Size"] = 0.0
+            sell_df["Action"] = "SELL"
+            out = pd.concat([out, sell_df], ignore_index=True)
+
+        out = out.sort_values(["Action", "Position_Size"], ascending=[True, False]).reset_index(drop=True)
+
+        targets[d] = tgt.sort_values("Position_Size", ascending=False).reset_index(drop=True)
+        actions[d] = out
+        prev_set = today_set
+
+    return {"targets": targets, "actions": actions}
+
+
+def current_portfolio_table(
+    price_table: pd.DataFrame,
+    target_df: pd.DataFrame,
+    as_of_date
+) -> pd.DataFrame:
+    """
+    Build a PM-style 'Current Portfolio' table from target dollars and latest prices.
+    """
+    if target_df is None or target_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    total = float(target_df["Position_Size"].sum())
+
+    for _, r in target_df.iterrows():
+        t = r["Ticker"]
+        dollars = float(r["Position_Size"])
+        px = get_last_price(price_table, t, as_of_date)
+
+        if px is None or px <= 0:
+            shares = np.nan
+            mkt = np.nan
+        else:
+            shares = dollars / px
+            mkt = shares * px
+
+        rows.append({
+            "Ticker": t,
+            "Target_$": dollars,
+            "Last_Price": px,
+            "Shares": shares,
+            "Market_Value_$": mkt,
+            "Weight_%": (dollars / total * 100.0) if total > 0 else np.nan
+        })
+
+    df = pd.DataFrame(rows).sort_values("Target_$", ascending=False).reset_index(drop=True)
+    return df
+
+
+def trade_diagnostics(trades_df: pd.DataFrame) -> dict:
+    """
+    Simple PM-friendly diagnostics from the trade blotter.
+    """
+    if trades_df is None or trades_df.empty:
+        return {"Message": "No trades"}
+
+    df = trades_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Month"] = df["Date"].dt.to_period("M").astype(str)
+
+    # Only realized PnL sits on Sell in your engine
+    sells = df[df["Action"] == "Sell"].copy()
+    realized = float(sells["PnL"].sum()) if not sells.empty else 0.0
+
+    # Counts
+    buys = int((df["Action"] == "Buy").sum())
+    sells_n = int((df["Action"] == "Sell").sum())
+    resz = int((df["Action"] == "Resize").sum())
+
+    # Monthly activity table
+    monthly = (
+        df.groupby(["Month", "Action"])
+          .size()
+          .unstack(fill_value=0)
+          .reset_index()
+    )
+
+    return {
+        "Realized_PnL_$": realized,
+        "Buys": buys,
+        "Sells": sells_n,
+        "Resizes": resz,
+        "monthly_table": monthly
+    }
+
+
+
 # ============================================================
 # STREAMLIT UI (RUNS THE SAME "MAIN" PIPELINE)
 # ============================================================
