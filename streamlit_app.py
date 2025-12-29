@@ -1393,59 +1393,137 @@ def run_full_pipeline():
             "W_EARLY": W_EARLY,
             "W_CONS": W_CONS,
         },
+
+        # Keep these for now (even if we won’t display A/B)
         "BucketA": {"history": histA, "trades": tradesA, "stats": statsA, "trade_stats": trade_statsA, "today": todayA},
         "BucketB": {"history": histB, "trades": tradesB, "stats": statsB, "trade_stats": trade_statsB, "today": todayB},
         "BucketC": {"history": histU, "trades": tradesU, "stats": statsU, "trade_stats": trade_statsU, "today": todayC},
+
+        # ✅ NEW: expose the intermediates needed for current portfolio + monthly rebalances
+        "internals": {
+            "base": base,
+            "dailyA": dailyA,
+            "dailyB": dailyB,
+            "priceA": priceA,
+        }
     }
+
 
 
 def _stats_to_df(d: dict) -> pd.DataFrame:
     return pd.DataFrame({"Metric": list(d.keys()), "Value": list(d.values())})
 
 
-st.title("📈 Momentum Strategy Dashboard")
-st.caption("If you just ran GitHub Actions and numbers look stale/wrong, hard refresh your browser tab.")
+st.title("📈 Momentum Portfolio")
+st.caption("Combined portfolio (Bucket C). PM-friendly view from latest GitHub Actions artifacts.")
 
 with st.spinner("Running full pipeline from artifacts…"):
     out = run_full_pipeline()
 
-# --- Render Bucket sections (same content as your prints) ---
-def render_bucket(title, bucket):
-    st.markdown(f"## {title}")
+params = out["params"]
+bucketC = out["BucketC"]
+internals = out["internals"]
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("### BACKTEST PERFORMANCE")
-        st.dataframe(_stats_to_df(bucket["stats"]), use_container_width=True)
-    with c2:
-        st.markdown("### TRADE STATISTICS")
-        st.dataframe(_stats_to_df(bucket["trade_stats"]), use_container_width=True)
+base = internals["base"]
+dailyA = internals["dailyA"]
+dailyB = internals["dailyB"]
+priceA = internals["priceA"]  # last prices
 
-    
+hist = bucketC["history"]
+trades = bucketC["trades"]
+stats = bucketC["stats"]
+trade_stats = bucketC["trade_stats"]
+
+def _stats_to_df(d: dict) -> pd.DataFrame:
+    return pd.DataFrame({"Metric": list(d.keys()), "Value": list(d.values())})
+
+# --- common dates across A and B ---
+all_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
+today = all_dates[-1] if all_dates else None
+
+# --- month-end rebalance dates ---
+m_dates = month_end_dates(all_dates)
+
+# --- targets/actions for each month-end ---
+bundle = compute_targets_over_dates(
+    dailyA=dailyA,
+    dailyB=dailyB,
+    dates=m_dates,
+    lookback_days=params["LOOKBACK_DAYS"],
+    w_momentum=params["W_MOM"],
+    w_early=params["W_EARLY"],
+    w_consistency=params["W_CONS"],
+    top_n=params["FINAL_TOP_N"],
+    total_capital=100_000.0,
+    weight_A=0.20,
+    weight_B=0.80
+)
+targets_by_month = bundle["targets"]
+actions_by_month = bundle["actions"]
+
+# choose "current" as latest month-end; fallback to last available date
+as_of = m_dates[-1] if m_dates else today
+current_target = targets_by_month.get(as_of, pd.DataFrame())
+current_port = current_portfolio_table(price_table=priceA, target_df=current_target, as_of_date=as_of)
+
+tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Current Portfolio", "Monthly Rebalances", "Diagnostics"])
+
+with tab1:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Return (%)", f"{stats.get('Total Return (%)', np.nan):.2f}")
+    c2.metric("CAGR (%)", f"{stats.get('CAGR (%)', np.nan):.2f}")
+    c3.metric("Sharpe", f"{stats.get('Sharpe Ratio', np.nan):.2f}")
+    c4.metric("Max Drawdown (%)", f"{stats.get('Max Drawdown (%)', np.nan):.2f}")
+
     st.markdown("### Equity & Drawdown")
-    
-    plot_equity_and_drawdown(
-        bucket["history"],
-        title=title
-    )
+    plot_equity_and_drawdown(hist, title="Momentum Portfolio")
 
+    st.markdown("### Trade Statistics")
+    st.dataframe(_stats_to_df(trade_stats), use_container_width=True)
 
-
-    st.markdown("### TODAY'S TRADES")
-    today = bucket["today"]
-    if today is None or today.empty:
-        st.write("No trades today")
+with tab2:
+    st.markdown(f"### Current Portfolio (as of {pd.to_datetime(as_of).date() if as_of is not None else 'N/A'})")
+    if current_port is None or current_port.empty:
+        st.info("No portfolio could be constructed.")
     else:
-        st.dataframe(today, use_container_width=True)
+        st.dataframe(current_port, use_container_width=True)
+        top5 = float(current_port["Weight_%"].head(5).sum())
+        st.metric("Top 5 weight (%)", f"{top5:.1f}")
 
-    with st.expander("Show backtest trades"):
-        trades = bucket["trades"]
+with tab3:
+    st.markdown("### Monthly Rebalance History")
+
+    if not m_dates:
+        st.info("Not enough data to compute monthly rebalances.")
+    else:
+        month_labels = [pd.to_datetime(d).strftime("%Y-%m") for d in m_dates]
+        choice = st.selectbox("Select month", options=month_labels, index=len(month_labels) - 1)
+        chosen_date = m_dates[month_labels.index(choice)]
+
+        st.markdown(f"#### Target portfolio — {choice} (rebalance date: {pd.to_datetime(chosen_date).date()})")
+        st.dataframe(targets_by_month[chosen_date], use_container_width=True)
+
+        st.markdown("#### Actions vs previous month")
+        st.dataframe(actions_by_month[chosen_date], use_container_width=True)
+
+with tab4:
+    st.markdown("### Diagnostics")
+
+    diag = trade_diagnostics(trades)
+    if "Message" in diag:
+        st.info(diag["Message"])
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Realized PnL ($)", f"{diag['Realized_PnL_$']:,.0f}")
+        c2.metric("Buys", f"{diag['Buys']}")
+        c3.metric("Sells", f"{diag['Sells']}")
+        c4.metric("Resizes", f"{diag['Resizes']}")
+
+        st.markdown("#### Monthly trade activity")
+        st.dataframe(diag["monthly_table"], use_container_width=True)
+
+    with st.expander("Show full backtest trades"):
         if trades is None or trades.empty:
             st.write("No trades.")
         else:
             st.dataframe(trades.sort_values("Date"), use_container_width=True)
-
-
-render_bucket("BUCKET A — ABSOLUTE MOMENTUM", out["BucketA"])
-render_bucket("BUCKET B — RELATIVE MOMENTUM", out["BucketB"])
-render_bucket("BUCKET C — COMBINED PORTFOLIO", out["BucketC"])
