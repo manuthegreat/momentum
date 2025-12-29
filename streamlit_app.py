@@ -1942,6 +1942,30 @@ def plot_ticker_price_with_trades_and_momentum(
 
     st.plotly_chart(fig, use_container_width=True)
 
+def pick_ticker_from_table(df: pd.DataFrame, key: str, ticker_col: str = "Ticker") -> str | None:
+    if df is None or df.empty or ticker_col not in df.columns:
+        return None
+
+    view = df.reset_index(drop=True).copy()
+
+    event = st.dataframe(
+        view,
+        hide_index=True,
+        width="stretch",
+        key=key,
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+
+    selected_rows = getattr(event, "selection", {}).get("rows", []) if hasattr(event, "selection") else []
+    if not selected_rows:
+        return None
+
+    t = str(view.iloc[selected_rows[0]][ticker_col])
+    if t == "TOTAL":
+        return None
+    return t
+
 
 # ============================================================
 # UI
@@ -2159,6 +2183,10 @@ with tab4:
 with tab5:
     st.markdown("### Analytics")
 
+    # Ensure session state exists (persists selection across reruns)
+    if "analytics_selected_ticker" not in st.session_state:
+        st.session_state.analytics_selected_ticker = None
+
     # --- Realized PnL per ticker (from SELL trades) ---
     realized = pd.DataFrame()
     if trades is not None and not trades.empty:
@@ -2171,6 +2199,7 @@ with tab5:
                 .sum()
                 .rename(columns={"PnL": "Realized_PnL_$"})
                 .sort_values("Realized_PnL_$", ascending=False)
+                .reset_index(drop=True)
             )
 
     # --- Open PnL from current_port (exclude TOTAL) ---
@@ -2179,58 +2208,102 @@ with tab5:
         cp = current_port[current_port["Ticker"] != "TOTAL"].copy()
         if "PnL_$" in cp.columns:
             open_pnl = cp[["Ticker", "PnL_$", "PnL_%", "Target_$", "Weight_%"]].copy()
-            open_pnl = open_pnl.rename(columns={"PnL_$": "Open_PnL_$"}).sort_values("Open_PnL_$", ascending=False)
+            open_pnl = open_pnl.rename(columns={"PnL_$": "Open_PnL_$"})
+            open_pnl = open_pnl.sort_values("Open_PnL_$", ascending=False).reset_index(drop=True)
+
+    # =========================
+    # Clickable tables
+    # =========================
+    st.markdown("#### Click a ticker in any table to show chart below")
 
     c1, c2 = st.columns(2)
-
     with c1:
-        st.markdown("#### Top performers (Realized)")
+        st.markdown("#### Top performers (Realized) — click")
         if realized.empty:
             st.info("No realized PnL yet (no SELL trades).")
+            sel1 = None
         else:
-            st.dataframe(realized.head(15), use_container_width=True)
+            sel1 = pick_single_row(realized.head(15), key="ana_realized_top", label_col="Ticker")
 
     with c2:
-        st.markdown("#### Bottom performers (Realized)")
+        st.markdown("#### Bottom performers (Realized) — click")
         if realized.empty:
             st.info("No realized PnL yet (no SELL trades).")
+            sel2 = None
         else:
-            st.dataframe(realized.tail(15).sort_values("Realized_PnL_$"), use_container_width=True)
-
-    st.markdown("---")
+            bottom_realized = realized.tail(15).sort_values("Realized_PnL_$").reset_index(drop=True)
+            sel2 = pick_single_row(bottom_realized, key="ana_realized_bot", label_col="Ticker")
 
     c3, c4 = st.columns(2)
-
     with c3:
-        st.markdown("#### Top performers (Open MTM)")
+        st.markdown("#### Top performers (Open MTM) — click")
         if open_pnl.empty:
             st.info("No open PnL available.")
+            sel3 = None
         else:
-            st.dataframe(open_pnl.head(15), use_container_width=True)
+            sel3 = pick_single_row(open_pnl.head(15), key="ana_open_top", label_col="Ticker")
 
     with c4:
-        st.markdown("#### Bottom performers (Open MTM)")
+        st.markdown("#### Bottom performers (Open MTM) — click")
         if open_pnl.empty:
             st.info("No open PnL available.")
+            sel4 = None
         else:
-            st.dataframe(open_pnl.tail(15).sort_values("Open_PnL_$"), use_container_width=True)
+            bottom_open = open_pnl.tail(15).sort_values("Open_PnL_$").reset_index(drop=True)
+            sel4 = pick_single_row(bottom_open, key="ana_open_bot", label_col="Ticker")
+
+    # Update selection (priority: whichever table got clicked most recently)
+    for s in [sel1, sel2, sel3, sel4]:
+        if s:
+            st.session_state.analytics_selected_ticker = s
+
+    selected = st.session_state.analytics_selected_ticker
 
     st.markdown("---")
 
-    # Monthly best/worst months (from monthly_summary you already compute in tab1)
+    # =========================
+    # Chart panel
+    # =========================
+    if selected:
+        st.markdown(f"### Selected: `{selected}`")
+
+        # Optional: allow switching score source
+        score_source = st.radio(
+            "Score source",
+            options=["scoreA", "scoreB"],
+            horizontal=True,
+            index=0,
+            key="ana_score_source",
+        )
+
+        score_df = internals.get(score_source, pd.DataFrame())
+
+        plot_ticker_price_with_trades_and_momentum(
+            base_df=base,
+            trades_df=trades,
+            score_df=score_df,
+            ticker=selected,
+            lookback_days=500
+        )
+    else:
+        st.info("Click any ticker in the tables above to show its chart.")
+
+    st.markdown("---")
+
+    # =========================
+    # Best / Worst months
+    # =========================
     st.markdown("#### Best / Worst months")
-    try:
-        if monthly_summary is not None and not monthly_summary.empty:
-            best = monthly_summary.sort_values("Return_%", ascending=False).head(6)
-            worst = monthly_summary.sort_values("Return_%", ascending=True).head(6)
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                st.markdown("**Best months**")
-                st.dataframe(best[["Month", "Return_%", "PnL_$"]], use_container_width=True)
-            with cc2:
-                st.markdown("**Worst months**")
-                st.dataframe(worst[["Month", "Return_%", "PnL_$"]], use_container_width=True)
-        else:
-            st.info("Monthly summary not available.")
-    except Exception:
+    if "monthly_summary" in locals() and monthly_summary is not None and not monthly_summary.empty:
+        best = monthly_summary.sort_values("Return_%", ascending=False).head(6)
+        worst = monthly_summary.sort_values("Return_%", ascending=True).head(6)
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.markdown("**Best months**")
+            st.dataframe(best[["Month", "Return_%", "PnL_$"]], use_container_width=True)
+        with cc2:
+            st.markdown("**Worst months**")
+            st.dataframe(worst[["Month", "Return_%", "PnL_$"]], use_container_width=True)
+    else:
         st.info("Monthly summary not available.")
