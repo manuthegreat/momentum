@@ -1056,54 +1056,37 @@ def monthly_pnl_table(
 # ✅ RADIO-LIKE TABLE + PRICE PLOT WITH BUY/SELL MARKERS (ADDITIVE)
 # ============================================================
 
-def radio_pick_table(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
+def raio_pick_table(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
     """
-    "Radio button in table" behavior using a Pick checkbox column + single-selection enforcement.
-    Returns selected label (or None).
+    Row-click single selection (radio-like) using st.dataframe selection_mode="single-row".
+    Returns selected ticker (or None).
     """
     if df is None or df.empty or label_col not in df.columns:
         return None
 
-    view = df.copy()
-    pick_col = "__Pick__"
-    if pick_col not in view.columns:
-        view.insert(0, pick_col, False)
+    view = df.copy().reset_index(drop=True)
 
-    # Restore previous selection state if present
-    state_key = f"{key}_state"
-    if state_key in st.session_state:
-        prev = st.session_state[state_key]
-        if isinstance(prev, pd.DataFrame) and len(prev) == len(view) and pick_col in prev.columns:
-            view[pick_col] = prev[pick_col].values
-
-    edited = st.data_editor(
+    event = st.dataframe(
         view,
-        key=key,
-        use_container_width=True,
         hide_index=True,
-        disabled=[c for c in view.columns if c != pick_col],
-        column_config={
-            pick_col: st.column_config.CheckboxColumn(
-                "Pick",
-                help="Select one row (radio-like)",
-                default=False
-            )
-        }
+        width="stretch",
+        key=key,
+        on_select="rerun",
+        selection_mode="single-row",
     )
 
-    # Enforce single selection; never allow selecting TOTAL
-    picked = edited.index[(edited[pick_col] == True) & (edited[label_col].astype(str) != "TOTAL")].tolist()
-    selected = None
-    if picked:
-        keep = picked[0]
-        edited.loc[(edited.index != keep), pick_col] = False
-        selected = str(edited.loc[keep, label_col])
+    selected_rows = getattr(event, "selection", {}).get("rows", []) if hasattr(event, "selection") else []
+    if not selected_rows:
+        return None
 
-    # Ensure TOTAL can't remain selected
-    edited.loc[edited[label_col].astype(str) == "TOTAL", pick_col] = False
+    selected_idx = selected_rows[0]
+    selected_val = str(view.iloc[selected_idx][label_col])
 
-    st.session_state[state_key] = edited.copy()
-    return selected
+    # optional: block TOTAL row
+    if selected_val == "TOTAL":
+        return None
+
+    return selected_val
 
 
 def plot_price_with_trades(price_table: pd.DataFrame, trades_df: pd.DataFrame, ticker: str, title_prefix: str = ""):
