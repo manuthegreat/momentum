@@ -1355,6 +1355,81 @@ def monthly_pnl_table(
     out = pd.DataFrame(rows).sort_values("Entry_Date").reset_index(drop=True)
     return out
 
+def pick_ticker_from_table(df: pd.DataFrame, key: str, ticker_col: str = "Ticker"):
+    """
+    Renders df with single-row selection and returns selected ticker (or None).
+    Works on Streamlit versions that support dataframe selection.
+    """
+    if df is None or df.empty or ticker_col not in df.columns:
+        st.dataframe(df, use_container_width=True)
+        return None
+
+    view = df.reset_index(drop=True)
+
+    event = st.dataframe(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        key=key,
+        selection_mode="single-row",
+        on_select="rerun",
+    )
+
+    # Different Streamlit builds expose selection slightly differently; handle both.
+    selected_rows = []
+    if hasattr(event, "selection") and isinstance(event.selection, dict):
+        selected_rows = event.selection.get("rows", []) or []
+    elif isinstance(event, dict):
+        selected_rows = event.get("selection", {}).get("rows", []) or []
+
+    if not selected_rows:
+        return None
+
+    i = selected_rows[0]
+    t = str(view.loc[i, ticker_col])
+
+    if t == "TOTAL":
+        return None
+    return t
+
+
+def plot_ticker_price_chart(
+    base_prices: pd.DataFrame,
+    ticker: str,
+    title_prefix: str = "Price",
+):
+    """
+    base_prices must have columns: Ticker, Date, Price (you already have this in `base`)
+    """
+    if not ticker:
+        return
+
+    px = base_prices[base_prices["Ticker"] == ticker].copy()
+    if px.empty:
+        st.info(f"No price series found for {ticker}.")
+        return
+
+    px = px.sort_values("Date")
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=px["Date"],
+            y=px["Price"],
+            mode="lines",
+            name=ticker,
+            line=dict(width=2),
+        )
+    )
+    fig.update_layout(
+        title=f"{title_prefix} — {ticker}",
+        height=420,
+        margin=dict(l=30, r=30, t=60, b=30),
+        hovermode="x unified",
+        xaxis=dict(title="Date", showgrid=False),
+        yaxis=dict(title="Price", tickformat=",.2f"),
+        template="plotly_white",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
 # STREAMLIT UI (RUNS THE SAME "MAIN" PIPELINE)
@@ -1686,7 +1761,8 @@ with tab2:
     if current_port is None or current_port.empty:
         st.info("No portfolio could be constructed.")
     else:
-        st.dataframe(current_port, use_container_width=True)
+        st.markdown("#### Holdings (click a row to show chart)")
+        selected_ticker = pick_ticker_from_table(current_port, key="current_port_select", ticker_col="Ticker")
 
         # Top 5 weight (exclude TOTAL)
         dfw = current_port[current_port["Ticker"] != "TOTAL"].copy()
@@ -1699,6 +1775,10 @@ with tab2:
             st.metric("Portfolio P&L ($)", f"{float(total_row['PnL_$']):,.0f}")
         except Exception:
             pass
+
+        if selected_ticker:
+            st.markdown("#### Selected ticker chart")
+            plot_ticker_price_chart(base_prices=base, ticker=selected_ticker, title_prefix="Price (full history)")
 
 with tab3:
     st.markdown("### Monthly Rebalance History")
@@ -1727,11 +1807,16 @@ with tab3:
             mark_date=exit_date
         )
 
-        st.dataframe(mtm_month, use_container_width=True)
+        st.markdown("#### Holdings (click a row to show chart)")
+        selected_ticker_m = pick_ticker_from_table(mtm_month, key="mtm_month_select", ticker_col="Ticker")
+
+        if selected_ticker_m:
+            st.markdown("#### Selected ticker chart")
+            plot_ticker_price_chart(base_prices=base, ticker=selected_ticker_m, title_prefix=f"Price (as-of {choice})")
 
         st.markdown("#### Actions vs previous month")
         st.dataframe(actions_by_month[chosen_date], use_container_width=True)
-
+        
 with tab4:
     st.markdown("### Diagnostics")
 
