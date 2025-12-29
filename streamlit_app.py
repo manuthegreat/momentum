@@ -1634,11 +1634,46 @@ with tab1:
     c3.metric("Sharpe", f"{stats.get('Sharpe Ratio', np.nan):.2f}")
     c4.metric("Max Drawdown (%)", f"{stats.get('Max Drawdown (%)', np.nan):.2f}")
 
+    # --- Monthly performance chart (rebalance-to-rebalance) ---
+    st.markdown("### Monthly Performance (rebalance to next rebalance)")
+
+    monthly_summary = monthly_pnl_table(
+        price_table=priceA,
+        targets_by_month=targets_by_month,
+        month_end_dates_list=m_dates
+    )
+
+    if monthly_summary is None or monthly_summary.empty:
+        st.info("Not enough data to compute monthly performance.")
+    else:
+        # Bar chart of monthly returns (%)
+        fig_m = go.Figure()
+        fig_m.add_trace(
+            go.Bar(
+                x=monthly_summary["Month"],
+                y=monthly_summary["Return_%"],
+                name="Monthly Return (%)"
+            )
+        )
+        fig_m.update_layout(
+            height=320,
+            margin=dict(l=40, r=40, t=40, b=40),
+            xaxis=dict(title="Month"),
+            yaxis=dict(title="Return (%)"),
+            template="plotly_white",
+        )
+        st.plotly_chart(fig_m, use_container_width=True)
+
+        # Optional: keep the table under an expander (nice for PMs)
+        with st.expander("Show monthly performance table"):
+            st.dataframe(monthly_summary, use_container_width=True)
+
     st.markdown("### Equity & Drawdown")
     plot_equity_and_drawdown(hist, title="Momentum Portfolio")
 
     st.markdown("### Trade Statistics")
     st.dataframe(_stats_to_df(trade_stats), use_container_width=True)
+
 
 with tab2:
     st.markdown(
@@ -1672,15 +1707,6 @@ with tab3:
         month_labels = [pd.to_datetime(d).strftime("%Y-%m") for d in m_dates]
         choice = st.selectbox("Select month", options=month_labels, index=len(month_labels) - 1)
         chosen_date = m_dates[month_labels.index(choice)]
-
-        # Monthly P&L summary for the whole strategy (month-end to next month-end)
-        monthly_summary = monthly_pnl_table(
-            price_table=priceA,
-            targets_by_month=targets_by_month,
-            month_end_dates_list=m_dates
-        )
-        st.markdown("#### Monthly performance (month-end to next month-end)")
-        st.dataframe(monthly_summary, use_container_width=True)
 
         st.markdown(f"#### Target portfolio — {choice} (rebalance date: {pd.to_datetime(chosen_date).date()})")
 
