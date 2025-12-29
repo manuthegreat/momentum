@@ -1,18 +1,18 @@
 # streamlit_app.py
 # FULL, 1:1 PIPELINE MIRROR (same functions, same order, same math)
 # Only differences (additive + schedule-only):
-#   1) Rebalance schedule is MONTHLY (first trading day of each month) instead of every N trading days
+#   1) Rebalance schedule is MONTH-END (monthly) instead of every N trading days
 #      -> implemented by using monthly_rebalance_dates() in the two simulators.
-#   2) Current Portfolio tab marks-to-market from last monthly rebalance date
+#   2) Current Portfolio tab now marks-to-market from last monthly rebalance date
 #      to the latest available price date (so P&L is not forced to 0).
-#   3) Click-a-row (radio-like) selection on Current Portfolio + Monthly Rebalance tables
-#      -> plots historic price and highlights BUY/SELL dates from the Bucket C trades blotter.
+#   3) ✅ Row selection is RADIO-LIKE (single-row click) using st.dataframe(..., selection_mode="single-row")
 # All momentum / scoring / filters are untouched.
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+
 
 st.set_page_config(page_title="Momentum Strategy Dashboard", layout="wide")
 
@@ -86,6 +86,7 @@ def add_absolute_returns(df: pd.DataFrame) -> pd.DataFrame:
 def add_relative_returns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Relative daily growth factor = (1 + stock_ret) / (1 + index_ret)
+
     This compounds correctly over time when you later do rolling product.
     """
     df = df.copy()
@@ -95,7 +96,9 @@ def add_relative_returns(df: pd.DataFrame) -> pd.DataFrame:
     stock_ret = df.groupby("Ticker")["Price"].pct_change()
     idx_ret = df["idx_ret_1d"]
 
-    denom = (1.0 + idx_ret).replace(0.0, np.nan)  # guard divide-by-zero
+    # Guard against divide-by-zero (extremely rare unless idx_ret == -1)
+    denom = (1.0 + idx_ret).replace(0.0, np.nan)
+
     df["1D Return"] = (1.0 + stock_ret) / denom
     return df
 
@@ -274,6 +277,7 @@ def add_regime_early_momentum(df: pd.DataFrame) -> pd.DataFrame:
 def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
+    # --- RELATIVE RETURNS (stock - index), same weights ---
     df["Rel_Slow"] = (
         0.5 * df["60D Return"] +
         0.5 * df["90D Return"]
@@ -298,15 +302,18 @@ def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
         0.4 * df["idx_10D"]
     )
 
+    # --- CROSS-SECTIONAL ZSCORES AFTER BENCH SUBTRACTION ---
     for col in ["Rel_Slow", "Rel_Mid", "Rel_Fast"]:
         mean = df.groupby("Date")[col].transform("mean")
         std  = df.groupby("Date")[col].transform("std").replace(0, np.nan)
         df[col + "_z"] = ((df[col] - mean) / std).fillna(0.0)
 
+    # ✅ IMPORTANT: define the regime scaffolding using RELATIVE z-scores
     df["Momentum_Slow"] = df["Rel_Slow_z"]
     df["Momentum_Mid"]  = df["Rel_Mid_z"]
     df["Momentum_Fast"] = df["Rel_Fast_z"]
 
+    # ✅ And Momentum Score is built from the relative regimes
     df["Momentum Score"] = (
         0.5 * df["Momentum_Slow"] +
         0.3 * df["Momentum_Mid"] +
@@ -410,7 +417,7 @@ def final_selection_from_daily(
 
 
 # ============================================================
-# 5) BACKTEST ENGINE HELPERS
+# 5) BACKTEST ENGINE (NOW USES FINAL_SELECTION_FROM_DAILY)
 # ============================================================
 
 def get_last_price(price_table: pd.DataFrame, ticker: str, date) -> float | None:
@@ -421,6 +428,95 @@ def get_last_price(price_table: pd.DataFrame, ticker: str, date) -> float | None
         return float(s.iloc[-1])
     except Exception:
         return None
+
+
+def simulate_momentum_portfolio(
+    df: pd.DataFrame,
+    price_table: pd.DataFrame,
+    daily_df: pd.DataFrame,
+    rebalance_interval: int = 7,
+    capital_per_trade: float = 5000,
+    lookback_days: int = 10,
+    w_momentum: float = 0.50,
+    w_early: float = 0.30,
+    w_consistency: float = 0.20,
+    top_n: int = 10,
+):
+    """
+    Rebalance every rebalance_interval trading days.
+    At each rebalance date, form target from FINAL_SELECTION_FROM_DAILY (persistence-scored),
+    then equal-weight buys/sells.
+    """
+    rebalance_dates = sorted(df["Date"].unique())[::rebalance_interval]
+
+    portfolio = {}  # ticker -> shares
+    invested = {}   # ticker -> dollars invested
+    realized = 0.0
+
+    history = []
+    trades = []
+
+    for d in rebalance_dates:
+        selection = final_selection_from_daily(
+            daily_df,
+            lookback_days=lookback_days,
+            w_momentum=w_momentum,
+            w_early=w_early,
+            w_consistency=w_consistency,
+            as_of_date=d,
+            top_n=top_n
+        )
+
+        target = set(selection["Ticker"]) if not selection.empty else set()
+        held = set(portfolio.keys())
+
+        # SELL
+        for t in list(held - target):
+            px = get_last_price(price_table, t, d)
+            if px is not None and px > 0:
+                shares = portfolio[t]
+                avg_cost = invested[t] / shares if shares else 0.0
+                pnl = shares * (px - avg_cost)
+                realized += pnl
+                trades.append({
+                    "Date": d,
+                    "Ticker": t,
+                    "Action": "Sell",
+                    "Price": px,
+                    "PnL": pnl
+                })
+            portfolio.pop(t, None)
+            invested.pop(t, None)
+
+        # BUY
+        for t in list(target - held):
+            px = get_last_price(price_table, t, d)
+            if px is None or px <= 0:
+                continue
+            shares = capital_per_trade / px
+            portfolio[t] = shares
+            invested[t] = capital_per_trade
+            trades.append({
+                "Date": d,
+                "Ticker": t,
+                "Action": "Buy",
+                "Price": px,
+                "PnL": 0.0
+            })
+
+        # Portfolio value on rebalance date
+        value = 0.0
+        for t, shares in portfolio.items():
+            px = get_last_price(price_table, t, d)
+            if px is not None:
+                value += px * shares
+
+        history.append({
+            "Date": d,
+            "Portfolio Value": value + realized
+        })
+
+    return pd.DataFrame(history), pd.DataFrame(trades)
 
 
 # ============================================================
@@ -524,12 +620,14 @@ def build_unified_target(
 
     frames = []
 
+    # -------- Bucket A allocation (20%) --------
     if not selA.empty:
         dollars_per_name_A = (total_capital * weight_A) / len(selA)
         tmpA = selA[["Ticker"]].copy()
         tmpA["Position_Size"] = dollars_per_name_A
         frames.append(tmpA)
 
+    # -------- Bucket B allocation (80%) --------
     if not selB.empty:
         dollars_per_name_B = (total_capital * weight_B) / len(selB)
         tmpB = selB[["Ticker"]].copy()
@@ -541,11 +639,135 @@ def build_unified_target(
 
     combined = pd.concat(frames, ignore_index=True)
 
+    # Sum dollars if a name appears in both buckets
     return (
         combined
         .groupby("Ticker", as_index=False)["Position_Size"]
         .sum()
     )
+
+
+def get_today_trades_from_final_selection(
+    daily_df: pd.DataFrame,
+    lookback_days: int = 10,
+    w_momentum: float = 0.50,
+    w_early: float = 0.30,
+    w_consistency: float = 0.20,
+    top_n: int = 10
+) -> pd.DataFrame:
+    if daily_df.empty:
+        return pd.DataFrame()
+
+    dates = sorted(daily_df["Date"].unique())
+    if not dates:
+        return pd.DataFrame()
+
+    today = dates[-1]
+    prev = dates[-2] if len(dates) >= 2 else None
+
+    sel_today = final_selection_from_daily(
+        daily_df,
+        lookback_days=lookback_days,
+        w_momentum=w_momentum,
+        w_early=w_early,
+        w_consistency=w_consistency,
+        as_of_date=today,
+        top_n=top_n
+    )
+
+    if sel_today.empty:
+        return pd.DataFrame()
+
+    sel_today = sel_today.copy()
+    sel_today["Date"] = today
+    sel_today["Action"] = "BUY"
+
+    if prev is not None:
+        sel_prev = final_selection_from_daily(
+            daily_df,
+            lookback_days=lookback_days,
+            w_momentum=w_momentum,
+            w_early=w_early,
+            w_consistency=w_consistency,
+            as_of_date=prev,
+            top_n=top_n
+        )
+        prev_set = set(sel_prev["Ticker"]) if not sel_prev.empty else set()
+        sel_today.loc[sel_today["Ticker"].isin(prev_set), "Action"] = "HOLD"
+
+        # Also compute sells (names that were in prev final list but not today)
+        sells = sorted(list(prev_set - set(sel_today["Ticker"])))
+    else:
+        sells = []
+
+    cols = [
+        "Ticker", "Action",
+        "Weighted_Score", "Momentum_Score", "Early_Momentum_Score", "Consistency"
+    ]
+    out = sel_today[cols].sort_values("Weighted_Score", ascending=False).reset_index(drop=True)
+
+    if sells:
+        sells_df = pd.DataFrame({"Ticker": sells})
+        sells_df["Action"] = "SELL"
+        for c in ["Weighted_Score", "Momentum_Score", "Early_Momentum_Score", "Consistency"]:
+            sells_df[c] = np.nan
+        out = pd.concat([out, sells_df[cols]], ignore_index=True)
+
+    return out
+
+
+def plot_equity_and_drawdown(history_df: pd.DataFrame, title: str):
+    if history_df.empty:
+        st.info("No equity history to display.")
+        return
+
+    df = history_df.sort_values("Date").copy()
+    df["Rolling_Max"] = df["Portfolio Value"].cummax()
+    df["Drawdown"] = (df["Portfolio Value"] - df["Rolling_Max"]) / df["Rolling_Max"]
+
+    # Equity curve
+    fig_eq = go.Figure()
+    fig_eq.add_trace(
+        go.Scatter(
+            x=df["Date"],
+            y=df["Portfolio Value"],
+            mode="lines",
+            name="Portfolio Value",
+            line=dict(width=2),
+        )
+    )
+    fig_eq.update_layout(
+        title=f"{title} — Equity Curve",
+        height=380,
+        margin=dict(l=40, r=40, t=60, b=40),
+        hovermode="x unified",
+        xaxis=dict(title="Date", showgrid=False),
+        yaxis=dict(title="Portfolio Value", tickformat=",.0f"),
+        template="plotly_white",
+    )
+    st.plotly_chart(fig_eq, use_container_width=True)
+
+    # Drawdown
+    fig_dd = go.Figure()
+    fig_dd.add_trace(
+        go.Scatter(
+            x=df["Date"],
+            y=df["Drawdown"],
+            mode="lines",
+            name="Drawdown",
+            line=dict(width=1.5, color="firebrick"),
+        )
+    )
+    fig_dd.update_layout(
+        title=f"{title} — Drawdown",
+        height=220,
+        margin=dict(l=40, r=40, t=50, b=40),
+        hovermode="x unified",
+        xaxis=dict(title="Date", showgrid=False),
+        yaxis=dict(title="Drawdown", tickformat=".0%"),
+        template="plotly_white",
+    )
+    st.plotly_chart(fig_dd, use_container_width=True)
 
 
 def get_today_trades_bucket_c(
@@ -623,17 +845,17 @@ def get_today_trades_bucket_c(
 
 
 # ============================================================
-# ✅ MONTHLY REBALANCE SCHEDULE (FIRST TRADING DAY OF MONTH)
+# ✅ MONTHLY REBALANCE SCHEDULE
 # ============================================================
 
 def monthly_rebalance_dates(df_prices: pd.DataFrame) -> list:
-    """Monthly rebalance dates = FIRST available trading day in each month."""
+    """Month-end rebalance dates = last available trading day in each month."""
     dates = pd.to_datetime(df_prices["Date"]).dropna().sort_values().unique()
     if len(dates) == 0:
         return []
     tmp = pd.DataFrame({"Date": dates})
     tmp["Month"] = tmp["Date"].dt.to_period("M")
-    return tmp.groupby("Month")["Date"].min().tolist()
+    return tmp.groupby("Month")["Date"].max().tolist()
 
 
 # ============================================================
@@ -660,7 +882,7 @@ def simulate_unified_portfolio(
     - Name in both A & B gets $5,000
     - Cash-constrained, no leverage
 
-    ✅ Rebalance schedule: MONTHLY (first trading day)
+    ✅ Rebalance schedule: MONTH-END (monthly_rebalance_dates)
     """
     rebalance_dates = monthly_rebalance_dates(df_prices)
 
@@ -672,6 +894,8 @@ def simulate_unified_portfolio(
     trades = []
 
     for d in rebalance_dates:
+
+        # TARGET PORTFOLIO
         target_df = build_unified_target(
             dailyA, dailyB,
             as_of_date=d,
@@ -684,6 +908,7 @@ def simulate_unified_portfolio(
             weight_A=0.20,
             weight_B=0.80
         )
+
         if target_df.empty:
             continue
 
@@ -696,11 +921,15 @@ def simulate_unified_portfolio(
             px = get_last_price(price_table, t, d)
             if px is None or px <= 0:
                 continue
+
             shares = portfolio[t]
             proceeds = shares * px
             cash += proceeds
+
             pnl = proceeds - cost_basis.get(t, 0.0)
+
             trades.append({"Date": d, "Ticker": t, "Action": "Sell", "Price": px, "PnL": pnl})
+
             portfolio.pop(t, None)
             cost_basis.pop(t, None)
 
@@ -736,6 +965,7 @@ def simulate_unified_portfolio(
             for t, s in portfolio.items()
             if get_last_price(price_table, t, d) is not None
         )
+
         nav = cash + holdings_value
         history.append({"Date": d, "Portfolio Value": nav})
 
@@ -757,7 +987,8 @@ def simulate_single_bucket_as_unified(
 ):
     """
     Runs Bucket A or B using the SAME capital mechanics as Bucket C.
-    ✅ Rebalance schedule: MONTHLY (first trading day)
+
+    ✅ Rebalance schedule: MONTH-END (monthly_rebalance_dates)
     """
     def build_single_target(as_of_date):
         sel = final_selection_from_daily(
@@ -771,6 +1002,7 @@ def simulate_single_bucket_as_unified(
         )
         if sel.empty:
             return pd.DataFrame()
+
         sel = sel.copy()
         sel["Position_Size"] = dollars_per_name
         return sel[["Ticker", "Position_Size"]]
@@ -841,19 +1073,17 @@ def simulate_single_bucket_as_unified(
 
 
 # ============================================================
-# MONTHLY DATES / TARGETS / MARK-TO-MARKET TABLES
+# MONTH-END DATES / TARGETS / MARK-TO-MARKET TABLES
 # ============================================================
 
 def month_end_dates(dates: pd.Series) -> list:
-    """
-    (Name kept for compatibility) — returns FIRST available trading day in each month.
-    """
+    """Pick the last available trading date in each month."""
     d = pd.to_datetime(pd.Series(dates).dropna().unique())
     if len(d) == 0:
         return []
     df = pd.DataFrame({"Date": sorted(d)})
     df["Month"] = df["Date"].dt.to_period("M")
-    return df.groupby("Month")["Date"].min().tolist()
+    return df.groupby("Month")["Date"].max().tolist()
 
 
 def compute_targets_over_dates(
@@ -869,6 +1099,11 @@ def compute_targets_over_dates(
     weight_A: float = 0.20,
     weight_B: float = 0.80
 ) -> dict:
+    """
+    For each date:
+      - compute unified target (Ticker, Position_Size)
+      - compute actions vs previous date (BUY/HOLD/SELL)
+    """
     targets = {}
     actions = {}
 
@@ -915,6 +1150,9 @@ def compute_targets_over_dates(
 
 
 def trade_diagnostics(trades_df: pd.DataFrame) -> dict:
+    """
+    Simple PM-friendly diagnostics from the trade blotter.
+    """
     if trades_df is None or trades_df.empty:
         return {"Message": "No trades"}
 
@@ -951,6 +1189,10 @@ def portfolio_mark_to_market(
     entry_date,
     mark_date
 ) -> pd.DataFrame:
+    """
+    Treat target_df as a portfolio initiated at entry_date using target dollars.
+    Compute shares at entry, and P&L marked to mark_date.
+    """
     if target_df is None or target_df.empty:
         return pd.DataFrame()
 
@@ -1019,12 +1261,14 @@ def monthly_pnl_table(
     month_end_dates_list: list
 ) -> pd.DataFrame:
     """
-    For each monthly rebalance portfolio target, compute P&L to the next rebalance date.
+    For each month-end portfolio target, compute P&L to the next month-end.
+    Assumes rebalance at each month-end date.
     """
     if not month_end_dates_list or len(month_end_dates_list) < 2:
         return pd.DataFrame()
 
     rows = []
+
     for i in range(len(month_end_dates_list) - 1):
         d0 = pd.to_datetime(month_end_dates_list[i])
         d1 = pd.to_datetime(month_end_dates_list[i + 1])
@@ -1034,8 +1278,8 @@ def monthly_pnl_table(
             continue
 
         mtm = portfolio_mark_to_market(price_table, tgt, entry_date=d0, mark_date=d1)
-        per = mtm[mtm["Ticker"] != "TOTAL"].copy()
 
+        per = mtm[mtm["Ticker"] != "TOTAL"].copy()
         month_pnl = per["PnL_$"].sum(skipna=True)
         month_cap = per["Target_$"].sum()
         month_ret = (month_pnl / month_cap * 100.0) if month_cap > 0 else np.nan
@@ -1049,14 +1293,15 @@ def monthly_pnl_table(
             "Return_%": month_ret
         })
 
-    return pd.DataFrame(rows).sort_values("Entry_Date").reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values("Entry_Date").reset_index(drop=True)
+    return out
 
 
 # ============================================================
-# ✅ RADIO-LIKE TABLE + PRICE PLOT WITH BUY/SELL MARKERS (ADDITIVE)
+# ✅ RADIO-LIKE ROW PICKER (st.dataframe single-row selection)
 # ============================================================
 
-def radio_pick_table(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
+def row_click_pick_table(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
     """
     Row-click single selection (radio-like) using st.dataframe selection_mode="single-row".
     Returns selected ticker (or None).
@@ -1082,126 +1327,14 @@ def radio_pick_table(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
     selected_idx = selected_rows[0]
     selected_val = str(view.iloc[selected_idx][label_col])
 
-    # optional: block TOTAL row
     if selected_val == "TOTAL":
         return None
 
     return selected_val
 
 
-def plot_price_with_trades(price_table: pd.DataFrame, trades_df: pd.DataFrame, ticker: str, title_prefix: str = ""):
-    if price_table is None or price_table.empty or ticker not in price_table.columns:
-        st.info(f"No price history found for {ticker}.")
-        return
-
-    px = price_table[[ticker]].dropna().reset_index().rename(columns={ticker: "Price"})
-    if px.empty:
-        st.info(f"No price history found for {ticker}.")
-        return
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=px["Date"], y=px["Price"], mode="lines", name=ticker))
-
-    if trades_df is not None and not trades_df.empty:
-        t = trades_df.copy()
-        t["Date"] = pd.to_datetime(t["Date"])
-        t = t[t["Ticker"] == ticker].sort_values("Date")
-
-        buys = t[t["Action"].str.lower() == "buy"]
-        sells = t[t["Action"].str.lower() == "sell"]
-
-        if not buys.empty:
-            bpx = pd.merge_asof(
-                buys[["Date"]].sort_values("Date"),
-                px.sort_values("Date"),
-                on="Date",
-                direction="backward"
-            )
-            fig.add_trace(go.Scatter(
-                x=bpx["Date"], y=bpx["Price"],
-                mode="markers", name="BUY",
-                marker=dict(symbol="triangle-up", size=11)
-            ))
-
-        if not sells.empty:
-            spx = pd.merge_asof(
-                sells[["Date"]].sort_values("Date"),
-                px.sort_values("Date"),
-                on="Date",
-                direction="backward"
-            )
-            fig.add_trace(go.Scatter(
-                x=spx["Date"], y=spx["Price"],
-                mode="markers", name="SELL",
-                marker=dict(symbol="triangle-down", size=11)
-            ))
-
-    fig.update_layout(
-        title=f"{title_prefix}{ticker} — Price with Trades",
-        height=420,
-        margin=dict(l=40, r=40, t=60, b=40),
-        hovermode="x unified",
-        xaxis=dict(title="Date", showgrid=False),
-        yaxis=dict(title="Price"),
-        template="plotly_white",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def plot_equity_and_drawdown(history_df: pd.DataFrame, title: str):
-    if history_df.empty:
-        st.info("No equity history to display.")
-        return
-
-    df = history_df.sort_values("Date").copy()
-    df["Rolling_Max"] = df["Portfolio Value"].cummax()
-    df["Drawdown"] = (df["Portfolio Value"] - df["Rolling_Max"]) / df["Rolling_Max"]
-
-    fig_eq = go.Figure()
-    fig_eq.add_trace(
-        go.Scatter(
-            x=df["Date"],
-            y=df["Portfolio Value"],
-            mode="lines",
-            name="Portfolio Value",
-            line=dict(width=2),
-        )
-    )
-    fig_eq.update_layout(
-        title=f"{title} — Equity Curve",
-        height=380,
-        margin=dict(l=40, r=40, t=60, b=40),
-        hovermode="x unified",
-        xaxis=dict(title="Date", showgrid=False),
-        yaxis=dict(title="Portfolio Value", tickformat=",.0f"),
-        template="plotly_white",
-    )
-    st.plotly_chart(fig_eq, use_container_width=True)
-
-    fig_dd = go.Figure()
-    fig_dd.add_trace(
-        go.Scatter(
-            x=df["Date"],
-            y=df["Drawdown"],
-            mode="lines",
-            name="Drawdown",
-            line=dict(width=1.5, color="firebrick"),
-        )
-    )
-    fig_dd.update_layout(
-        title=f"{title} — Drawdown",
-        height=220,
-        margin=dict(l=40, r=40, t=50, b=40),
-        hovermode="x unified",
-        xaxis=dict(title="Date", showgrid=False),
-        yaxis=dict(title="Drawdown", tickformat=".0%"),
-        template="plotly_white",
-    )
-    st.plotly_chart(fig_dd, use_container_width=True)
-
-
 # ============================================================
-# STREAMLIT UI (RUNS THE SAME "MAIN" PIPELINE)
+# STREAMLIT PIPELINE
 # ============================================================
 
 @st.cache_data(show_spinner=False)
@@ -1209,8 +1342,7 @@ def run_full_pipeline():
     parquet_path = "artifacts/index_constituents_5yr.parquet"
     index_path = "artifacts/index_returns_5y.parquet"
 
-    # Strategy knobs (momentum logic untouched)
-    REBALANCE_INTERVAL = 10  # kept for parity but monthly schedule is enforced in simulators
+    REBALANCE_INTERVAL = 10  # kept for parity; unused in monthly sims
     DAILY_TOP_N = 10
     FINAL_TOP_N = 10
     LOOKBACK_DAYS = 10
@@ -1252,6 +1384,15 @@ def run_full_pipeline():
     )
     statsA = compute_performance_stats(histA)
     trade_statsA = compute_trade_stats(tradesA)
+
+    todayA = get_today_trades_from_final_selection(
+        dailyA,
+        lookback_days=LOOKBACK_DAYS,
+        w_momentum=W_MOM,
+        w_early=W_EARLY,
+        w_consistency=W_CONS,
+        top_n=FINAL_TOP_N
+    )
 
     # ---------------- BUCKET B ----------------
     dfB = base.copy()
@@ -1323,6 +1464,15 @@ def run_full_pipeline():
     statsB = compute_performance_stats(histB)
     trade_statsB = compute_trade_stats(tradesB)
 
+    todayB = get_today_trades_from_final_selection(
+        dailyB,
+        lookback_days=LOOKBACK_DAYS,
+        w_momentum=W_MOM,
+        w_early=W_EARLY,
+        w_consistency=W_CONS,
+        top_n=FINAL_TOP_N
+    )
+
     # ---------------- BUCKET C (UNIFIED) ----------------
     histU, tradesU = simulate_unified_portfolio(
         df_prices=base,
@@ -1366,8 +1516,8 @@ def run_full_pipeline():
             "W_EARLY": W_EARLY,
             "W_CONS": W_CONS,
         },
-        "BucketA": {"history": histA, "trades": tradesA, "stats": statsA, "trade_stats": trade_statsA},
-        "BucketB": {"history": histB, "trades": tradesB, "stats": statsB, "trade_stats": trade_statsB},
+        "BucketA": {"history": histA, "trades": tradesA, "stats": statsA, "trade_stats": trade_statsA, "today": todayA},
+        "BucketB": {"history": histB, "trades": tradesB, "stats": statsB, "trade_stats": trade_statsB, "today": todayB},
         "BucketC": {"history": histU, "trades": tradesU, "stats": statsU, "trade_stats": trade_statsU, "today": todayC},
         "internals": {
             "base": base,
@@ -1388,7 +1538,12 @@ def _stats_to_df(d: dict) -> pd.DataFrame:
 
 st.title("📈 Momentum Portfolio")
 st.caption(
-    "This strategy seeks to capture persistent equity momentum by systematically ranking stocks on both absolute price strength and alpha-based momentum relative to the broader market. Momentum candidates are selected using a disciplined, multi-horizon process that emphasizes consistency and trend persistence rather than short-term price moves. The portfolio is rebalanced monthly on the first trading day, rotating capital into the strongest opportunities while exiting positions where momentum has deteriorated. Positions are held as long as momentum persists, with no fixed take-profit targets—allowing winners to compound while enforcing objective exits through the rebalance process."
+    "This strategy seeks to capture persistent equity momentum by systematically ranking stocks on both absolute price strength "
+    "and alpha-based momentum relative to the broader market. Momentum candidates are selected using a disciplined, multi-horizon "
+    "process that emphasizes consistency and trend persistence rather than short-term price moves. The portfolio is rebalanced monthly "
+    "(at month-end based on available trading dates), rotating capital into the strongest opportunities while exiting positions where "
+    "momentum has deteriorated. Positions are held as long as momentum persists, with no fixed take-profit targets—allowing winners "
+    "to compound while enforcing objective exits through the rebalance process."
 )
 
 with st.spinner("Running full pipeline from artifacts…"):
@@ -1398,7 +1553,6 @@ params = out["params"]
 bucketC = out["BucketC"]
 internals = out["internals"]
 
-base = internals["base"]
 dailyA = internals["dailyA"]
 dailyB = internals["dailyB"]
 priceA = internals["priceA"]
@@ -1412,10 +1566,10 @@ trade_stats = bucketC["trade_stats"]
 all_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
 today = all_dates[-1] if all_dates else None
 
-# --- monthly rebalance dates (first trading day each month) ---
+# --- month-end rebalance dates ---
 m_dates = month_end_dates(all_dates)
 
-# --- targets/actions for each monthly rebalance date ---
+# --- targets/actions for each month-end ---
 bundle = compute_targets_over_dates(
     dailyA=dailyA,
     dailyB=dailyB,
@@ -1432,7 +1586,6 @@ bundle = compute_targets_over_dates(
 targets_by_month = bundle["targets"]
 actions_by_month = bundle["actions"]
 
-# Current portfolio: entry at LAST monthly rebalance date; mark to latest available price date.
 entry_date = m_dates[-1] if m_dates else today
 latest_price_date = priceA.index.max() if len(priceA.index) else entry_date
 
@@ -1493,22 +1646,28 @@ with tab2:
     if current_port is None or current_port.empty:
         st.info("No portfolio could be constructed.")
     else:
-        selected = radio_pick_table(current_port, key="cp_table", label_col="Ticker")
-        st.markdown("#### Price chart (pick a row above)")
-        if selected:
-            plot_price_with_trades(priceA, trades, selected, title_prefix="Current Portfolio: ")
-        else:
-            st.info("Pick a ticker to plot its chart (BUY/SELL markers come from the backtest trades).")
+        st.markdown("#### Holdings (click a row to select — radio-like)")
+        selected_ticker = row_click_pick_table(current_port, key="cp_table", label_col="Ticker")
 
+        # Show the table regardless
+        st.caption("Tip: click a row to select (single-row selection).")
+        # (table already rendered by row_click_pick_table)
+
+        # Top 5 weight (exclude TOTAL)
         dfw = current_port[current_port["Ticker"] != "TOTAL"].copy()
         top5 = float(dfw["Weight_%"].head(5).sum()) if not dfw.empty else 0.0
         st.metric("Top 5 weight (%)", f"{top5:.1f}")
 
+        # Portfolio PnL (from TOTAL row)
         try:
             total_row = current_port[current_port["Ticker"] == "TOTAL"].iloc[0]
             st.metric("Portfolio P&L ($)", f"{float(total_row['PnL_$']):,.0f}")
         except Exception:
             pass
+
+        if selected_ticker:
+            st.success(f"Selected: {selected_ticker}")
+            st.info("Hook your ticker chart here (price history + buy/sell markers).")
 
 
 with tab3:
@@ -1537,12 +1696,18 @@ with tab3:
             mark_date=exit_date
         )
 
-        selected_m = radio_pick_table(mtm_month, key="m_table", label_col="Ticker")
-        st.markdown("#### Price chart (pick a row above)")
-        if selected_m:
-            plot_price_with_trades(priceA, trades, selected_m, title_prefix=f"{choice}: ")
+        if mtm_month is None or mtm_month.empty:
+            st.info("No target portfolio for this month.")
         else:
-            st.info("Pick a ticker to plot its chart (BUY/SELL markers come from the backtest trades).")
+            st.markdown("#### Holdings (click a row to select — radio-like)")
+            selected_ticker_m = row_click_pick_table(mtm_month, key="m_table", label_col="Ticker")
+
+            st.caption("Tip: click a row to select (single-row selection).")
+            # (table already rendered by row_click_pick_table)
+
+            if selected_ticker_m:
+                st.success(f"Selected: {selected_ticker_m}")
+                st.info("Hook your ticker chart here (price history + buy/sell markers).")
 
         st.markdown("#### Actions vs previous month")
         st.dataframe(actions_by_month[chosen_date], use_container_width=True)
