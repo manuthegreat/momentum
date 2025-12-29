@@ -1056,7 +1056,7 @@ def monthly_pnl_table(
 # ✅ RADIO-LIKE TABLE + PRICE PLOT WITH BUY/SELL MARKERS (ADDITIVE)
 # ============================================================
 
-def raio_pick_table(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
+def radio_pick_table(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
     """
     Row-click single selection (radio-like) using st.dataframe selection_mode="single-row".
     Returns selected ticker (or None).
