@@ -23,6 +23,9 @@ def load_price_data_parquet(path: str) -> pd.DataFrame:
     df = pd.read_parquet(path)
     df["Date"] = pd.to_datetime(df["Date"])
 
+    # Keep OHLC if present (for candlesticks). This does NOT change your strategy math.
+    ohlc_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
+
     if "Adj Close" in df.columns:
         df["Price"] = df["Adj Close"]
     elif "Close" in df.columns:
@@ -30,14 +33,15 @@ def load_price_data_parquet(path: str) -> pd.DataFrame:
     else:
         raise ValueError("No 'Adj Close' or 'Close' found in parquet.")
 
-    keep = ["Ticker", "Date", "Price", "Index"]
-    missing = [c for c in keep if c not in df.columns]
+    keep = ["Ticker", "Date", "Price", "Index"] + ohlc_cols
+    missing = [c for c in ["Ticker", "Date", "Price", "Index"] if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns in price parquet: {missing}")
 
     df = df[keep].drop_duplicates(subset=["Ticker", "Date"], keep="last")
     df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
     return df
+
 
 
 def load_index_returns_parquet(path: str) -> pd.DataFrame:
@@ -1723,6 +1727,10 @@ def run_full_pipeline():
         weight_B=0.80
     )
 
+    scoreA = dfA[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
+    scoreB = dfB[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
+
+
     return {
         "params": {
             "REBALANCE_INTERVAL": REBALANCE_INTERVAL,
@@ -1747,12 +1755,189 @@ def run_full_pipeline():
             "dailyA": dailyA,
             "dailyB": dailyB,
             "priceA": priceA,
+            "scoreA": scoreA,
+            "scoreB": scoreB,
         }
     }
 
 
 def _stats_to_df(d: dict) -> pd.DataFrame:
     return pd.DataFrame({"Metric": list(d.keys()), "Value": list(d.values())})
+
+
+def pick_single_row(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
+    """
+    Radio-like single row selection using st.dataframe selection_mode="single-row".
+    Returns selected value or None.
+    """
+    if df is None or df.empty or label_col not in df.columns:
+        st.dataframe(df, use_container_width=True)
+        return None
+
+    view = df.reset_index(drop=True)
+
+    event = st.dataframe(
+        view,
+        hide_index=True,
+        use_container_width=True,
+        key=key,
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+
+    rows = getattr(event, "selection", {}).get("rows", []) if hasattr(event, "selection") else []
+    if not rows:
+        return None
+
+    val = str(view.iloc[rows[0]][label_col])
+    if val == "TOTAL":
+        return None
+    return val
+
+
+def _trade_markers_for_ticker(trades_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if trades_df is None or trades_df.empty:
+        return pd.DataFrame(columns=["Date", "Action", "Price"])
+    x = trades_df[trades_df["Ticker"] == ticker].copy()
+    if x.empty:
+        return x
+    x["Date"] = pd.to_datetime(x["Date"])
+    return x.sort_values("Date")
+
+
+def plot_ticker_price_with_trades_and_momentum(
+    base_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    score_df: pd.DataFrame,
+    ticker: str,
+    lookback_days: int = 252 * 2
+):
+    """
+    2-panel plot:
+      (1) Candlestick (if OHLC present) else line, with BUY/SELL/RESIZE markers
+      (2) Momentum Score vs time (+ Early)
+    """
+    if not ticker:
+        return
+
+    px = base_df[base_df["Ticker"] == ticker].copy()
+    if px.empty:
+        st.warning(f"No price history for {ticker}")
+        return
+
+    px = px.sort_values("Date")
+    if lookback_days and len(px) > lookback_days:
+        px = px.tail(lookback_days)
+
+    # Momentum series
+    sc = score_df[score_df["Ticker"] == ticker].copy() if score_df is not None else pd.DataFrame()
+    if not sc.empty:
+        sc["Date"] = pd.to_datetime(sc["Date"])
+        sc = sc.sort_values("Date")
+        if lookback_days and len(sc) > lookback_days:
+            sc = sc.tail(lookback_days)
+
+    # Trades
+    tdf = _trade_markers_for_ticker(trades_df, ticker)
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.68, 0.32],
+    )
+
+    has_ohlc = all(c in px.columns for c in ["Open", "High", "Low", "Close"])
+
+    # --- Price panel ---
+    if has_ohlc:
+        fig.add_trace(
+            go.Candlestick(
+                x=px["Date"],
+                open=px["Open"],
+                high=px["High"],
+                low=px["Low"],
+                close=px["Close"],
+                name="Price",
+            ),
+            row=1, col=1
+        )
+    else:
+        fig.add_trace(
+            go.Scatter(
+                x=px["Date"],
+                y=px["Price"],
+                mode="lines",
+                name="Price",
+            ),
+            row=1, col=1
+        )
+
+    # Add trade markers (use trade Price if present; else approximate via last known price)
+    if not tdf.empty:
+        # If your trades_df has Price already, use it. Otherwise map date->Price
+        if "Price" not in tdf.columns or tdf["Price"].isna().all():
+            # map to last price <= trade date
+            s = px.set_index("Date")["Price"]
+            tdf["Price"] = [float(s.loc[:d].iloc[-1]) if len(s.loc[:d]) else np.nan for d in tdf["Date"]]
+
+        def add_marker(action, symbol, name):
+            sub = tdf[tdf["Action"].str.upper() == action].copy()
+            if sub.empty:
+                return
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["Date"],
+                    y=sub["Price"],
+                    mode="markers+text",
+                    text=[action] * len(sub),
+                    textposition="top center",
+                    name=name,
+                    marker=dict(size=11, symbol=symbol),
+                ),
+                row=1, col=1
+            )
+
+        add_marker("BUY", "triangle-up", "BUY")
+        add_marker("SELL", "triangle-down", "SELL")
+        add_marker("RESIZE", "diamond", "RESIZE")
+
+    # --- Momentum panel ---
+    if not sc.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=sc["Date"], y=sc["Momentum Score"],
+                mode="lines",
+                name="Momentum Score",
+            ),
+            row=2, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sc["Date"], y=sc["Early Momentum Score"],
+                mode="lines",
+                name="Early Momentum",
+            ),
+            row=2, col=1
+        )
+    else:
+        fig.add_trace(
+            go.Scatter(x=[], y=[], mode="lines", name="Momentum Score"),
+            row=2, col=1
+        )
+
+    fig.update_layout(
+        height=720,
+        margin=dict(l=30, r=20, t=40, b=30),
+        hovermode="x unified",
+        xaxis_rangeslider_visible=False,
+        template="plotly_white",
+        title=f"{ticker} — Price + Trades + Momentum"
+    )
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Momentum", row=2, col=1)
+
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # ============================================================
@@ -1817,7 +2002,8 @@ current_port = portfolio_mark_to_market(
     mark_date=latest_price_date     # mark to latest available price (can be > entry_date)
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Current Portfolio", "Monthly Rebalances", "Diagnostics"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Current Portfolio", "Monthly Rebalances", "Diagnostics", "Analytics"])
+
 
 with tab1:
     c1, c2, c3, c4 = st.columns(4)
@@ -1876,29 +2062,30 @@ with tab2:
     if current_port is None or current_port.empty:
         st.info("No portfolio could be constructed.")
     else:
-        st.markdown("#### Holdings (click a row to show chart)")
-        selected_ticker = pick_ticker_from_table(current_port, key="current_port_select", ticker_col="Ticker")
+        st.markdown("#### Holdings (click a row to select)")
+        selected_ticker_cp = pick_single_row(current_port, key="cp_table", label_col="Ticker")
 
-        # Top 5 weight (exclude TOTAL)
+        # Metrics
         dfw = current_port[current_port["Ticker"] != "TOTAL"].copy()
         top5 = float(dfw["Weight_%"].head(5).sum()) if not dfw.empty else 0.0
         st.metric("Top 5 weight (%)", f"{top5:.1f}")
 
-        # Portfolio PnL (from TOTAL row)
         try:
             total_row = current_port[current_port["Ticker"] == "TOTAL"].iloc[0]
             st.metric("Portfolio P&L ($)", f"{float(total_row['PnL_$']):,.0f}")
         except Exception:
             pass
 
-        if selected_ticker:
+        if selected_ticker_cp:
             st.markdown("#### Selected ticker chart")
-            plot_ticker_price_chart_with_trades(
-                base_prices=base,
+            plot_ticker_price_with_trades_and_momentum(
+                base_df=base,
                 trades_df=trades,
-                ticker=selected_ticker,
-                title_prefix="Price (full history)"
+                score_df=internals.get("scoreA", pd.DataFrame()),
+                ticker=selected_ticker_cp,
+                lookback_days=500
             )
+
 
 with tab3:
     st.markdown("### Monthly Rebalance History")
@@ -1927,17 +2114,19 @@ with tab3:
             mark_date=exit_date
         )
 
-        st.markdown("#### Holdings (click a row to show chart)")
-        selected_ticker_m = pick_ticker_from_table(mtm_month, key="mtm_month_select", ticker_col="Ticker")
+        st.markdown("#### Holdings (click a row to select)")
+        selected_ticker_m = pick_single_row(mtm_month, key="m_table", label_col="Ticker")
 
         if selected_ticker_m:
             st.markdown("#### Selected ticker chart")
-            plot_ticker_price_chart_with_trades(
-                base_prices=base,
+            plot_ticker_price_with_trades_and_momentum(
+                base_df=base,
                 trades_df=trades,
+                score_df=internals.get("scoreA", pd.DataFrame()),
                 ticker=selected_ticker_m,
-                title_prefix=f"Price (as-of {choice})"
+                lookback_days=500
             )
+
 
         st.markdown("#### Actions vs previous month")
         st.dataframe(actions_by_month[chosen_date], use_container_width=True)
@@ -1963,3 +2152,82 @@ with tab4:
             st.write("No trades.")
         else:
             st.dataframe(trades.sort_values("Date"), use_container_width=True)
+
+with tab5:
+    st.markdown("### Analytics")
+
+    # --- Realized PnL per ticker (from SELL trades) ---
+    realized = pd.DataFrame()
+    if trades is not None and not trades.empty:
+        t = trades.copy()
+        t["Date"] = pd.to_datetime(t["Date"])
+        sells = t[t["Action"].str.upper() == "SELL"].copy()
+        if not sells.empty:
+            realized = (
+                sells.groupby("Ticker", as_index=False)["PnL"]
+                .sum()
+                .rename(columns={"PnL": "Realized_PnL_$"})
+                .sort_values("Realized_PnL_$", ascending=False)
+            )
+
+    # --- Open PnL from current_port (exclude TOTAL) ---
+    open_pnl = pd.DataFrame()
+    if current_port is not None and not current_port.empty:
+        cp = current_port[current_port["Ticker"] != "TOTAL"].copy()
+        if "PnL_$" in cp.columns:
+            open_pnl = cp[["Ticker", "PnL_$", "PnL_%", "Target_$", "Weight_%"]].copy()
+            open_pnl = open_pnl.rename(columns={"PnL_$": "Open_PnL_$"}).sort_values("Open_PnL_$", ascending=False)
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("#### Top performers (Realized)")
+        if realized.empty:
+            st.info("No realized PnL yet (no SELL trades).")
+        else:
+            st.dataframe(realized.head(15), use_container_width=True)
+
+    with c2:
+        st.markdown("#### Bottom performers (Realized)")
+        if realized.empty:
+            st.info("No realized PnL yet (no SELL trades).")
+        else:
+            st.dataframe(realized.tail(15).sort_values("Realized_PnL_$"), use_container_width=True)
+
+    st.markdown("---")
+
+    c3, c4 = st.columns(2)
+
+    with c3:
+        st.markdown("#### Top performers (Open MTM)")
+        if open_pnl.empty:
+            st.info("No open PnL available.")
+        else:
+            st.dataframe(open_pnl.head(15), use_container_width=True)
+
+    with c4:
+        st.markdown("#### Bottom performers (Open MTM)")
+        if open_pnl.empty:
+            st.info("No open PnL available.")
+        else:
+            st.dataframe(open_pnl.tail(15).sort_values("Open_PnL_$"), use_container_width=True)
+
+    st.markdown("---")
+
+    # Monthly best/worst months (from monthly_summary you already compute in tab1)
+    st.markdown("#### Best / Worst months")
+    try:
+        if monthly_summary is not None and not monthly_summary.empty:
+            best = monthly_summary.sort_values("Return_%", ascending=False).head(6)
+            worst = monthly_summary.sort_values("Return_%", ascending=True).head(6)
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                st.markdown("**Best months**")
+                st.dataframe(best[["Month", "Return_%", "PnL_$"]], use_container_width=True)
+            with cc2:
+                st.markdown("**Worst months**")
+                st.dataframe(worst[["Month", "Return_%", "PnL_$"]], use_container_width=True)
+        else:
+            st.info("Monthly summary not available.")
+    except Exception:
+        st.info("Monthly summary not available.")
