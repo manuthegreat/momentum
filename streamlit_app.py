@@ -789,7 +789,7 @@ def get_today_trades_bucket_c(
     """
 
     # Get sorted rebalance dates
-    all_dates = sorted(set(dailyA["Date"]).intersection(dailyB["Date"]))
+    all_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
     if len(all_dates) < 2:
         return pd.DataFrame()
 
