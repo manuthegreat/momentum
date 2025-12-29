@@ -1393,13 +1393,39 @@ def pick_ticker_from_table(df: pd.DataFrame, key: str, ticker_col: str = "Ticker
     return t
 
 
-def plot_ticker_price_chart(
+def build_trade_markers_for_ticker(
+    trades_df: pd.DataFrame,
+    ticker: str,
+) -> pd.DataFrame:
+    """
+    Returns trades for ticker with standardized Action + Date.
+    Assumes trades_df has: Date, Ticker, Action (Buy/Sell/Resize), Price, PnL
+    """
+    if trades_df is None or trades_df.empty:
+        return pd.DataFrame(columns=["Date", "Action", "Trade_Price"])
+
+    t = trades_df.copy()
+    t["Date"] = pd.to_datetime(t["Date"])
+    t = t[t["Ticker"] == ticker].copy()
+    if t.empty:
+        return pd.DataFrame(columns=["Date", "Action", "Trade_Price"])
+
+    # Normalize action labels just in case
+    t["Action"] = t["Action"].astype(str).str.strip().str.upper()
+    t["Trade_Price"] = pd.to_numeric(t.get("Price", np.nan), errors="coerce")
+
+    return t.sort_values("Date")[["Date", "Action", "Trade_Price"]]
+
+
+def plot_ticker_price_chart_with_trades(
     base_prices: pd.DataFrame,
+    trades_df: pd.DataFrame,
     ticker: str,
     title_prefix: str = "Price",
 ):
     """
-    base_prices must have columns: Ticker, Date, Price (you already have this in `base`)
+    base_prices: columns [Ticker, Date, Price]
+    trades_df: your backtest blotter (Date, Ticker, Action, Price, PnL)
     """
     if not ticker:
         return
@@ -1409,7 +1435,40 @@ def plot_ticker_price_chart(
         st.info(f"No price series found for {ticker}.")
         return
 
+    px["Date"] = pd.to_datetime(px["Date"])
     px = px.sort_values("Date")
+
+    # --- trades for this ticker ---
+    tm = build_trade_markers_for_ticker(trades_df, ticker)
+
+    # Map each trade date to a plotted y-value (closest prior price)
+    # (Handles rebalance dates that aren't trading days.)
+    trade_points = []
+    if not tm.empty:
+        # series for fast lookup
+        px_series = px.set_index("Date")["Price"].sort_index()
+
+        for _, r in tm.iterrows():
+            d = pd.to_datetime(r["Date"])
+            # last available price on/before trade date
+            s = px_series.loc[:d]
+            if s.empty:
+                y = np.nan
+            else:
+                y = float(s.iloc[-1])
+
+            trade_points.append(
+                {
+                    "Date": d,
+                    "Action": r["Action"],
+                    "Y": y,
+                    "Trade_Price": r["Trade_Price"],
+                }
+            )
+
+    trade_points = pd.DataFrame(trade_points)
+
+    # --- base price chart ---
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -1420,16 +1479,72 @@ def plot_ticker_price_chart(
             line=dict(width=2),
         )
     )
+
+    # --- overlay trade markers ---
+    if not trade_points.empty:
+        # BUY
+        buys = trade_points[trade_points["Action"] == "BUY"]
+        if not buys.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=buys["Date"],
+                    y=buys["Y"],
+                    mode="markers",
+                    name="BUY",
+                    marker=dict(symbol="triangle-up", size=12),
+                    hovertemplate="BUY<br>Date=%{x|%Y-%m-%d}<br>Price=%{y:.2f}<extra></extra>",
+                )
+            )
+
+        # SELL
+        sells = trade_points[trade_points["Action"] == "SELL"]
+        if not sells.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=sells["Date"],
+                    y=sells["Y"],
+                    mode="markers",
+                    name="SELL",
+                    marker=dict(symbol="triangle-down", size=12),
+                    hovertemplate="SELL<br>Date=%{x|%Y-%m-%d}<br>Price=%{y:.2f}<extra></extra>",
+                )
+            )
+
+        # RESIZE (optional)
+        resz = trade_points[trade_points["Action"] == "RESIZE"]
+        if not resz.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=resz["Date"],
+                    y=resz["Y"],
+                    mode="markers",
+                    name="RESIZE",
+                    marker=dict(symbol="circle", size=9),
+                    hovertemplate="RESIZE<br>Date=%{x|%Y-%m-%d}<br>Price=%{y:.2f}<extra></extra>",
+                )
+            )
+
+        # Vertical lines for all trade dates (light + dashed)
+        for d in trade_points["Date"].dropna().unique():
+            fig.add_vline(x=d, line_width=1, line_dash="dot")
+
     fig.update_layout(
         title=f"{title_prefix} — {ticker}",
-        height=420,
+        height=460,
         margin=dict(l=30, r=30, t=60, b=30),
         hovermode="x unified",
         xaxis=dict(title="Date", showgrid=False),
         yaxis=dict(title="Price", tickformat=",.2f"),
         template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+
     st.plotly_chart(fig, use_container_width=True)
+
+    # Optional: show the per-ticker trade blotter under the chart
+    if not tm.empty:
+        with st.expander("Show trades for selected ticker"):
+            st.dataframe(tm, use_container_width=True)
 
 # ============================================================
 # STREAMLIT UI (RUNS THE SAME "MAIN" PIPELINE)
@@ -1778,7 +1893,12 @@ with tab2:
 
         if selected_ticker:
             st.markdown("#### Selected ticker chart")
-            plot_ticker_price_chart(base_prices=base, ticker=selected_ticker, title_prefix="Price (full history)")
+            plot_ticker_price_chart_with_trades(
+                base_prices=base,
+                trades_df=trades,
+                ticker=selected_ticker,
+                title_prefix="Price (full history)"
+            )
 
 with tab3:
     st.markdown("### Monthly Rebalance History")
@@ -1812,7 +1932,12 @@ with tab3:
 
         if selected_ticker_m:
             st.markdown("#### Selected ticker chart")
-            plot_ticker_price_chart(base_prices=base, ticker=selected_ticker_m, title_prefix=f"Price (as-of {choice})")
+            plot_ticker_price_chart_with_trades(
+                base_prices=base,
+                trades_df=trades,
+                ticker=selected_ticker_m,
+                title_prefix=f"Price (as-of {choice})"
+            )
 
         st.markdown("#### Actions vs previous month")
         st.dataframe(actions_by_month[chosen_date], use_container_width=True)
