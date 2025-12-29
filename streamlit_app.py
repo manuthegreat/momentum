@@ -1203,6 +1203,124 @@ def trade_diagnostics(trades_df: pd.DataFrame) -> dict:
         "monthly_table": monthly
     }
 
+def portfolio_mark_to_market(
+    price_table: pd.DataFrame,
+    target_df: pd.DataFrame,
+    entry_date,
+    mark_date
+) -> pd.DataFrame:
+    """
+    Treat target_df as a portfolio initiated at entry_date using target dollars.
+    Compute shares at entry, and P&L marked to mark_date.
+    """
+    if target_df is None or target_df.empty:
+        return pd.DataFrame()
+
+    entry_date = pd.to_datetime(entry_date)
+    mark_date = pd.to_datetime(mark_date)
+
+    rows = []
+    total = float(target_df["Position_Size"].sum())
+
+    for _, r in target_df.iterrows():
+        t = r["Ticker"]
+        dollars = float(r["Position_Size"])
+
+        entry_px = get_last_price(price_table, t, entry_date)
+        mark_px  = get_last_price(price_table, t, mark_date)
+
+        if entry_px is None or entry_px <= 0:
+            shares = np.nan
+            pnl = np.nan
+            pnl_pct = np.nan
+        else:
+            shares = dollars / entry_px
+            if mark_px is None or mark_px <= 0:
+                pnl = np.nan
+                pnl_pct = np.nan
+            else:
+                pnl = shares * (mark_px - entry_px)
+                pnl_pct = (mark_px / entry_px - 1.0) * 100.0
+
+        rows.append({
+            "Ticker": t,
+            "Target_$": dollars,
+            "Weight_%": (dollars / total * 100.0) if total > 0 else np.nan,
+            "Entry_Date": entry_date.date(),
+            "Entry_Price": entry_px,
+            "Current_Date": mark_date.date(),
+            "Current_Price": mark_px,
+            "Shares": shares,
+            "PnL_$": pnl,
+            "PnL_%": pnl_pct,
+        })
+
+    df = pd.DataFrame(rows).sort_values("Target_$", ascending=False).reset_index(drop=True)
+
+    # Nice formatting: totals row
+    if not df.empty:
+        total_row = {
+            "Ticker": "TOTAL",
+            "Target_$": df["Target_$"].sum(),
+            "Weight_%": df["Weight_%"].sum(),
+            "Entry_Date": "",
+            "Entry_Price": np.nan,
+            "Current_Date": "",
+            "Current_Price": np.nan,
+            "Shares": np.nan,
+            "PnL_$": df["PnL_$"].sum(skipna=True),
+            "PnL_%": np.nan,
+        }
+        df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
+    return df
+
+
+def monthly_pnl_table(
+    price_table: pd.DataFrame,
+    targets_by_month: dict,
+    month_end_dates_list: list
+) -> pd.DataFrame:
+    """
+    For each month-end portfolio target, compute P&L to the next month-end.
+    Assumes rebalance at each month-end date.
+    """
+    if not month_end_dates_list or len(month_end_dates_list) < 2:
+        return pd.DataFrame()
+
+    rows = []
+
+    for i in range(len(month_end_dates_list) - 1):
+        d0 = pd.to_datetime(month_end_dates_list[i])
+        d1 = pd.to_datetime(month_end_dates_list[i + 1])
+
+        tgt = targets_by_month.get(d0)
+        if tgt is None or tgt.empty:
+            continue
+
+        mtm = portfolio_mark_to_market(price_table, tgt, entry_date=d0, mark_date=d1)
+
+        # strip TOTAL row for per-ticker details
+        per = mtm[mtm["Ticker"] != "TOTAL"].copy()
+        per["Month"] = d0.strftime("%Y-%m")
+        per["Exit_Date"] = d1.date()
+
+        # Month summary row
+        month_pnl = per["PnL_$"].sum(skipna=True)
+        month_cap = per["Target_$"].sum()
+        month_ret = (month_pnl / month_cap * 100.0) if month_cap > 0 else np.nan
+
+        rows.append({
+            "Month": d0.strftime("%Y-%m"),
+            "Entry_Date": d0.date(),
+            "Exit_Date": d1.date(),
+            "Capital_$": month_cap,
+            "PnL_$": month_pnl,
+            "Return_%": month_ret
+        })
+
+    out = pd.DataFrame(rows).sort_values("Entry_Date").reset_index(drop=True)
+    return out
 
 
 # ============================================================
@@ -1464,7 +1582,17 @@ actions_by_month = bundle["actions"]
 # choose "current" as latest month-end; fallback to last available date
 as_of = m_dates[-1] if m_dates else today
 current_target = targets_by_month.get(as_of, pd.DataFrame())
-current_port = current_portfolio_table(price_table=priceA, target_df=current_target, as_of_date=as_of)
+
+# Mark to latest available price date in price table
+latest_price_date = priceA.index.max() if len(priceA.index) else as_of
+
+current_port = portfolio_mark_to_market(
+    price_table=priceA,
+    target_df=current_target,
+    entry_date=as_of,              # entry at last month-end rebalance
+    mark_date=latest_price_date    # mark to latest available price
+)
+
 
 tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Current Portfolio", "Monthly Rebalances", "Diagnostics"])
 
@@ -1499,10 +1627,31 @@ with tab3:
         month_labels = [pd.to_datetime(d).strftime("%Y-%m") for d in m_dates]
         choice = st.selectbox("Select month", options=month_labels, index=len(month_labels) - 1)
         chosen_date = m_dates[month_labels.index(choice)]
+        # Monthly P&L summary for the whole strategy (month-end to next month-end)
+        monthly_summary = monthly_pnl_table(price_table=priceA, targets_by_month=targets_by_month, month_end_dates_list=m_dates)
+        st.markdown("#### Monthly performance (month-end to next month-end)")
+        st.dataframe(monthly_summary, use_container_width=True)
+
 
         st.markdown(f"#### Target portfolio — {choice} (rebalance date: {pd.to_datetime(chosen_date).date()})")
-        st.dataframe(targets_by_month[chosen_date], use_container_width=True)
-
+        
+        # If there's a next month, show P&L to next month-end; otherwise mark to latest price
+        idx_choice = month_labels.index(choice)
+        if idx_choice < len(m_dates) - 1:
+            exit_date = m_dates[idx_choice + 1]
+        else:
+            exit_date = priceA.index.max() if len(priceA.index) else chosen_date
+        
+        tgt = targets_by_month.get(chosen_date, pd.DataFrame())
+        mtm_month = portfolio_mark_to_market(
+            price_table=priceA,
+            target_df=tgt,
+            entry_date=chosen_date,
+            mark_date=exit_date
+        )
+        
+        st.dataframe(mtm_month, use_container_width=True)
+        
         st.markdown("#### Actions vs previous month")
         st.dataframe(actions_by_month[chosen_date], use_container_width=True)
 
