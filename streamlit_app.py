@@ -480,22 +480,29 @@ def compute_performance_stats(history_df: pd.DataFrame) -> dict:
     total_return = (end / start - 1) * 100
     years = (df["Date"].iloc[-1] - df["Date"].iloc[0]).days / 365.25
 
-    if start <= 0 or end <= 0 or years <= 0:
-        cagr = np.nan
-    else:
+    if end > 0 and years > 0:
         cagr = ((end / start) ** (1 / years) - 1) * 100
+    else:
+        cagr = np.nan
 
+    # Returns
     ret = df["Portfolio Value"].pct_change().dropna()
-    sharpe = np.sqrt(252) * ret.mean() / ret.std() if ret know := ret.std() and ret.std() > 0 else np.nan  # noqa
-    # (avoid linting on streamlit; if your environment complains, replace the line above with the 2 lines below)
-    # s = ret.std()
-    # sharpe = np.sqrt(252) * ret.mean() / s if s and s > 0 else np.nan
 
-    sortino = np.nan
+    # Sharpe
+    std = ret.std()
+    if std and std > 0:
+        sharpe = np.sqrt(252) * ret.mean() / std
+    else:
+        sharpe = np.nan
+
+    # Sortino
     downside = ret[ret < 0]
     if downside.std() and downside.std() > 0:
         sortino = np.sqrt(252) * ret.mean() / downside.std()
+    else:
+        sortino = np.nan
 
+    # Drawdown
     rolling_max = df["Portfolio Value"].cummax()
     drawdown = (df["Portfolio Value"] - rolling_max) / rolling_max
 
