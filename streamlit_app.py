@@ -1,10 +1,11 @@
 # streamlit_app.py
 # CLEAN 2-TAB VERSION (C ONLY)
-# Tab 1: Signals (Bucket C unified) + click ticker -> chart updates below
+# Tab 1: Signals (Bucket C unified / Option A) + click ticker -> chart updates below
 # Tab 2: Backtest Results (Bucket C overview)
 #
-# ✅ Strategy math unchanged
-# ✅ Monthly rebalance schedule remains month-end (as in your current version)
+# ✅ Strategy math unchanged (same A/B feature + scoring blocks)
+# ✅ Monthly rebalance schedule remains month-end
+# ✅ Signals table shows Consistency score
 
 import streamlit as st
 import pandas as pd
@@ -13,6 +14,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Momentum Strategy Dashboard", layout="wide")
+
 
 # ============================================================
 # 1) DATA LOADING
@@ -203,6 +205,58 @@ def add_regime_early_momentum(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
+# 3B) RELATIVE REGIME MOMENTUM (Bucket B core)
+# ============================================================
+
+def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Uses df's existing stock returns features (5D/10D/30D/45D/60D/90D Return)
+    and index momentum columns (idx_5D..idx_90D) to build relative regimes,
+    then sets Momentum_* and Momentum Score from relative z-scores.
+    """
+    df = df.copy()
+
+    # Relative regime components
+    df["Rel_Slow"] = (
+        0.5 * df["60D Return"] + 0.5 * df["90D Return"]
+    ) - (
+        0.5 * df["idx_60D"] + 0.5 * df["idx_90D"]
+    )
+
+    df["Rel_Mid"] = (
+        0.5 * df["30D Return"] + 0.5 * df["45D Return"]
+    ) - (
+        0.5 * df["idx_30D"] + 0.5 * df["idx_45D"]
+    )
+
+    df["Rel_Fast"] = (
+        0.6 * df["5D Return"] + 0.4 * df["10D Return"]
+    ) - (
+        0.6 * df["idx_5D"] + 0.4 * df["idx_10D"]
+    )
+
+    # Cross-sectional z-scores AFTER benchmark subtraction
+    for col in ["Rel_Slow", "Rel_Mid", "Rel_Fast"]:
+        mean = df.groupby("Date")[col].transform("mean")
+        std  = df.groupby("Date")[col].transform("std").replace(0, np.nan)
+        df[col + "_z"] = ((df[col] - mean) / std).fillna(0.0)
+
+    # Define regime scaffolding using RELATIVE z-scores
+    df["Momentum_Slow"] = df["Rel_Slow_z"]
+    df["Momentum_Mid"]  = df["Rel_Mid_z"]
+    df["Momentum_Fast"] = df["Rel_Fast_z"]
+
+    # Momentum Score built from relative regimes
+    df["Momentum Score"] = (
+        0.5 * df["Momentum_Slow"] +
+        0.3 * df["Momentum_Mid"] +
+        0.2 * df["Momentum_Fast"]
+    )
+
+    return df.fillna(0.0)
+
+
+# ============================================================
 # 4) DAILY LISTS + FINAL (PERSISTENCE) SELECTION
 # ============================================================
 
@@ -232,7 +286,7 @@ def final_selection_from_daily(
     as_of_date=None,
     top_n: int = 10
 ) -> pd.DataFrame:
-    if daily_df.empty:
+    if daily_df is None or daily_df.empty:
         return pd.DataFrame()
 
     if as_of_date is None:
@@ -311,8 +365,8 @@ def build_bucket_c_signals(
     weight_B=0.80,
 ) -> pd.DataFrame:
     """
-    Returns Bucket C target + diagnostics columns:
-    Position_Size + A/B components (Momentum/Early/Consistency/Weighted) aggregated.
+    Bucket C = combine final selection from A and B, allocate dollars by weights,
+    and aggregate diagnostics per ticker (showing Consistency etc.).
     """
     selA = final_selection_from_daily(
         dailyA,
@@ -323,6 +377,7 @@ def build_bucket_c_signals(
         as_of_date=as_of_date,
         top_n=top_n
     ).copy()
+
     selB = final_selection_from_daily(
         dailyB,
         lookback_days=lookback_days,
@@ -350,10 +405,7 @@ def build_bucket_c_signals(
 
     combo = pd.concat(frames, ignore_index=True)
 
-    # Sum dollars if ticker appears in both; also combine diagnostics for display:
-    # - Position size sums
-    # - Weighted scores (and other scores) take the MAX across contributing buckets (keeps "why it's here" visible)
-    #   You can change this to mean() if you prefer.
+    # Aggregate per ticker
     out = (
         combo.groupby("Ticker", as_index=False)
         .agg(
@@ -362,9 +414,14 @@ def build_bucket_c_signals(
             Momentum_Score=("Momentum_Score", "max"),
             Early_Momentum_Score=("Early_Momentum_Score", "max"),
             Consistency=("Consistency", "max"),
+            Bucket_Source=("Bucket", lambda x: "+".join(sorted(set(x))))
         )
-    ).sort_values(["Position_Size", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
+        .sort_values(["Position_Size", "Weighted_Score"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
 
+    # Normalize source formatting
+    out["Bucket_Source"] = out["Bucket_Source"].replace({"A+B": "A+B", "A": "A", "B": "B"})
     return out
 
 
@@ -413,7 +470,7 @@ def simulate_unified_portfolio(
         held = set(portfolio.keys())
 
         # SELL
-        for t in held - target:
+        for t in list(held - target):
             px = get_last_price(price_table, t, d)
             if px is None or px <= 0:
                 continue
@@ -480,29 +537,17 @@ def compute_performance_stats(history_df: pd.DataFrame) -> dict:
     total_return = (end / start - 1) * 100
     years = (df["Date"].iloc[-1] - df["Date"].iloc[0]).days / 365.25
 
-    if end > 0 and years > 0:
-        cagr = ((end / start) ** (1 / years) - 1) * 100
-    else:
-        cagr = np.nan
+    cagr = ((end / start) ** (1 / years) - 1) * 100 if (end > 0 and years > 0) else np.nan
 
-    # Returns
     ret = df["Portfolio Value"].pct_change().dropna()
 
-    # Sharpe
     std = ret.std()
-    if std and std > 0:
-        sharpe = np.sqrt(252) * ret.mean() / std
-    else:
-        sharpe = np.nan
+    sharpe = np.sqrt(252) * ret.mean() / std if (std is not None and std > 0) else np.nan
 
-    # Sortino
     downside = ret[ret < 0]
-    if downside.std() and downside.std() > 0:
-        sortino = np.sqrt(252) * ret.mean() / downside.std()
-    else:
-        sortino = np.nan
+    dstd = downside.std()
+    sortino = np.sqrt(252) * ret.mean() / dstd if (dstd is not None and dstd > 0) else np.nan
 
-    # Drawdown
     rolling_max = df["Portfolio Value"].cummax()
     drawdown = (df["Portfolio Value"] - rolling_max) / rolling_max
 
@@ -723,16 +768,17 @@ def run_full_pipeline():
     base = filter_by_index(base, "SP500")
     idx = load_index_returns_parquet(index_path)
 
-    # Bucket A
+    # ---------------- Bucket A (absolute) ----------------
     dfA = calculate_momentum_features(add_absolute_returns(base), windows=WINDOWS)
     dfA = add_regime_momentum_score(dfA)
     dfA = add_regime_acceleration(dfA)
     dfA = add_regime_residual_momentum(dfA)
     dfA = add_regime_early_momentum(dfA)
+
     priceA = dfA.pivot(index="Date", columns="Ticker", values="Price").sort_index()
     dailyA = build_daily_lists(dfA, top_n=DAILY_TOP_N)
 
-    # Bucket B (your code already ends up producing Momentum Score / Early Momentum Score)
+    # ---------------- Bucket B (relative) ----------------
     dfB = base.copy()
     dfB = dfB.merge(
         idx,
@@ -743,8 +789,11 @@ def run_full_pipeline():
     ).drop(columns=["date", "index"], errors="ignore")
 
     dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
+
+    # Use same return feature factory (absolute 1D return) to build 5/10/30... stock return features
     dfB = calculate_momentum_features(add_absolute_returns(dfB), windows=WINDOWS)
 
+    # Merge index momentum features idx_5D..idx_90D
     idx_mom = compute_index_momentum(idx, windows=WINDOWS)
     dfB = dfB.merge(
         idx_mom[["date", "index", "idx_5D", "idx_10D", "idx_30D", "idx_45D", "idx_60D", "idx_90D"]],
@@ -753,20 +802,25 @@ def run_full_pipeline():
         how="left"
     ).drop(columns=["date", "index"], errors="ignore")
 
-    # Note: your earlier code uses add_relative_regime_momentum_score; keeping that exact structure
-    # but this stripped version doesn’t need to re-show A/B signals.
+    # Relative regime scoring (sets Momentum_* and Momentum Score)
+    dfB = add_relative_regime_momentum_score(dfB)
 
-    # Minimal: reuse your relative regime scoring function from your original file if you want it exactly.
-    # For now, we keep only what’s needed for persistence scoring. If you already have dfB with Momentum/Early,
-    # this will work as-is.
-    # ---- For safety, we assume dfB has required columns; if not, you'll paste your existing B block here.
+    # Filters (as in your original long version)
+    dfB = dfB[dfB["Momentum_Slow"] > 1].copy()
+    dfB = dfB[dfB["Momentum_Mid"] > 0.5].copy()
+    dfB = dfB[dfB["Momentum_Fast"] > 1].copy()
 
-    # (If your current B block is required, drop it in here exactly — nothing else changes.)
+    # Early momentum scaffolding (same functions, now applied to relative regimes)
+    dfB = add_regime_acceleration(dfB)
+    dfB = add_regime_residual_momentum(dfB)
+    dfB = add_regime_early_momentum(dfB)
 
-    # Backtest Bucket C
+    dailyB = build_daily_lists(dfB, top_n=DAILY_TOP_N)
+
+    # ---------------- Bucket C (unified) backtest ----------------
     histU, tradesU = simulate_unified_portfolio(
         df_prices=base,
-        price_table=priceA,
+        price_table=priceA,          # same as your existing version
         dailyA=dailyA,
         dailyB=dailyB,
         lookback_days=LOOKBACK_DAYS,
@@ -783,6 +837,7 @@ def run_full_pipeline():
     trade_statsU = compute_trade_stats(tradesU)
 
     scoreA = dfA[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
+    scoreB = dfB[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
 
     return {
         "params": {
@@ -799,10 +854,12 @@ def run_full_pipeline():
             "base": base,
             "dailyA": dailyA,
             "dailyB": dailyB,
-            "score_for_chart": scoreA,  # chart uses whichever score_df you pass; for now A
+            "scoreA": scoreA,
+            "scoreB": scoreB,
             "priceA": priceA
         }
     }
+
 
 def build_bucket_c_signal_preview(
     dailyA,
@@ -817,17 +874,6 @@ def build_bucket_c_signal_preview(
     weight_A=0.20,
     weight_B=0.80,
 ):
-    # Final selections per bucket (for scores only)
-    selA = final_selection_from_daily(
-        dailyA, lookback_days, w_momentum, w_early, w_consistency,
-        as_of_date=as_of_date, top_n=top_n
-    )
-    selB = final_selection_from_daily(
-        dailyB, lookback_days, w_momentum, w_early, w_consistency,
-        as_of_date=as_of_date, top_n=top_n
-    )
-
-    # Unified C target (this defines capital allocation)
     tgtC = build_bucket_c_signals(
         dailyA=dailyA,
         dailyB=dailyB,
@@ -842,67 +888,28 @@ def build_bucket_c_signal_preview(
         weight_B=weight_B,
     )
 
-
-    if tgtC.empty:
+    if tgtC is None or tgtC.empty:
         return pd.DataFrame()
 
-    # Merge score info back in
     out = tgtC.copy()
-
-    def merge_scores(out, sel, bucket_label):
-        if sel.empty:
-            return out
-        s = sel.copy()
-        s["Bucket_Source"] = bucket_label
-        return out.merge(
-            s[[
-                "Ticker",
-                "Momentum_Score",
-                "Early_Momentum_Score",
-                "Consistency",
-                "Weighted_Score",
-                "Bucket_Source",
-            ]],
-            on="Ticker",
-            how="left",
-            suffixes=("", f"_{bucket_label}")
-        )
-
-    out = merge_scores(out, selA, "A")
-    out = merge_scores(out, selB, "B")
-
-    # Bucket source logic
-    out["Bucket_Source"] = (
-        out["Bucket_Source"].fillna("") +
-        out.get("Bucket_Source_B", "").fillna("")
-    )
-    out["Bucket_Source"] = out["Bucket_Source"].replace(
-        {"AB": "A+B", "": "Unknown"}
-    )
-
-    # Clean columns
-    out = out[[
-        "Ticker",
-        "Position_Size",
-        "Momentum_Score",
-        "Early_Momentum_Score",
-        "Consistency",
-        "Weighted_Score",
-        "Bucket_Source",
-    ]]
-
     out = out.rename(columns={"Position_Size": "Target_$"})
-    total = out["Target_$"].sum()
-    out["Weight_%"] = out["Target_$"] / total * 100.0
+    total = float(out["Target_$"].sum()) if "Target_$" in out.columns else 0.0
+    out["Weight_%"] = (out["Target_$"] / total * 100.0) if total > 0 else np.nan
 
-    return out.sort_values("Weighted_Score", ascending=False).reset_index(drop=True)
+    # Order / keep columns for the Signals tab (includes Consistency)
+    cols = [
+        "Ticker", "Bucket_Source", "Target_$", "Weight_%",
+        "Consistency", "Weighted_Score", "Momentum_Score", "Early_Momentum_Score"
+    ]
+    cols = [c for c in cols if c in out.columns]
+    out = out[cols].sort_values(["Target_$", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
+
+    return out
 
 
 # ============================================================
 # UI (2 TABS)
 # ============================================================
-
-
 
 st.title("📈 Momentum Portfolio")
 
@@ -916,28 +923,20 @@ internals = out["internals"]
 base = internals["base"]
 dailyA = internals["dailyA"]
 dailyB = internals["dailyB"]
-score_for_chart = internals["score_for_chart"]
+scoreA = internals["scoreA"]
+scoreB = internals["scoreB"]
 
 hist = bucketC["history"]
 trades = bucketC["trades"]
 stats = bucketC["stats"]
 trade_stats = bucketC["trade_stats"]
 
-# Common dates across A and B for unified signals
-all_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
-as_of_default = all_dates[-1] if all_dates else None
-
-# Latest common signal date (this is "today" for signals)
 common_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
 signal_date = common_dates[-1] if common_dates else None
 
 if signal_date is None:
     st.error("No overlapping signal dates between Bucket A and Bucket B (cannot build Bucket C signals).")
     st.stop()
-
-
-if "signals_selected_ticker" not in st.session_state:
-    st.session_state.signals_selected_ticker = None
 
 tab_signals, tab_backtest = st.tabs(["Signals", "Backtest Results"])
 
@@ -947,8 +946,17 @@ with tab_signals:
     st.caption(
         f"Signals as of **{signal_date.date()}** · "
         f"Lookback: last **{params['LOOKBACK_DAYS']}** trading days · "
-        f"Rebalance: Monthly"
+        f"Rebalance: Month-end"
     )
+
+    # Optional: choose which score series to show in the chart (does not affect signals)
+    chart_source = st.radio(
+        "Chart momentum source (visual only)",
+        options=["Absolute (A)", "Relative (B)"],
+        horizontal=True,
+        index=0
+    )
+    score_for_chart = scoreA if chart_source.startswith("Absolute") else scoreB
 
     preview = build_bucket_c_signal_preview(
         dailyA=dailyA,
@@ -960,14 +968,18 @@ with tab_signals:
         w_consistency=params["W_CONS"],
         top_n=params["FINAL_TOP_N"],
         total_capital=100_000.0,
+        weight_A=0.20,
+        weight_B=0.80
     )
 
     if preview.empty:
         st.info("No signals available.")
     else:
+        st.markdown("#### Target portfolio (click a row to update chart)")
         selected = pick_single_row(preview, key="signal_preview", label_col="Ticker")
 
         if selected:
+            st.markdown("#### Selected ticker chart")
             plot_ticker_price_with_trades_and_momentum(
                 base_df=base,
                 trades_df=trades,
@@ -989,11 +1001,15 @@ with tab_backtest:
     plot_equity_and_drawdown(hist, title="Momentum Portfolio")
 
     st.markdown("### Trade Statistics")
-    st.dataframe(pd.DataFrame({"Metric": list(trade_stats.keys()), "Value": list(trade_stats.values())}),
-                 use_container_width=True)
+    st.dataframe(
+        pd.DataFrame({"Metric": list(trade_stats.keys()), "Value": list(trade_stats.values())}),
+        use_container_width=True
+    )
 
     with st.expander("Show full backtest trades"):
         if trades is None or trades.empty:
             st.write("No trades.")
         else:
-            st.dataframe(trades.sort_values("Date"), use_container_width=True)
+            x = trades.copy()
+            x["Date"] = pd.to_datetime(x["Date"])
+            st.dataframe(x.sort_values("Date"), use_container_width=True)
