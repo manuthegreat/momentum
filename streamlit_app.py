@@ -965,10 +965,11 @@ def build_bucket_c_signal_preview(
 
     # Order / keep columns for the Signals tab (includes Consistency)
     cols = [
-        "Ticker", "Name", "Sector", "Industry",
-        "Bucket_Source", "Target_$", "Weight_%",
+        "Ticker", "Name",
+        "Target_$", "Weight_%",
         "Signal_Confidence",
         "Weighted_Score", "Momentum_Score", "Early_Momentum_Score",
+        "Sector", "Industry",
     ]
 
 
@@ -976,7 +977,7 @@ def build_bucket_c_signal_preview(
 
 
     cols = [c for c in cols if c in out.columns]
-    out = out[cols].sort_values(["Target_$", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
+    out = out[cols].sort_values(["Singal_Confidence", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
 
     return out
 
@@ -1049,6 +1050,33 @@ with tab_signals:
     tickers = tuple(preview["Ticker"].astype(str).unique())
     meta = fetch_yahoo_metadata(tickers)
     preview = preview.merge(meta, on="Ticker", how="left")
+
+    st.markdown("### Sector exposure")
+
+    sector_df = preview.copy()
+    sector_df["Sector"] = sector_df["Sector"].fillna("Unknown")
+    
+    # Use Weight_% if present; fallback to Target_$ if you prefer
+    if "Weight_%" in sector_df.columns and sector_df["Weight_%"].notna().any():
+        expo = sector_df.groupby("Sector", as_index=False)["Weight_%"].sum()
+        values_col = "Weight_%"
+        title = "Sector Exposure (by weight %)"
+    else:
+        expo = sector_df.groupby("Sector", as_index=False)["Target_$"].sum()
+        values_col = "Target_$"
+        title = "Sector Exposure (by $)"
+    
+    fig_sector = go.Figure(
+        data=[go.Pie(labels=expo["Sector"], values=expo[values_col], hole=0.45)]
+    )
+    fig_sector.update_layout(
+        title=title,
+        height=380,
+        margin=dict(l=20, r=20, t=60, b=20),
+        template="plotly_white"
+    )
+    st.plotly_chart(fig_sector, use_container_width=True)
+
 
 
     if preview.empty:
