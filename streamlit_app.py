@@ -804,12 +804,107 @@ def run_full_pipeline():
         }
     }
 
+def build_bucket_c_signal_preview(
+    dailyA,
+    dailyB,
+    as_of_date,
+    lookback_days,
+    w_momentum,
+    w_early,
+    w_consistency,
+    top_n,
+    total_capital,
+    weight_A=0.20,
+    weight_B=0.80,
+):
+    # Final selections per bucket (for scores only)
+    selA = final_selection_from_daily(
+        dailyA, lookback_days, w_momentum, w_early, w_consistency,
+        as_of_date=as_of_date, top_n=top_n
+    )
+    selB = final_selection_from_daily(
+        dailyB, lookback_days, w_momentum, w_early, w_consistency,
+        as_of_date=as_of_date, top_n=top_n
+    )
+
+    # Unified C target (this defines capital allocation)
+    tgtC = build_unified_target(
+        dailyA, dailyB,
+        as_of_date=as_of_date,
+        lookback_days=lookback_days,
+        w_momentum=w_momentum,
+        w_early=w_early,
+        w_consistency=w_consistency,
+        top_n=top_n,
+        total_capital=total_capital,
+        weight_A=weight_A,
+        weight_B=weight_B
+    )
+
+    if tgtC.empty:
+        return pd.DataFrame()
+
+    # Merge score info back in
+    out = tgtC.copy()
+
+    def merge_scores(out, sel, bucket_label):
+        if sel.empty:
+            return out
+        s = sel.copy()
+        s["Bucket_Source"] = bucket_label
+        return out.merge(
+            s[[
+                "Ticker",
+                "Momentum_Score",
+                "Early_Momentum_Score",
+                "Consistency",
+                "Weighted_Score",
+                "Bucket_Source",
+            ]],
+            on="Ticker",
+            how="left",
+            suffixes=("", f"_{bucket_label}")
+        )
+
+    out = merge_scores(out, selA, "A")
+    out = merge_scores(out, selB, "B")
+
+    # Bucket source logic
+    out["Bucket_Source"] = (
+        out["Bucket_Source"].fillna("") +
+        out.get("Bucket_Source_B", "").fillna("")
+    )
+    out["Bucket_Source"] = out["Bucket_Source"].replace(
+        {"AB": "A+B", "": "Unknown"}
+    )
+
+    # Clean columns
+    out = out[[
+        "Ticker",
+        "Position_Size",
+        "Momentum_Score",
+        "Early_Momentum_Score",
+        "Consistency",
+        "Weighted_Score",
+        "Bucket_Source",
+    ]]
+
+    out = out.rename(columns={"Position_Size": "Target_$"})
+    total = out["Target_$"].sum()
+    out["Weight_%"] = out["Target_$"] / total * 100.0
+
+    return out.sort_values("Weighted_Score", ascending=False).reset_index(drop=True)
+
 
 # ============================================================
 # UI (2 TABS)
 # ============================================================
 
-st.title("📈 Momentum Portfolio (C Only)")
+# Latest common signal date (this is "today" for signals)
+signal_date = max(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
+
+
+st.title("📈 Momentum Portfolio")
 
 with st.spinner("Running full pipeline from artifacts…"):
     out = run_full_pipeline()
@@ -838,61 +933,39 @@ if "signals_selected_ticker" not in st.session_state:
 tab_signals, tab_backtest = st.tabs(["Signals", "Backtest Results"])
 
 with tab_signals:
-    st.markdown("### Bucket C Signals")
+    st.markdown("### Next Rebalance Preview (Option A)")
 
-    if as_of_default is None:
-        st.info("No common dates found across the signal inputs.")
+    st.caption(
+        f"Signals as of **{signal_date.date()}** · "
+        f"Lookback: last **{params['LOOKBACK_DAYS']}** trading days · "
+        f"Rebalance: Monthly"
+    )
+
+    preview = build_bucket_c_signal_preview(
+        dailyA=dailyA,
+        dailyB=dailyB,
+        as_of_date=signal_date,
+        lookback_days=params["LOOKBACK_DAYS"],
+        w_momentum=params["W_MOM"],
+        w_early=params["W_EARLY"],
+        w_consistency=params["W_CONS"],
+        top_n=params["FINAL_TOP_N"],
+        total_capital=100_000.0,
+    )
+
+    if preview.empty:
+        st.info("No signals available.")
     else:
-        # Allow selecting as-of date (practical for live ops)
-        as_of = st.selectbox(
-            "As-of date",
-            options=all_dates,
-            index=len(all_dates) - 1,
-            format_func=lambda x: pd.to_datetime(x).strftime("%Y-%m-%d"),
-        )
+        selected = pick_single_row(preview, key="signal_preview", label_col="Ticker")
 
-        signalsC = build_bucket_c_signals(
-            dailyA=dailyA,
-            dailyB=dailyB,
-            as_of_date=as_of,
-            lookback_days=params["LOOKBACK_DAYS"],
-            w_momentum=params["W_MOM"],
-            w_early=params["W_EARLY"],
-            w_consistency=params["W_CONS"],
-            top_n=params["FINAL_TOP_N"],
-            total_capital=100_000.0,
-            weight_A=0.20,
-            weight_B=0.80
-        )
-
-        if signalsC is None or signalsC.empty:
-            st.info("No signals available on this date.")
-        else:
-            st.caption("Click a row to update the chart below.")
-            # Show consistency + persistence diagnostics
-            view = signalsC[
-                ["Ticker", "Position_Size", "Consistency", "Weighted_Score", "Momentum_Score", "Early_Momentum_Score"]
-            ].copy()
-
-            selected = pick_single_row(view, key="signals_c_table", label_col="Ticker")
-            if selected:
-                st.session_state.signals_selected_ticker = selected
-
-            st.markdown("---")
-            st.markdown("### Chart")
-
-            tkr = st.session_state.signals_selected_ticker
-            if not tkr:
-                st.info("Click a ticker in the table above to show its chart.")
-            else:
-                st.markdown(f"Selected: `{tkr}`")
-                plot_ticker_price_with_trades_and_momentum(
-                    base_df=base,
-                    trades_df=trades,
-                    score_df=score_for_chart,
-                    ticker=tkr,
-                    lookback_days=500
-                )
+        if selected:
+            plot_ticker_price_with_trades_and_momentum(
+                base_df=base,
+                trades_df=trades,
+                score_df=internals["scoreA"],  # or merged if you prefer
+                ticker=selected,
+                lookback_days=500
+            )
 
 with tab_backtest:
     st.markdown("### Backtest Results (Bucket C)")
