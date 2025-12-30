@@ -900,8 +900,6 @@ def build_bucket_c_signal_preview(
 # UI (2 TABS)
 # ============================================================
 
-# Latest common signal date (this is "today" for signals)
-signal_date = max(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
 
 
 st.title("📈 Momentum Portfolio")
@@ -926,6 +924,9 @@ trade_stats = bucketC["trade_stats"]
 # Common dates across A and B for unified signals
 all_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
 as_of_default = all_dates[-1] if all_dates else None
+
+# Latest common signal date (this is "today" for signals)
+signal_date = max(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
 
 if "signals_selected_ticker" not in st.session_state:
     st.session_state.signals_selected_ticker = None
