@@ -13,6 +13,28 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+import time
+import yfinance as yf
+
+@st.cache_data(show_spinner=False, ttl=60*60*24*7)  # cache for 7 days
+def fetch_yahoo_metadata(tickers: tuple[str, ...]) -> pd.DataFrame:
+    rows = []
+    for t in tickers:
+        try:
+            info = yf.Ticker(t).info  # may be slow; but fine for ~10 tickers
+            rows.append({
+                "Ticker": t,
+                "Name": info.get("shortName") or info.get("longName"),
+                "Sector": info.get("sector"),
+                "Industry": info.get("industry"),
+            })
+            time.sleep(0.2)  # tiny delay helps avoid throttling
+        except Exception:
+            rows.append({"Ticker": t, "Name": None, "Sector": None, "Industry": None})
+
+    return pd.DataFrame(rows)
+
+
 st.set_page_config(page_title="Momentum Strategy Dashboard", layout="wide")
 
 
@@ -928,10 +950,12 @@ def build_bucket_c_signal_preview(
 
     # Order / keep columns for the Signals tab (includes Consistency)
     cols = [
-        "Ticker", "Bucket_Source", "Target_$", "Weight_%",
-        "Consistency", "Rank_Std", "RankStabilityScore", "Signal_Confidence",
-        "Weighted_Score", "Momentum_Score", "Early_Momentum_Score"
+        "Ticker", "Name", "Sector", "Industry",
+        "Bucket_Source", "Target_$", "Weight_%",
+        "Signal_Confidence",
+        "Weighted_Score", "Momentum_Score", "Early_Momentum_Score",
     ]
+
 
     out["Consistency"] = out["Consistency"] * 100.0   # convert to %
 
@@ -1006,6 +1030,11 @@ with tab_signals:
         weight_A=0.20,
         weight_B=0.80
     )
+
+    tickers = tuple(preview["Ticker"].astype(str).unique())
+    meta = fetch_yahoo_metadata(tickers)
+    preview = preview.merge(meta, on="Ticker", how="left")
+
 
     if preview.empty:
         st.info("No signals available.")
