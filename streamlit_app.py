@@ -768,7 +768,7 @@ def run_full_pipeline():
         df_prices=base,
         price_table=priceA,
         dailyA=dailyA,
-        dailyB=dailyA if dailyA is not None else dailyA,  # placeholder safeguard; replace with real dailyB below
+        dailyB=dailyB,
         lookback_days=LOOKBACK_DAYS,
         w_momentum=W_MOM,
         w_early=W_EARLY,
@@ -798,7 +798,7 @@ def run_full_pipeline():
         "internals": {
             "base": base,
             "dailyA": dailyA,
-            "dailyB": dailyA,  # placeholder; replace with your real dailyB
+            "dailyB": dailyB,
             "score_for_chart": scoreA,  # chart uses whichever score_df you pass; for now A
             "priceA": priceA
         }
@@ -828,8 +828,9 @@ def build_bucket_c_signal_preview(
     )
 
     # Unified C target (this defines capital allocation)
-    tgtC = build_unified_target(
-        dailyA, dailyB,
+    tgtC = build_bucket_c_signals(
+        dailyA=dailyA,
+        dailyB=dailyB,
         as_of_date=as_of_date,
         lookback_days=lookback_days,
         w_momentum=w_momentum,
@@ -838,8 +839,9 @@ def build_bucket_c_signal_preview(
         top_n=top_n,
         total_capital=total_capital,
         weight_A=weight_A,
-        weight_B=weight_B
+        weight_B=weight_B,
     )
+
 
     if tgtC.empty:
         return pd.DataFrame()
@@ -969,7 +971,7 @@ with tab_signals:
             plot_ticker_price_with_trades_and_momentum(
                 base_df=base,
                 trades_df=trades,
-                score_df=internals["scoreA"],  # or merged if you prefer
+                score_df=score_for_chart,
                 ticker=selected,
                 lookback_days=500
             )
