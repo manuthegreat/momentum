@@ -16,23 +16,38 @@ from plotly.subplots import make_subplots
 import time
 import yfinance as yf
 
-@st.cache_data(show_spinner=False, ttl=60*60*24*7)  # cache for 7 days
+@st.cache_data(show_spinner=False, ttl=60*60*24*7)
 def fetch_yahoo_metadata(tickers: tuple[str, ...]) -> pd.DataFrame:
     rows = []
+
     for t in tickers:
+        name = sector = industry = None
         try:
-            info = yf.Ticker(t).info  # may be slow; but fine for ~10 tickers
-            rows.append({
-                "Ticker": t,
-                "Name": info.get("shortName") or info.get("longName"),
-                "Sector": info.get("sector"),
-                "Industry": info.get("industry"),
-            })
-            time.sleep(0.2)  # tiny delay helps avoid throttling
+            tk = yf.Ticker(t)
+
+            # 1) Try fast_info (very reliable for name)
+            fi = getattr(tk, "fast_info", {}) or {}
+            name = fi.get("shortName") or fi.get("longName")
+
+            # 2) Try full info ONLY if needed
+            if sector is None or industry is None:
+                info = tk.get_info() or {}
+                name = name or info.get("shortName") or info.get("longName")
+                sector = info.get("sector")
+                industry = info.get("industry")
+
         except Exception:
-            rows.append({"Ticker": t, "Name": None, "Sector": None, "Industry": None})
+            pass
+
+        rows.append({
+            "Ticker": t,
+            "Name": name,
+            "Sector": sector,
+            "Industry": industry,
+        })
 
     return pd.DataFrame(rows)
+
 
 
 st.set_page_config(page_title="Momentum Strategy Dashboard", layout="wide")
