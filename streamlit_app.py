@@ -263,18 +263,23 @@ def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
 def build_daily_lists(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     records = []
     for d in sorted(df["Date"].unique()):
-        snap = df[df["Date"] == d]
-        picks = snap.sort_values("Momentum Score", ascending=False).head(top_n)
-        if picks.empty:
+        snap = df[df["Date"] == d].sort_values("Momentum Score", ascending=False).head(top_n).copy()
+        if snap.empty:
             continue
-        for _, r in picks.iterrows():
+
+        # rank 1..top_n (1 = best)
+        snap["Rank"] = np.arange(1, len(snap) + 1)
+
+        for _, r in snap.iterrows():
             records.append({
                 "Date": d,
                 "Ticker": r["Ticker"],
+                "Rank": int(r["Rank"]),
                 "Momentum Score": float(r["Momentum Score"]),
                 "Early Momentum Score": float(r["Early Momentum Score"]),
             })
     return pd.DataFrame(records)
+
 
 
 def final_selection_from_daily(
@@ -309,10 +314,16 @@ def final_selection_from_daily(
         .agg(
             Momentum_Score=("Momentum Score", "mean"),
             Early_Momentum_Score=("Early Momentum Score", "mean"),
-            Appearances=("Date", "count")
+            Appearances=("Date", "count"),
+            Rank_Mean=("Rank", "mean"),
+            Rank_Std=("Rank", "std"),
         )
         .reset_index()
     )
+    
+    # std can be NaN when only 1 appearance; treat that as perfectly stable (std=0)
+    agg["Rank_Std"] = agg["Rank_Std"].fillna(0.0)
+
 
     agg["Consistency"] = agg["Appearances"] / len(dates)
     agg["Weighted_Score"] = (
@@ -320,6 +331,18 @@ def final_selection_from_daily(
         w_early * agg["Early_Momentum_Score"] +
         w_consistency * agg["Consistency"]
     )
+
+    # Consistency already 0..1
+    agg["ConsistencyScore"] = agg["Consistency"] * 100.0
+    
+    # Rank stability from Rank_Std (lower is better)
+    # Normalize: std >= (top_n/2) is considered "very unstable" => score goes to 0
+    max_std = max(1.0, top_n / 2.0)
+    agg["RankStabilityScore"] = (1.0 - (agg["Rank_Std"] / max_std)).clip(0.0, 1.0) * 100.0
+    
+    # 50/50 confidence
+    agg["Signal_Confidence"] = 0.5 * agg["ConsistencyScore"] + 0.5 * agg["RankStabilityScore"]
+
 
     return (
         agg.sort_values("Weighted_Score", ascending=False)
@@ -414,9 +437,15 @@ def build_bucket_c_signals(
             Momentum_Score=("Momentum_Score", "max"),
             Early_Momentum_Score=("Early_Momentum_Score", "max"),
             Consistency=("Consistency", "max"),
+    
+            # ✅ add these
+            Rank_Std=("Rank_Std", "min"),                 # smaller = more stable
+            RankStabilityScore=("RankStabilityScore", "max"),
+            Signal_Confidence=("Signal_Confidence", "max"),
+    
             Bucket_Source=("Bucket", lambda x: "+".join(sorted(set(x))))
         )
-        .sort_values(["Position_Size", "Weighted_Score"], ascending=[False, False])
+        .sort_values(["Position_Size", "Signal_Confidence"], ascending=[False, False])
         .reset_index(drop=True)
     )
 
@@ -618,7 +647,7 @@ def plot_equity_and_drawdown(history_df: pd.DataFrame, title: str):
     st.plotly_chart(fig_dd, use_container_width=True)
 
 
-def pick_single_row(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
+def pick_single_row(df: pd.DataFrame, key: str, label_col: str = "Ticker", column_config=None):
     if df is None or df.empty or label_col not in df.columns:
         st.dataframe(df, use_container_width=True)
         return None
@@ -631,6 +660,7 @@ def pick_single_row(df: pd.DataFrame, key: str, label_col: str = "Ticker"):
         key=key,
         on_select="rerun",
         selection_mode="single-row",
+        column_config=column_config,
     )
 
     rows = getattr(event, "selection", {}).get("rows", []) if hasattr(event, "selection") else []
@@ -899,8 +929,13 @@ def build_bucket_c_signal_preview(
     # Order / keep columns for the Signals tab (includes Consistency)
     cols = [
         "Ticker", "Bucket_Source", "Target_$", "Weight_%",
-        "Consistency", "Weighted_Score", "Momentum_Score", "Early_Momentum_Score"
+        "Consistency", "Rank_Std", "RankStabilityScore", "Signal_Confidence",
+        "Weighted_Score", "Momentum_Score", "Early_Momentum_Score"
     ]
+
+    out["Consistency"] = out["Consistency"] * 100.0   # convert to %
+
+
     cols = [c for c in cols if c in out.columns]
     out = out[cols].sort_values(["Target_$", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
 
@@ -976,7 +1011,21 @@ with tab_signals:
         st.info("No signals available.")
     else:
         st.markdown("#### Target portfolio (click a row to update chart)")
-        selected = pick_single_row(preview, key="signal_preview", label_col="Ticker")
+        battery_cfg = {
+            "Signal_Confidence": st.column_config.ProgressColumn(
+                "Signal Strength",
+                min_value=0,
+                max_value=100,
+                format="%d%%",
+            )
+        }
+
+        selected = pick_single_row(
+            preview,
+            key="signal_preview",
+            label_col="Ticker",
+            column_config=battery_cfg
+        )
 
         if selected:
             st.markdown("#### Selected ticker chart")
