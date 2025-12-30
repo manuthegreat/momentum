@@ -926,7 +926,13 @@ all_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
 as_of_default = all_dates[-1] if all_dates else None
 
 # Latest common signal date (this is "today" for signals)
-signal_date = max(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
+common_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
+signal_date = common_dates[-1] if common_dates else None
+
+if signal_date is None:
+    st.error("No overlapping signal dates between Bucket A and Bucket B (cannot build Bucket C signals).")
+    st.stop()
+
 
 if "signals_selected_ticker" not in st.session_state:
     st.session_state.signals_selected_ticker = None
