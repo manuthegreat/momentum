@@ -977,7 +977,7 @@ def build_bucket_c_signal_preview(
 
 
     cols = [c for c in cols if c in out.columns]
-    out = out[cols].sort_values(["Singal_Confidence", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
+    out = out[cols].sort_values(["Signal_Confidence", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
 
     return out
 
