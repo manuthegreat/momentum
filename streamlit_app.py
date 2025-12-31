@@ -32,7 +32,6 @@ PREVIEW_LATEST_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_preview_latest.parque
 st.set_page_config(page_title="Momentum Strategy Dashboard", layout="wide")
 
 
-
 # ============================================================
 # LOAD REFERENCE ARTIFACTS (FAST)
 # ============================================================
@@ -261,6 +260,7 @@ def plot_ticker_price_with_trades_and_momentum(
 
     st.plotly_chart(fig, use_container_width=True)
 
+
 # ============================================================
 # UI
 # ============================================================
@@ -282,10 +282,7 @@ if preview is not None and not preview.empty and "Signal_Date" in preview.column
 else:
     signal_date = None
 
-tab_signals, tab_backtest = st.tabs(
-    ["Signals", "Overview"]
-)
-
+tab_signals, tab_backtest = st.tabs(["Signals", "Backtest Results"])
 
 with tab_signals:
     st.markdown("### Next Rebalance Preview (Option A)")
