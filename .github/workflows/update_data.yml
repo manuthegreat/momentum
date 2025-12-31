@@ -5,12 +5,19 @@ on:
     - cron: "0 23 * * 1-5"
   workflow_dispatch:
 
+# ✅ prevents two runs racing to push at the same time
+concurrency:
+  group: update-data-main
+  cancel-in-progress: false
+
 jobs:
   update-data:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # ✅ needed so pull --rebase has history to work with
 
       - uses: actions/setup-python@v5
         with:
@@ -28,6 +35,13 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
+
           git add artifacts/*.parquet
-          git commit -m "Daily market data refresh" || echo "No changes"
-          git push
+
+          # Commit only if there are changes
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Daily market data refresh"
+
+          # ✅ integrate remote changes, then push
+          git pull --rebase origin main
+          git push origin main
