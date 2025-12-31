@@ -1,60 +1,286 @@
-# streamlit_app.py
-# CLEAN 2-TAB VERSION (C ONLY)
-# Tab 1: Signals (Bucket C unified / Option A) + click ticker -> chart updates below
-# Tab 2: Backtest Results (Bucket C overview)
+# update_parquet.py
+# Nightly batch job:
+# 1) Refresh raw artifacts (constituents OHLC + index returns)
+# 2) Run the EXACT SAME pipeline you previously ran inside Streamlit
+# 3) Persist "reference" parquets so Streamlit becomes UI-only
 #
-# ✅ Strategy math unchanged (same A/B feature + scoring blocks)
-# ✅ Monthly rebalance schedule remains month-end
-# ✅ Signals table shows Consistency score
+# IMPORTANT: Core calculation logic has been copied verbatim from streamlit_app.py
+#           (only packaging / persistence / caching has been added).
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from __future__ import annotations
 
+import os
 import time
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import requests
 import yfinance as yf
+from io import StringIO
 
-@st.cache_data(show_spinner=False, ttl=60*60*24*7)
-def fetch_yahoo_metadata(tickers: tuple[str, ...]) -> pd.DataFrame:
-    rows = []
+ARTIFACTS_DIR = "artifacts"
 
-    for t in tickers:
-        name = sector = industry = None
-        try:
-            tk = yf.Ticker(t)
+RAW_CONSTITUENTS_PATH = os.path.join(ARTIFACTS_DIR, "index_constituents_5yr.parquet")
+RAW_INDEX_RETURNS_PATH = os.path.join(ARTIFACTS_DIR, "index_returns_5y.parquet")
 
-            # 1) Try fast_info (very reliable for name)
-            fi = getattr(tk, "fast_info", {}) or {}
-            name = fi.get("shortName") or fi.get("longName")
+# Reference outputs (consumed by Streamlit UI)
+BASE_SP500_PATH = os.path.join(ARTIFACTS_DIR, "base_SP500_5y.parquet")
+DAILYA_PATH = os.path.join(ARTIFACTS_DIR, "dailyA.parquet")
+DAILYB_PATH = os.path.join(ARTIFACTS_DIR, "dailyB.parquet")
+SCOREA_PATH = os.path.join(ARTIFACTS_DIR, "scoreA.parquet")
+SCOREB_PATH = os.path.join(ARTIFACTS_DIR, "scoreB.parquet")
+PRICEA_PATH = os.path.join(ARTIFACTS_DIR, "priceA.parquet")
 
-            # 2) Try full info ONLY if needed
-            if sector is None or industry is None:
-                info = tk.get_info() or {}
-                name = name or info.get("shortName") or info.get("longName")
-                sector = info.get("sector")
-                industry = info.get("industry")
+BUCKETC_HISTORY_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_history.parquet")
+BUCKETC_TRADES_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_trades.parquet")
+BUCKETC_STATS_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_stats.parquet")
+BUCKETC_TRADE_STATS_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_trade_stats.parquet")
 
-        except Exception:
-            pass
+PREVIEW_LATEST_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_preview_latest.parquet")
 
-        rows.append({
-            "Ticker": t,
-            "Name": name,
-            "Sector": sector,
-            "Industry": industry,
-        })
-
-    return pd.DataFrame(rows)
-
-
-
-st.set_page_config(page_title="Momentum Strategy Dashboard", layout="wide")
+YAHOO_META_CACHE_PATH = os.path.join(ARTIFACTS_DIR, "yahoo_metadata.parquet")
 
 
 # ============================================================
-# 1) DATA LOADING
+# 1. UNIVERSE BUILDERS (RAW)
+# ============================================================
+
+def get_sp500_universe():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers)
+    tables = pd.read_html(StringIO(r.text))
+
+    for t in tables:
+        if "Symbol" in t.columns:
+            df = t.copy()
+            break
+
+    df["Ticker"] = df["Symbol"].str.replace(".", "-", regex=False)
+    df["Name"] = df["Security"]
+    df["Sector"] = df["GICS Sector"]
+
+    return df[["Ticker", "Name", "Sector"]]
+
+
+def get_hsi_universe():
+    url = "https://en.wikipedia.org/wiki/Hang_Seng_Index"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers)
+    tables = pd.read_html(StringIO(r.text))
+
+    df = None
+    for t in tables:
+        cols = [str(c).lower() for c in t.columns]
+        if any(x in cols for x in ["ticker", "constituent", "sub-index", "code"]):
+            df = t.copy()
+            break
+
+    if df is None:
+        raise ValueError("No HSI table found")
+
+    df.columns = [str(c).lower() for c in df.columns]
+
+    ticker_col = next(
+        (c for c in df.columns if "ticker" in c or "code" in c or "sehk" in c),
+        None
+    )
+    if ticker_col is None:
+        raise ValueError("No HSI ticker column")
+
+    df["Ticker"] = (
+        df[ticker_col]
+        .astype(str)
+        .str.extract(r"(\d+)")
+        .iloc[:, 0]
+        .astype(str)
+        .str.zfill(4)
+        + ".HK"
+    )
+
+    name_col = "name" if "name" in df.columns else df.columns[0]
+    df["Name"] = df[name_col]
+
+    if "sub-index" in df.columns:
+        df["Sector"] = df["sub-index"]
+    elif "industry" in df.columns:
+        df["Sector"] = df["industry"]
+    else:
+        df["Sector"] = None
+
+    return df[["Ticker", "Name", "Sector"]]
+
+
+def get_sti_universe():
+    data = [
+        ("D05.SI", "DBS Group Holdings", "Financials"),
+        ("U11.SI", "United Overseas Bank", "Financials"),
+        ("O39.SI", "OCBC", "Financials"),
+        ("C07.SI", "Jardine Matheson", "Conglomerate"),
+        ("C09.SI", "City Developments", "Real Estate"),
+        ("C38U.SI", "CICT", "Real Estate"),
+        ("Z74.SI", "Singtel", "Telecom"),
+    ]
+    return pd.DataFrame(data, columns=["Ticker", "Name", "Sector"])
+
+
+# ============================================================
+# 2. DOWNLOAD CONSTITUENT OHLC (5Y) (RAW)
+# ============================================================
+
+def download_5yr_ohlc(tickers, label):
+    print(f"\nDownloading {label} ({len(tickers)} tickers)")
+    frames = []
+    batch_size = 40
+
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        data = yf.download(
+            batch,
+            period="5y",
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+            progress=False
+        )
+
+        for t in batch:
+            try:
+                df = data[t].dropna()
+                if df.empty:
+                    continue
+                df = df.reset_index()
+                df["Ticker"] = t
+                df["Index"] = label
+                frames.append(df)
+            except Exception:
+                continue
+
+    return frames
+
+
+# ============================================================
+# 3. DOWNLOAD INDEX RETURNS (5Y) (RAW)
+# ============================================================
+
+def download_index_5y(ticker, label):
+    df = yf.download(
+        ticker,
+        period="5y",
+        interval="1d",
+        auto_adjust=False,
+        progress=False
+    )
+
+    if df is None or df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+    df = df.dropna().reset_index()
+
+    df["index_name"] = label
+    df["ticker"] = ticker
+
+    df["ret_1d"] = df["close"].pct_change()
+    df["ret_5d"] = df["close"].pct_change(5)
+    df["ret_20d"] = df["close"].pct_change(20)
+    df["ret_60d"] = df["close"].pct_change(60)
+
+    return df
+
+
+# ============================================================
+# 4. YAHOO METADATA CACHE (FULL UNIVERSE, INCREMENTAL)
+# ============================================================
+
+def _fetch_one_yahoo_metadata(ticker: str) -> dict:
+    name = sector = industry = None
+    try:
+        tk = yf.Ticker(ticker)
+
+        # 1) Try fast_info first (same as Streamlit)
+        fi = getattr(tk, "fast_info", {}) or {}
+        name = fi.get("shortName") or fi.get("longName")
+
+        # 2) Try full info only if needed
+        info = tk.get_info() or {}
+        name = name or info.get("shortName") or info.get("longName")
+        sector = info.get("sector")
+        industry = info.get("industry")
+
+    except Exception:
+        pass
+
+    return {"Ticker": ticker, "Name": name, "Sector": sector, "Industry": industry}
+
+
+def update_metadata_cache(
+    all_tickers: list[str],
+    cache_path: str = YAHOO_META_CACHE_PATH,
+    ttl_days: int = 90,
+    sleep_s: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Full universe metadata, but incremental:
+    - Loads cache if exists
+    - Fetches missing tickers + tickers older than TTL
+    - Saves back to cache
+    """
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+    now = pd.Timestamp.utcnow().normalize()
+
+    if os.path.exists(cache_path):
+        cache = pd.read_parquet(cache_path)
+        if "LastUpdated" in cache.columns:
+            cache["LastUpdated"] = pd.to_datetime(cache["LastUpdated"], errors="coerce")
+        else:
+            cache["LastUpdated"] = pd.NaT
+    else:
+        cache = pd.DataFrame(columns=["Ticker", "Name", "Sector", "Industry", "LastUpdated"])
+
+    cache = cache.drop_duplicates(subset=["Ticker"], keep="last")
+    cache_tickers = set(cache["Ticker"].astype(str).tolist()) if not cache.empty else set()
+
+    all_set = set(map(str, all_tickers))
+    missing = sorted(list(all_set - cache_tickers))
+
+    stale = []
+    if not cache.empty:
+        cutoff = now - pd.Timedelta(days=ttl_days)
+        stale = cache.loc[cache["LastUpdated"].isna() | (cache["LastUpdated"] < cutoff), "Ticker"].astype(str).tolist()
+        stale = sorted(list(set(stale) & all_set))
+
+    to_fetch = sorted(list(set(missing + stale)))
+
+    if to_fetch:
+        print(f"\nYahoo metadata: fetching {len(to_fetch)} tickers (missing={len(missing)}, stale={len(stale)})")
+        rows = []
+        for i, t in enumerate(to_fetch, 1):
+            row = _fetch_one_yahoo_metadata(t)
+            row["LastUpdated"] = now
+            rows.append(row)
+
+            if sleep_s and i < len(to_fetch):
+                time.sleep(sleep_s)
+
+        upd = pd.DataFrame(rows)
+        cache = pd.concat([cache, upd], ignore_index=True)
+        cache = cache.drop_duplicates(subset=["Ticker"], keep="last")
+        cache.to_parquet(cache_path, index=False)
+        print(f"Saved metadata cache: {cache_path}")
+    else:
+        print("\nYahoo metadata: cache already up-to-date for this universe.")
+
+    return cache
+
+
+# ============================================================
+# 5. PIPELINE FUNCTIONS (COPIED FROM STREAMLIT, LOGIC UNCHANGED)
 # ============================================================
 
 def load_price_data_parquet(path: str) -> pd.DataFrame:
@@ -112,10 +338,6 @@ def filter_by_index(df: pd.DataFrame, index_name: str) -> pd.DataFrame:
     return df[df["Index"] == index_name].reset_index(drop=True)
 
 
-# ============================================================
-# 2) RETURN DEFINITIONS
-# ============================================================
-
 def add_absolute_returns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["1D Return"] = df.groupby("Ticker")["Price"].pct_change() + 1
@@ -135,10 +357,6 @@ def compute_index_momentum(idx: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90)) -
         )
     return idx
 
-
-# ============================================================
-# 3) MOMENTUM FEATURE ENGINE
-# ============================================================
 
 def calculate_momentum_features(df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90)) -> pd.DataFrame:
     df = df.copy()
@@ -175,7 +393,7 @@ def add_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     df["Momentum_Fast"] = (0.6 * df["5D zscore"] + 0.4 * df["10D zscore"])
-    df["Momentum_Mid"]  = (0.5 * df["30D zscore"] + 0.5 * df["45D zscore"])
+    df["Momentum_Mid"] = (0.5 * df["30D zscore"] + 0.5 * df["45D zscore"])
     df["Momentum_Slow"] = (0.5 * df["60D zscore"] + 0.5 * df["90D zscore"])
 
     df["Momentum Score"] = (
@@ -189,7 +407,7 @@ def add_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
 def add_regime_acceleration(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Accel_Fast"] = df.groupby("Ticker")["Momentum_Fast"].diff()
-    df["Accel_Mid"]  = df.groupby("Ticker")["Momentum_Mid"].diff()
+    df["Accel_Mid"] = df.groupby("Ticker")["Momentum_Mid"].diff()
     df["Accel_Slow"] = df.groupby("Ticker")["Momentum_Slow"].diff()
 
     def zscore_safe(x: pd.Series) -> pd.Series:
@@ -199,7 +417,7 @@ def add_regime_acceleration(df: pd.DataFrame) -> pd.DataFrame:
         return ((x - x.mean()) / s).fillna(0.0)
 
     df["Accel_Fast_z"] = df.groupby("Date")["Accel_Fast"].transform(zscore_safe)
-    df["Accel_Mid_z"]  = df.groupby("Date")["Accel_Mid"].transform(zscore_safe)
+    df["Accel_Mid_z"] = df.groupby("Date")["Accel_Mid"].transform(zscore_safe)
     df["Accel_Slow_z"] = df.groupby("Date")["Accel_Slow"].transform(zscore_safe)
 
     df["Acceleration Score"] = (
@@ -230,7 +448,7 @@ def add_regime_residual_momentum(df: pd.DataFrame) -> pd.DataFrame:
 def add_regime_early_momentum(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Early_Fast"] = (0.6 * df["Accel_Fast_z"] + 0.4 * df["Momentum_Fast"])
-    df["Early_Mid"]  = (0.5 * df["Accel_Mid_z"] + 0.5 * df["Momentum_Mid"])
+    df["Early_Mid"] = (0.5 * df["Accel_Mid_z"] + 0.5 * df["Momentum_Mid"])
     df["Early_Slow"] = (0.5 * df["Accel_Slow_z"] + 0.5 * df["Momentum_Slow"])
 
     df["Early Momentum Score"] = (
@@ -240,10 +458,6 @@ def add_regime_early_momentum(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df.fillna(0.0)
 
-
-# ============================================================
-# 3B) RELATIVE REGIME MOMENTUM (Bucket B core)
-# ============================================================
 
 def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -275,12 +489,12 @@ def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
     # Cross-sectional z-scores AFTER benchmark subtraction
     for col in ["Rel_Slow", "Rel_Mid", "Rel_Fast"]:
         mean = df.groupby("Date")[col].transform("mean")
-        std  = df.groupby("Date")[col].transform("std").replace(0, np.nan)
+        std = df.groupby("Date")[col].transform("std").replace(0, np.nan)
         df[col + "_z"] = ((df[col] - mean) / std).fillna(0.0)
 
     # Define regime scaffolding using RELATIVE z-scores
     df["Momentum_Slow"] = df["Rel_Slow_z"]
-    df["Momentum_Mid"]  = df["Rel_Mid_z"]
+    df["Momentum_Mid"] = df["Rel_Mid_z"]
     df["Momentum_Fast"] = df["Rel_Fast_z"]
 
     # Momentum Score built from relative regimes
@@ -292,10 +506,6 @@ def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
 
     return df.fillna(0.0)
 
-
-# ============================================================
-# 4) DAILY LISTS + FINAL (PERSISTENCE) SELECTION
-# ============================================================
 
 def build_daily_lists(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     records = []
@@ -316,7 +526,6 @@ def build_daily_lists(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
                 "Early Momentum Score": float(r["Early Momentum Score"]),
             })
     return pd.DataFrame(records)
-
 
 
 def final_selection_from_daily(
@@ -357,10 +566,9 @@ def final_selection_from_daily(
         )
         .reset_index()
     )
-    
+
     # std can be NaN when only 1 appearance; treat that as perfectly stable (std=0)
     agg["Rank_Std"] = agg["Rank_Std"].fillna(0.0)
-
 
     agg["Consistency"] = agg["Appearances"] / len(dates)
     agg["Weighted_Score"] = (
@@ -371,15 +579,14 @@ def final_selection_from_daily(
 
     # Consistency already 0..1
     agg["ConsistencyScore"] = agg["Consistency"] * 100.0
-    
+
     # Rank stability from Rank_Std (lower is better)
     # Normalize: std >= (top_n/2) is considered "very unstable" => score goes to 0
     max_std = max(1.0, top_n / 2.0)
     agg["RankStabilityScore"] = (1.0 - (agg["Rank_Std"] / max_std)).clip(0.0, 1.0) * 100.0
-    
+
     # 50/50 confidence
     agg["Signal_Confidence"] = 0.5 * agg["ConsistencyScore"] + 0.5 * agg["RankStabilityScore"]
-
 
     return (
         agg.sort_values("Weighted_Score", ascending=False)
@@ -387,10 +594,6 @@ def final_selection_from_daily(
         .reset_index(drop=True)
     )
 
-
-# ============================================================
-# 5) BUCKET C SIGNALS (UNIFIED TARGET) + BACKTEST
-# ============================================================
 
 def monthly_rebalance_dates(df_prices: pd.DataFrame) -> list:
     dates = pd.to_datetime(df_prices["Date"]).dropna().sort_values().unique()
@@ -474,12 +677,12 @@ def build_bucket_c_signals(
             Momentum_Score=("Momentum_Score", "max"),
             Early_Momentum_Score=("Early_Momentum_Score", "max"),
             Consistency=("Consistency", "max"),
-    
+
             # ✅ add these
-            Rank_Std=("Rank_Std", "min"),                 # smaller = more stable
+            Rank_Std=("Rank_Std", "min"),  # smaller = more stable
             RankStabilityScore=("RankStabilityScore", "max"),
             Signal_Confidence=("Signal_Confidence", "max"),
-    
+
             Bucket_Source=("Bucket", lambda x: "+".join(sorted(set(x))))
         )
         .sort_values(["Position_Size", "Signal_Confidence"], ascending=[False, False])
@@ -508,7 +711,7 @@ def simulate_unified_portfolio(
     rebalance_dates = monthly_rebalance_dates(df_prices)
 
     cash = total_capital
-    portfolio = {}   # ticker -> shares
+    portfolio = {}  # ticker -> shares
     cost_basis = {}  # ticker -> dollars invested
 
     history = []
@@ -586,10 +789,6 @@ def simulate_unified_portfolio(
     return pd.DataFrame(history), pd.DataFrame(trades)
 
 
-# ============================================================
-# 6) PERFORMANCE + PLOTS
-# ============================================================
-
 def compute_performance_stats(history_df: pd.DataFrame) -> dict:
     df = history_df.sort_values("Date").copy()
     if df.empty or len(df) < 2:
@@ -648,286 +847,6 @@ def compute_trade_stats(trades_df: pd.DataFrame) -> dict:
     }
 
 
-def plot_equity_and_drawdown(history_df: pd.DataFrame, title: str):
-    if history_df is None or history_df.empty:
-        st.info("No equity history to display.")
-        return
-
-    df = history_df.sort_values("Date").copy()
-    df["Rolling_Max"] = df["Portfolio Value"].cummax()
-    df["Drawdown"] = (df["Portfolio Value"] - df["Rolling_Max"]) / df["Rolling_Max"]
-
-    fig_eq = go.Figure()
-    fig_eq.add_trace(go.Scatter(x=df["Date"], y=df["Portfolio Value"], mode="lines", name="Portfolio Value"))
-    fig_eq.update_layout(
-        title=f"{title} — Equity Curve",
-        height=380,
-        margin=dict(l=40, r=40, t=60, b=40),
-        hovermode="x unified",
-        xaxis=dict(title="Date", showgrid=False),
-        yaxis=dict(title="Portfolio Value", tickformat=",.0f"),
-        template="plotly_white",
-    )
-    st.plotly_chart(fig_eq, use_container_width=True)
-
-    fig_dd = go.Figure()
-    fig_dd.add_trace(go.Scatter(x=df["Date"], y=df["Drawdown"], mode="lines", name="Drawdown"))
-    fig_dd.update_layout(
-        title=f"{title} — Drawdown",
-        height=220,
-        margin=dict(l=40, r=40, t=50, b=40),
-        hovermode="x unified",
-        xaxis=dict(title="Date", showgrid=False),
-        yaxis=dict(title="Drawdown", tickformat=".0%"),
-        template="plotly_white",
-    )
-    st.plotly_chart(fig_dd, use_container_width=True)
-
-
-def pick_single_row(df: pd.DataFrame, key: str, label_col: str = "Ticker", column_config=None):
-    if df is None or df.empty or label_col not in df.columns:
-        st.dataframe(df, use_container_width=True)
-        return None
-
-    view = df.reset_index(drop=True)
-    event = st.dataframe(
-        view,
-        hide_index=True,
-        use_container_width=True,
-        key=key,
-        on_select="rerun",
-        selection_mode="single-row",
-        column_config=column_config,
-    )
-
-    rows = getattr(event, "selection", {}).get("rows", []) if hasattr(event, "selection") else []
-    if not rows:
-        return None
-
-    val = str(view.iloc[rows[0]][label_col])
-    if val == "TOTAL":
-        return None
-    return val
-
-
-def _trade_markers_for_ticker(trades_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    if trades_df is None or trades_df.empty:
-        return pd.DataFrame(columns=["Date", "Action", "Price"])
-    x = trades_df[trades_df["Ticker"] == ticker].copy()
-    if x.empty:
-        return x
-    x["Date"] = pd.to_datetime(x["Date"])
-    return x.sort_values("Date")
-
-
-def plot_ticker_price_with_trades_and_momentum(
-    base_df: pd.DataFrame,
-    trades_df: pd.DataFrame,
-    score_df: pd.DataFrame,
-    ticker: str,
-    lookback_days: int = 500
-):
-    if not ticker:
-        return
-
-    px = base_df[base_df["Ticker"] == ticker].copy()
-    if px.empty:
-        st.warning(f"No price history for {ticker}")
-        return
-
-    px = px.sort_values("Date")
-    if lookback_days and len(px) > lookback_days:
-        px = px.tail(lookback_days)
-
-    sc = score_df[score_df["Ticker"] == ticker].copy() if score_df is not None else pd.DataFrame()
-    if not sc.empty:
-        sc["Date"] = pd.to_datetime(sc["Date"])
-        sc = sc.sort_values("Date")
-        if lookback_days and len(sc) > lookback_days:
-            sc = sc.tail(lookback_days)
-
-    tdf = _trade_markers_for_ticker(trades_df, ticker)
-
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.06,
-        row_heights=[0.68, 0.32],
-    )
-
-    has_ohlc = all(c in px.columns for c in ["Open", "High", "Low", "Close"])
-
-    if has_ohlc:
-        fig.add_trace(
-            go.Candlestick(
-                x=px["Date"], open=px["Open"], high=px["High"], low=px["Low"], close=px["Close"],
-                name="Price",
-            ),
-            row=1, col=1
-        )
-    else:
-        fig.add_trace(go.Scatter(x=px["Date"], y=px["Price"], mode="lines", name="Price"), row=1, col=1)
-
-    if not tdf.empty:
-        if "Price" not in tdf.columns or tdf["Price"].isna().all():
-            s = px.set_index("Date")["Price"]
-            tdf["Price"] = [float(s.loc[:d].iloc[-1]) if len(s.loc[:d]) else np.nan for d in tdf["Date"]]
-
-        def add_marker(action, symbol):
-            sub = tdf[tdf["Action"].str.upper() == action].copy()
-            if sub.empty:
-                return
-            fig.add_trace(
-                go.Scatter(
-                    x=sub["Date"], y=sub["Price"],
-                    mode="markers+text",
-                    text=[action] * len(sub),
-                    textposition="top center",
-                    name=action,
-                    marker=dict(size=11, symbol=symbol),
-                ),
-                row=1, col=1
-            )
-
-        add_marker("BUY", "triangle-up")
-        add_marker("SELL", "triangle-down")
-        add_marker("RESIZE", "diamond")
-
-    if not sc.empty:
-        fig.add_trace(go.Scatter(x=sc["Date"], y=sc["Momentum Score"], mode="lines", name="Momentum Score"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=sc["Date"], y=sc["Early Momentum Score"], mode="lines", name="Early Momentum"), row=2, col=1)
-    else:
-        fig.add_trace(go.Scatter(x=[], y=[], mode="lines", name="Momentum Score"), row=2, col=1)
-
-    fig.update_layout(
-        height=720,
-        margin=dict(l=30, r=20, t=40, b=30),
-        hovermode="x unified",
-        xaxis_rangeslider_visible=False,
-        template="plotly_white",
-        title=f"{ticker} — Price + Trades + Momentum"
-    )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Momentum", row=2, col=1)
-
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# ============================================================
-# PIPELINE
-# ============================================================
-
-@st.cache_data(show_spinner=False)
-def run_full_pipeline():
-    parquet_path = "artifacts/index_constituents_5yr.parquet"
-    index_path = "artifacts/index_returns_5y.parquet"
-
-    DAILY_TOP_N = 10
-    FINAL_TOP_N = 10
-    LOOKBACK_DAYS = 10
-    WINDOWS = (5, 10, 30, 45, 60, 90)
-
-    W_MOM = 0.50
-    W_EARLY = 0.30
-    W_CONS = 0.20
-
-    base = load_price_data_parquet(parquet_path)
-    base = filter_by_index(base, "SP500")
-    idx = load_index_returns_parquet(index_path)
-
-    # ---------------- Bucket A (absolute) ----------------
-    dfA = calculate_momentum_features(add_absolute_returns(base), windows=WINDOWS)
-    dfA = add_regime_momentum_score(dfA)
-    dfA = add_regime_acceleration(dfA)
-    dfA = add_regime_residual_momentum(dfA)
-    dfA = add_regime_early_momentum(dfA)
-
-    priceA = dfA.pivot(index="Date", columns="Ticker", values="Price").sort_index()
-    dailyA = build_daily_lists(dfA, top_n=DAILY_TOP_N)
-
-    # ---------------- Bucket B (relative) ----------------
-    dfB = base.copy()
-    dfB = dfB.merge(
-        idx,
-        left_on=["Date", "Index"],
-        right_on=["date", "index"],
-        how="left",
-        validate="many_to_one"
-    ).drop(columns=["date", "index"], errors="ignore")
-
-    dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
-
-    # Use same return feature factory (absolute 1D return) to build 5/10/30... stock return features
-    dfB = calculate_momentum_features(add_absolute_returns(dfB), windows=WINDOWS)
-
-    # Merge index momentum features idx_5D..idx_90D
-    idx_mom = compute_index_momentum(idx, windows=WINDOWS)
-    dfB = dfB.merge(
-        idx_mom[["date", "index", "idx_5D", "idx_10D", "idx_30D", "idx_45D", "idx_60D", "idx_90D"]],
-        left_on=["Date", "Index"],
-        right_on=["date", "index"],
-        how="left"
-    ).drop(columns=["date", "index"], errors="ignore")
-
-    # Relative regime scoring (sets Momentum_* and Momentum Score)
-    dfB = add_relative_regime_momentum_score(dfB)
-
-    # Filters (as in your original long version)
-    dfB = dfB[dfB["Momentum_Slow"] > 1].copy()
-    dfB = dfB[dfB["Momentum_Mid"] > 0.5].copy()
-    dfB = dfB[dfB["Momentum_Fast"] > 1].copy()
-
-    # Early momentum scaffolding (same functions, now applied to relative regimes)
-    dfB = add_regime_acceleration(dfB)
-    dfB = add_regime_residual_momentum(dfB)
-    dfB = add_regime_early_momentum(dfB)
-
-    dailyB = build_daily_lists(dfB, top_n=DAILY_TOP_N)
-
-    # ---------------- Bucket C (unified) backtest ----------------
-    histU, tradesU = simulate_unified_portfolio(
-        df_prices=base,
-        price_table=priceA,          # same as your existing version
-        dailyA=dailyA,
-        dailyB=dailyB,
-        lookback_days=LOOKBACK_DAYS,
-        w_momentum=W_MOM,
-        w_early=W_EARLY,
-        w_consistency=W_CONS,
-        top_n=FINAL_TOP_N,
-        total_capital=100_000.0,
-        weight_A=0.20,
-        weight_B=0.80
-    )
-
-    statsU = compute_performance_stats(histU)
-    trade_statsU = compute_trade_stats(tradesU)
-
-    scoreA = dfA[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
-    scoreB = dfB[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
-
-    return {
-        "params": {
-            "DAILY_TOP_N": DAILY_TOP_N,
-            "FINAL_TOP_N": FINAL_TOP_N,
-            "LOOKBACK_DAYS": LOOKBACK_DAYS,
-            "WINDOWS": WINDOWS,
-            "W_MOM": W_MOM,
-            "W_EARLY": W_EARLY,
-            "W_CONS": W_CONS,
-        },
-        "BucketC": {"history": histU, "trades": tradesU, "stats": statsU, "trade_stats": trade_statsU},
-        "internals": {
-            "base": base,
-            "dailyA": dailyA,
-            "dailyB": dailyB,
-            "scoreA": scoreA,
-            "scoreB": scoreB,
-            "priceA": priceA
-        }
-    }
-
-
 def build_bucket_c_signal_preview(
     dailyA,
     dailyB,
@@ -972,9 +891,7 @@ def build_bucket_c_signal_preview(
         "Sector", "Industry",
     ]
 
-
-    out["Consistency"] = out["Consistency"] * 100.0   # convert to %
-
+    out["Consistency"] = out["Consistency"] * 100.0  # convert to %
 
     cols = [c for c in cols if c in out.columns]
     out = out[cols].sort_values(["Signal_Confidence", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
@@ -983,154 +900,211 @@ def build_bucket_c_signal_preview(
 
 
 # ============================================================
-# UI (2 TABS)
+# 6. RAW REFRESH + REFERENCE BUILD
 # ============================================================
 
-st.title("📈 Momentum Portfolio")
+def refresh_raw_parquets():
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-with st.spinner("Running full pipeline from artifacts…"):
-    out = run_full_pipeline()
+    # ---------- Build universes ----------
+    sp500 = get_sp500_universe()
+    hsi = get_hsi_universe()
+    sti = get_sti_universe()
 
-params = out["params"]
-bucketC = out["BucketC"]
-internals = out["internals"]
+    # ---------- Download constituents ----------
+    frames = []
+    frames += download_5yr_ohlc(sp500["Ticker"].tolist(), "SP500")
+    frames += download_5yr_ohlc(hsi["Ticker"].tolist(), "HSI")
+    frames += download_5yr_ohlc(sti["Ticker"].tolist(), "STI")
 
-base = internals["base"]
-dailyA = internals["dailyA"]
-dailyB = internals["dailyB"]
-scoreA = internals["scoreA"]
-scoreB = internals["scoreB"]
+    full_constituents = pd.concat(frames, ignore_index=True)
+    full_constituents.to_parquet(RAW_CONSTITUENTS_PATH, index=False)
+    print(f"Saved {RAW_CONSTITUENTS_PATH}")
 
-hist = bucketC["history"]
-trades = bucketC["trades"]
-stats = bucketC["stats"]
-trade_stats = bucketC["trade_stats"]
+    # ---------- Download index returns ----------
+    index_map = {
+        "^GSPC": "SP500",
+        "^HSI": "HSI",
+        "^STI": "STI",
+        "^VIX": "VIX",
+    }
 
-common_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
-signal_date = common_dates[-1] if common_dates else None
+    idx_frames = []
+    for t, lbl in index_map.items():
+        df = download_index_5y(t, lbl)
+        if df is not None:
+            idx_frames.append(df)
 
-if signal_date is None:
-    st.error("No overlapping signal dates between Bucket A and Bucket B (cannot build Bucket C signals).")
-    st.stop()
+    full_index = pd.concat(idx_frames, ignore_index=True)
+    full_index.to_parquet(RAW_INDEX_RETURNS_PATH, index=False)
+    print(f"Saved {RAW_INDEX_RETURNS_PATH}")
 
-tab_signals, tab_backtest = st.tabs(["Signals", "Backtest Results"])
+    return full_constituents
 
-with tab_signals:
-    st.markdown("### Next Rebalance Preview (Option A)")
 
-    st.caption(
-        f"Signals as of **{signal_date.date()}** · "
-        f"Lookback: last **{params['LOOKBACK_DAYS']}** trading days · "
-        f"Rebalance: Month-end"
-    )
+def build_reference_parquets():
+    # (Same params as Streamlit)
+    DAILY_TOP_N = 10
+    FINAL_TOP_N = 10
+    LOOKBACK_DAYS = 10
+    WINDOWS = (5, 10, 30, 45, 60, 90)
 
-    # Optional: choose which score series to show in the chart (does not affect signals)
-    chart_source = st.radio(
-        "Chart momentum source (visual only)",
-        options=["Absolute (A)", "Relative (B)"],
-        horizontal=True,
-        index=0
-    )
-    score_for_chart = scoreA if chart_source.startswith("Absolute") else scoreB
+    W_MOM = 0.50
+    W_EARLY = 0.30
+    W_CONS = 0.20
 
-    preview = build_bucket_c_signal_preview(
+    # Load raw artifacts (just refreshed)
+    base = load_price_data_parquet(RAW_CONSTITUENTS_PATH)
+    base = filter_by_index(base, "SP500")
+    idx = load_index_returns_parquet(RAW_INDEX_RETURNS_PATH)
+
+    # Save base SP500 for Streamlit charts
+    base.to_parquet(BASE_SP500_PATH, index=False)
+    print(f"Saved {BASE_SP500_PATH}")
+
+    # ---------------- Bucket A (absolute) ----------------
+    dfA = calculate_momentum_features(add_absolute_returns(base), windows=WINDOWS)
+    dfA = add_regime_momentum_score(dfA)
+    dfA = add_regime_acceleration(dfA)
+    dfA = add_regime_residual_momentum(dfA)
+    dfA = add_regime_early_momentum(dfA)
+
+    priceA = dfA.pivot(index="Date", columns="Ticker", values="Price").sort_index()
+    dailyA = build_daily_lists(dfA, top_n=DAILY_TOP_N)
+
+    scoreA = dfA[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
+
+    dailyA.to_parquet(DAILYA_PATH, index=False)
+    scoreA.to_parquet(SCOREA_PATH, index=False)
+    priceA.reset_index().to_parquet(PRICEA_PATH, index=False)
+
+    print(f"Saved {DAILYA_PATH}")
+    print(f"Saved {SCOREA_PATH}")
+    print(f"Saved {PRICEA_PATH}")
+
+    # ---------------- Bucket B (relative) ----------------
+    dfB = base.copy()
+    dfB = dfB.merge(
+        idx,
+        left_on=["Date", "Index"],
+        right_on=["date", "index"],
+        how="left",
+        validate="many_to_one"
+    ).drop(columns=["date", "index"], errors="ignore")
+
+    dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
+
+    dfB = calculate_momentum_features(add_absolute_returns(dfB), windows=WINDOWS)
+
+    idx_mom = compute_index_momentum(idx, windows=WINDOWS)
+    dfB = dfB.merge(
+        idx_mom[["date", "index", "idx_5D", "idx_10D", "idx_30D", "idx_45D", "idx_60D", "idx_90D"]],
+        left_on=["Date", "Index"],
+        right_on=["date", "index"],
+        how="left"
+    ).drop(columns=["date", "index"], errors="ignore")
+
+    dfB = add_relative_regime_momentum_score(dfB)
+
+    # Filters (as in your original long version)
+    dfB = dfB[dfB["Momentum_Slow"] > 1].copy()
+    dfB = dfB[dfB["Momentum_Mid"] > 0.5].copy()
+    dfB = dfB[dfB["Momentum_Fast"] > 1].copy()
+
+    dfB = add_regime_acceleration(dfB)
+    dfB = add_regime_residual_momentum(dfB)
+    dfB = add_regime_early_momentum(dfB)
+
+    dailyB = build_daily_lists(dfB, top_n=DAILY_TOP_N)
+    scoreB = dfB[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
+
+    dailyB.to_parquet(DAILYB_PATH, index=False)
+    scoreB.to_parquet(SCOREB_PATH, index=False)
+
+    print(f"Saved {DAILYB_PATH}")
+    print(f"Saved {SCOREB_PATH}")
+
+    # ---------------- Bucket C (unified) backtest ----------------
+    histU, tradesU = simulate_unified_portfolio(
+        df_prices=base,
+        price_table=priceA,
         dailyA=dailyA,
         dailyB=dailyB,
-        as_of_date=signal_date,
-        lookback_days=params["LOOKBACK_DAYS"],
-        w_momentum=params["W_MOM"],
-        w_early=params["W_EARLY"],
-        w_consistency=params["W_CONS"],
-        top_n=params["FINAL_TOP_N"],
+        lookback_days=LOOKBACK_DAYS,
+        w_momentum=W_MOM,
+        w_early=W_EARLY,
+        w_consistency=W_CONS,
+        top_n=FINAL_TOP_N,
         total_capital=100_000.0,
         weight_A=0.20,
         weight_B=0.80
     )
 
-    tickers = tuple(preview["Ticker"].astype(str).unique())
-    meta = fetch_yahoo_metadata(tickers)
-    preview = preview.merge(meta, on="Ticker", how="left")
+    statsU = compute_performance_stats(histU)
+    trade_statsU = compute_trade_stats(tradesU)
 
-    st.markdown("### Sector exposure")
+    histU.to_parquet(BUCKETC_HISTORY_PATH, index=False)
+    tradesU.to_parquet(BUCKETC_TRADES_PATH, index=False)
 
-    sector_df = preview.copy()
-    sector_df["Sector"] = sector_df["Sector"].fillna("Unknown")
-    
-    # Use Weight_% if present; fallback to Target_$ if you prefer
-    if "Weight_%" in sector_df.columns and sector_df["Weight_%"].notna().any():
-        expo = sector_df.groupby("Sector", as_index=False)["Weight_%"].sum()
-        values_col = "Weight_%"
-        title = "Sector Exposure (by weight %)"
-    else:
-        expo = sector_df.groupby("Sector", as_index=False)["Target_$"].sum()
-        values_col = "Target_$"
-        title = "Sector Exposure (by $)"
-    
-    fig_sector = go.Figure(
-        data=[go.Pie(labels=expo["Sector"], values=expo[values_col], hole=0.45)]
-    )
-    fig_sector.update_layout(
-        title=title,
-        height=380,
-        margin=dict(l=20, r=20, t=60, b=20),
-        template="plotly_white"
-    )
-    st.plotly_chart(fig_sector, use_container_width=True)
+    pd.DataFrame([{"Metric": k, "Value": v} for k, v in statsU.items()]).to_parquet(BUCKETC_STATS_PATH, index=False)
+    pd.DataFrame([{"Metric": k, "Value": v} for k, v in trade_statsU.items()]).to_parquet(BUCKETC_TRADE_STATS_PATH, index=False)
 
+    print(f"Saved {BUCKETC_HISTORY_PATH}")
+    print(f"Saved {BUCKETC_TRADES_PATH}")
+    print(f"Saved {BUCKETC_STATS_PATH}")
+    print(f"Saved {BUCKETC_TRADE_STATS_PATH}")
 
+    # ---------------- Latest preview (ready-to-display) ----------------
+    common_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
+    signal_date = common_dates[-1] if common_dates else None
+    if signal_date is None:
+        print("WARNING: No overlapping signal dates between dailyA and dailyB. Preview not saved.")
+        return
 
-    if preview.empty:
-        st.info("No signals available.")
-    else:
-        st.markdown("#### Target portfolio (click a row to update chart)")
-        battery_cfg = {
-            "Signal_Confidence": st.column_config.ProgressColumn(
-                "Signal Strength",
-                min_value=0,
-                max_value=100,
-                format="%d%%",
-            )
-        }
-
-        selected = pick_single_row(
-            preview,
-            key="signal_preview",
-            label_col="Ticker",
-            column_config=battery_cfg
-        )
-
-        if selected:
-            st.markdown("#### Selected ticker chart")
-            plot_ticker_price_with_trades_and_momentum(
-                base_df=base,
-                trades_df=trades,
-                score_df=score_for_chart,
-                ticker=selected,
-                lookback_days=500
-            )
-
-with tab_backtest:
-    st.markdown("### Backtest Results (Bucket C)")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Return (%)", f"{stats.get('Total Return (%)', np.nan):.2f}")
-    c2.metric("CAGR (%)", f"{stats.get('CAGR (%)', np.nan):.2f}")
-    c3.metric("Sharpe", f"{stats.get('Sharpe Ratio', np.nan):.2f}")
-    c4.metric("Max Drawdown (%)", f"{stats.get('Max Drawdown (%)', np.nan):.2f}")
-
-    st.markdown("### Equity & Drawdown")
-    plot_equity_and_drawdown(hist, title="Momentum Portfolio")
-
-    st.markdown("### Trade Statistics")
-    st.dataframe(
-        pd.DataFrame({"Metric": list(trade_stats.keys()), "Value": list(trade_stats.values())}),
-        use_container_width=True
+    preview = build_bucket_c_signal_preview(
+        dailyA=dailyA,
+        dailyB=dailyB,
+        as_of_date=signal_date,
+        lookback_days=LOOKBACK_DAYS,
+        w_momentum=W_MOM,
+        w_early=W_EARLY,
+        w_consistency=W_CONS,
+        top_n=FINAL_TOP_N,
+        total_capital=100_000.0,
+        weight_A=0.20,
+        weight_B=0.80
     )
 
-    with st.expander("Show full backtest trades"):
-        if trades is None or trades.empty:
-            st.write("No trades.")
-        else:
-            x = trades.copy()
-            x["Date"] = pd.to_datetime(x["Date"])
-            st.dataframe(x.sort_values("Date"), use_container_width=True)
+    # Full-universe metadata cache (incremental)
+    # Use ALL tickers present in raw constituents parquet (SP500+HSI+STI)
+    raw_const = pd.read_parquet(RAW_CONSTITUENTS_PATH)
+    universe_tickers = sorted(raw_const["Ticker"].astype(str).unique().tolist())
+    meta = update_metadata_cache(universe_tickers, cache_path=YAHOO_META_CACHE_PATH, ttl_days=90, sleep_s=0.0)
+
+    preview = preview.drop(columns=["Name", "Sector", "Industry"], errors="ignore").merge(
+        meta[["Ticker", "Name", "Sector", "Industry"]],
+        on="Ticker",
+        how="left"
+    )
+
+    # Stamp the signal date (handy for UI)
+    preview["Signal_Date"] = pd.to_datetime(signal_date)
+
+    preview.to_parquet(PREVIEW_LATEST_PATH, index=False)
+    print(f"Saved {PREVIEW_LATEST_PATH}")
+
+
+def main():
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+
+    # 1) Refresh raw parquets
+    refresh_raw_parquets()
+
+    # 2) Build reference parquets (heavy lifting)
+    build_reference_parquets()
+
+    print("\n✅ Overnight batch complete.")
+
+
+if __name__ == "__main__":
+    main()
