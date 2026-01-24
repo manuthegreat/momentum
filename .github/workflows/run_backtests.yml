@@ -2,6 +2,10 @@ name: Run Backtests
 
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Daily Market Data Update"]
+    types:
+      - completed
 
 concurrency:
   group: run-backtests-main
@@ -9,6 +13,7 @@ concurrency:
 
 jobs:
   run-backtests:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
     steps:
