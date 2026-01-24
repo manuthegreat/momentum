@@ -33,9 +33,19 @@ def _format_percentage(series: pd.Series, decimals: int = 0) -> pd.Series:
 
 def _normalize_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     try:
-        return frame.convert_dtypes(dtype_backend="numpy_nullable")
+        normalized = frame.convert_dtypes(dtype_backend="numpy_nullable")
     except TypeError:
-        return frame.convert_dtypes()
+        normalized = frame.convert_dtypes()
+
+    for column in normalized.columns:
+        dtype = normalized[column].dtype
+        dtype_name = str(dtype).lower()
+        if "string" in dtype_name or "unicode" in dtype_name:
+            normalized[column] = normalized[column].astype("string[python]")
+        elif "arrow" in dtype_name and "large" in dtype_name:
+            normalized[column] = normalized[column].astype(object)
+
+    return normalized
 
 
 @st.cache_data(show_spinner=False)
