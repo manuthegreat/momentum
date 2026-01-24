@@ -4,4 +4,5 @@ pyarrow
 yfinance
 matplotlib
 streamlit
+altair==4.2.2
 plotly
