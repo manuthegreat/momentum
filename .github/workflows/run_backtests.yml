@@ -27,6 +27,7 @@ jobs:
       - name: Run backtest pipeline
         run: |
           python -m updater.run_backtest_systems
+          python updater/run_backtest_systems.py
 
       - name: Commit backtest artifacts
         run: |
