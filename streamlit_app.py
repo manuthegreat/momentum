@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 import pandas as pd
@@ -18,6 +19,13 @@ WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals.parquet"
 FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals.parquet")
 MOMENTUM_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "momentum_bucketc_signals.parquet")
 ACTION_LIST_PATH = os.path.join(ARTIFACTS_DIR, "action_list.parquet")
+BACKTEST_EQUITY_S1_PATH = os.path.join(ARTIFACTS_DIR, "backtest_equity_system1.parquet")
+BACKTEST_EQUITY_S2_PATH = os.path.join(ARTIFACTS_DIR, "backtest_equity_system2.parquet")
+BACKTEST_EQUITY_S3_PATH = os.path.join(ARTIFACTS_DIR, "backtest_equity_system3.parquet")
+BACKTEST_EQUITY_COMBINED_PATH = os.path.join(ARTIFACTS_DIR, "backtest_equity_combined.parquet")
+BACKTEST_TRADES_PATH = os.path.join(ARTIFACTS_DIR, "backtest_trades.parquet")
+BACKTEST_POSITIONS_PATH = os.path.join(ARTIFACTS_DIR, "backtest_positions.parquet")
+BACKTEST_STATS_PATH = os.path.join(ARTIFACTS_DIR, "backtest_stats.json")
 
 st.set_page_config(page_title="Momentum Signals Dashboard", layout="wide")
 
@@ -88,6 +96,51 @@ def load_signal_artifacts():
     return weekly, fib, mom, action_list
 
 
+@st.cache_data(show_spinner=False)
+def load_backtest_artifacts():
+    required = [
+        BACKTEST_EQUITY_S1_PATH,
+        BACKTEST_EQUITY_S2_PATH,
+        BACKTEST_EQUITY_S3_PATH,
+        BACKTEST_EQUITY_COMBINED_PATH,
+        BACKTEST_TRADES_PATH,
+        BACKTEST_POSITIONS_PATH,
+    ]
+    if not all(os.path.exists(path) for path in required):
+        return None
+
+    equity_s1 = _normalize_dataframe(pd.read_parquet(BACKTEST_EQUITY_S1_PATH))
+    equity_s2 = _normalize_dataframe(pd.read_parquet(BACKTEST_EQUITY_S2_PATH))
+    equity_s3 = _normalize_dataframe(pd.read_parquet(BACKTEST_EQUITY_S3_PATH))
+    equity_combined = _normalize_dataframe(pd.read_parquet(BACKTEST_EQUITY_COMBINED_PATH))
+    trades = _normalize_dataframe(pd.read_parquet(BACKTEST_TRADES_PATH))
+    positions = _normalize_dataframe(pd.read_parquet(BACKTEST_POSITIONS_PATH))
+
+    stats = None
+    if os.path.exists(BACKTEST_STATS_PATH):
+        with open(BACKTEST_STATS_PATH, "r") as f:
+            stats = json.load(f)
+
+    for frame in (equity_s1, equity_s2, equity_s3, equity_combined, trades, positions):
+        if "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"])
+        if "entry_date" in frame.columns:
+            frame["entry_date"] = pd.to_datetime(frame["entry_date"])
+
+    if stats is not None:
+        stats = pd.DataFrame(stats).T.reset_index().rename(columns={"index": "Portfolio"})
+
+    return {
+        "equity_s1": equity_s1,
+        "equity_s2": equity_s2,
+        "equity_s3": equity_s3,
+        "equity_combined": equity_combined,
+        "trades": trades,
+        "positions": positions,
+        "stats": stats,
+    }
+
+
 st.title("📊 Consolidated Momentum Signals")
 
 try:
@@ -104,8 +157,8 @@ c3.metric("Momentum Bucket C", f"{len(mom_sig):,}")
 c4.metric("Action List", f"{len(action_list):,}")
 
 
-tab_weekly, tab_fib, tab_mom, tab_action = st.tabs(
-    ["Weekly Swing", "Fibonacci", "Momentum Bucket C", "Action List"]
+tab_weekly, tab_fib, tab_mom, tab_action, tab_backtest = st.tabs(
+    ["Weekly Swing", "Fibonacci", "Momentum Bucket C", "Action List", "Backtests"]
 )
 
 with tab_weekly:
@@ -197,3 +250,50 @@ with tab_action:
             if "mom_conf" in view.columns:
                 view["mom_conf"] = _format_percentage(view["mom_conf"], decimals=0)
             st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
+
+with tab_backtest:
+    st.markdown("### Backtested Results")
+    backtests = load_backtest_artifacts()
+
+    if backtests is None:
+        st.info(
+            "Backtest artifacts not found. Run `python updater/run_backtest_systems.py` "
+            "after the daily update to generate them."
+        )
+    else:
+        stats = backtests["stats"]
+        if stats is not None and not stats.empty:
+            st.subheader("Summary Stats")
+            st.dataframe(_streamlit_safe_frame(stats), use_container_width=True)
+
+        st.subheader("Equity Curves")
+        equity_combined = backtests["equity_combined"]
+        if not equity_combined.empty:
+            st.line_chart(equity_combined.set_index("date")["equity_usd"], height=220)
+
+        cols = st.columns(3)
+        for col, key, label in zip(
+            cols,
+            ["equity_s1", "equity_s2", "equity_s3"],
+            ["System 1 (Weekly)", "System 2 (Fib)", "System 3 (Momentum)"],
+        ):
+            data = backtests[key]
+            if data.empty:
+                continue
+            with col:
+                st.caption(label)
+                st.line_chart(data.set_index("date")["equity_usd"], height=160)
+
+        st.subheader("Recent Trades")
+        trades = backtests["trades"]
+        if trades.empty:
+            st.info("No trades found in the backtest output.")
+        else:
+            st.dataframe(_streamlit_safe_frame(trades.tail(200)), use_container_width=True)
+
+        st.subheader("Open Positions (End of Backtest)")
+        positions = backtests["positions"]
+        if positions.empty:
+            st.info("No open positions at the end of the backtest.")
+        else:
+            st.dataframe(_streamlit_safe_frame(positions), use_container_width=True)
