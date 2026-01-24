@@ -1,55 +1,43 @@
 # update_parquet.py
 # Nightly batch job:
-# 1) Refresh raw artifacts (constituents OHLC + index returns)
-# 2) Run the EXACT SAME pipeline you previously ran inside Streamlit
-# 3) Persist "reference" parquets so Streamlit becomes UI-only
-#
-# IMPORTANT: Core calculation logic has been copied verbatim from streamlit_app.py
-#           (only packaging / persistence / caching has been added).
+# 1) Refresh raw artifacts (constituents OHLC + index returns) from Yahoo
+# 2) Run consolidated signals pipeline (Weekly Swing, Fibonacci, Momentum Bucket C)
+# 3) Persist signal parquets so Streamlit becomes UI-only
 
 from __future__ import annotations
 
 import os
-import time
-from datetime import datetime, timedelta
+import warnings
+from dataclasses import dataclass
+from io import StringIO
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from io import StringIO
+
+warnings.filterwarnings("ignore")
 
 ARTIFACTS_DIR = "artifacts"
 
 RAW_CONSTITUENTS_PATH = os.path.join(ARTIFACTS_DIR, "index_constituents_5yr.parquet")
 RAW_INDEX_RETURNS_PATH = os.path.join(ARTIFACTS_DIR, "index_returns_5y.parquet")
 
-# Reference outputs (consumed by Streamlit UI)
-BASE_SP500_PATH = os.path.join(ARTIFACTS_DIR, "base_SP500_5y.parquet")
-DAILYA_PATH = os.path.join(ARTIFACTS_DIR, "dailyA.parquet")
-DAILYB_PATH = os.path.join(ARTIFACTS_DIR, "dailyB.parquet")
-SCOREA_PATH = os.path.join(ARTIFACTS_DIR, "scoreA.parquet")
-SCOREB_PATH = os.path.join(ARTIFACTS_DIR, "scoreB.parquet")
-PRICEA_PATH = os.path.join(ARTIFACTS_DIR, "priceA.parquet")
-
-BUCKETC_HISTORY_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_history.parquet")
-BUCKETC_TRADES_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_trades.parquet")
-BUCKETC_STATS_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_stats.parquet")
-BUCKETC_TRADE_STATS_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_trade_stats.parquet")
-
-PREVIEW_LATEST_PATH = os.path.join(ARTIFACTS_DIR, "bucketC_preview_latest.parquet")
-
-YAHOO_META_CACHE_PATH = os.path.join(ARTIFACTS_DIR, "yahoo_metadata.parquet")
+WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals.parquet")
+FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals.parquet")
+MOMENTUM_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "momentum_bucketc_signals.parquet")
+ACTION_LIST_PATH = os.path.join(ARTIFACTS_DIR, "action_list.parquet")
 
 
 # ============================================================
-# 1. UNIVERSE BUILDERS (RAW)
+# 1) UNIVERSE BUILDERS (RAW)
 # ============================================================
 
-def get_sp500_universe():
+def get_sp500_universe() -> pd.DataFrame:
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers)
+    r = requests.get(url, headers=headers, timeout=30)
     tables = pd.read_html(StringIO(r.text))
 
     for t in tables:
@@ -64,10 +52,10 @@ def get_sp500_universe():
     return df[["Ticker", "Name", "Sector"]]
 
 
-def get_hsi_universe():
+def get_hsi_universe() -> pd.DataFrame:
     url = "https://en.wikipedia.org/wiki/Hang_Seng_Index"
     headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers)
+    r = requests.get(url, headers=headers, timeout=30)
     tables = pd.read_html(StringIO(r.text))
 
     df = None
@@ -84,7 +72,7 @@ def get_hsi_universe():
 
     ticker_col = next(
         (c for c in df.columns if "ticker" in c or "code" in c or "sehk" in c),
-        None
+        None,
     )
     if ticker_col is None:
         raise ValueError("No HSI ticker column")
@@ -112,7 +100,7 @@ def get_hsi_universe():
     return df[["Ticker", "Name", "Sector"]]
 
 
-def get_sti_universe():
+def get_sti_universe() -> pd.DataFrame:
     data = [
         ("D05.SI", "DBS Group Holdings", "Financials"),
         ("U11.SI", "United Overseas Bank", "Financials"),
@@ -126,7 +114,7 @@ def get_sti_universe():
 
 
 # ============================================================
-# 2. DOWNLOAD CONSTITUENT OHLC (5Y) (RAW)
+# 2) DOWNLOAD CONSTITUENT OHLC (5Y) (RAW)
 # ============================================================
 
 def download_5yr_ohlc(tickers, label):
@@ -142,7 +130,7 @@ def download_5yr_ohlc(tickers, label):
             group_by="ticker",
             auto_adjust=False,
             threads=True,
-            progress=False
+            progress=False,
         )
 
         for t in batch:
@@ -161,7 +149,7 @@ def download_5yr_ohlc(tickers, label):
 
 
 # ============================================================
-# 3. DOWNLOAD INDEX RETURNS (5Y) (RAW)
+# 3) DOWNLOAD INDEX RETURNS (5Y) (RAW)
 # ============================================================
 
 def download_index_5y(ticker, label):
@@ -170,7 +158,7 @@ def download_index_5y(ticker, label):
         period="5y",
         interval="1d",
         auto_adjust=False,
-        progress=False
+        progress=False,
     )
 
     if df is None or df.empty:
@@ -194,221 +182,763 @@ def download_index_5y(ticker, label):
 
 
 # ============================================================
-# 4. YAHOO METADATA CACHE (FULL UNIVERSE, INCREMENTAL)
+# 4) LOAD + STANDARDIZE PARQUETS (PRICES + INDEX RETURNS)
 # ============================================================
 
-def _fetch_one_yahoo_metadata(ticker: str) -> dict:
-    name = sector = industry = None
-    try:
-        tk = yf.Ticker(ticker)
+def load_prices_from_parquet(path: str) -> pd.DataFrame:
+    df = pd.read_parquet(path).copy()
 
-        # 1) Try fast_info first (same as Streamlit)
-        fi = getattr(tk, "fast_info", {}) or {}
-        name = fi.get("shortName") or fi.get("longName")
+    colmap = {}
+    for c in df.columns:
+        cl = str(c).strip()
+        if cl.lower() == "date":
+            colmap[c] = "date"
+        elif cl.lower() == "ticker":
+            colmap[c] = "ticker"
+        elif cl.lower() == "index":
+            colmap[c] = "index"
+        elif cl.lower() == "open":
+            colmap[c] = "open"
+        elif cl.lower() == "high":
+            colmap[c] = "high"
+        elif cl.lower() == "low":
+            colmap[c] = "low"
+        elif cl.lower() == "close":
+            colmap[c] = "close"
+        elif cl.lower() in ("adj close", "adj_close", "adjclose"):
+            colmap[c] = "adj_close"
+        elif cl.lower() == "volume":
+            colmap[c] = "volume"
 
-        # 2) Try full info only if needed
-        info = tk.get_info() or {}
-        name = name or info.get("shortName") or info.get("longName")
-        sector = info.get("sector")
-        industry = info.get("industry")
+    df = df.rename(columns=colmap)
 
-    except Exception:
-        pass
-
-    return {"Ticker": ticker, "Name": name, "Sector": sector, "Industry": industry}
-
-
-def update_metadata_cache(
-    all_tickers: list[str],
-    cache_path: str = YAHOO_META_CACHE_PATH,
-    ttl_days: int = 90,
-    sleep_s: float = 0.0,
-) -> pd.DataFrame:
-    """
-    Full universe metadata, but incremental:
-    - Loads cache if exists
-    - Fetches missing tickers + tickers older than TTL
-    - Saves back to cache
-    """
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-
-    now = pd.Timestamp.utcnow().normalize()
-
-    if os.path.exists(cache_path):
-        cache = pd.read_parquet(cache_path)
-        if "LastUpdated" in cache.columns:
-            cache["LastUpdated"] = pd.to_datetime(cache["LastUpdated"], errors="coerce")
-        else:
-            cache["LastUpdated"] = pd.NaT
-    else:
-        cache = pd.DataFrame(columns=["Ticker", "Name", "Sector", "Industry", "LastUpdated"])
-
-    cache = cache.drop_duplicates(subset=["Ticker"], keep="last")
-    cache_tickers = set(cache["Ticker"].astype(str).tolist()) if not cache.empty else set()
-
-    all_set = set(map(str, all_tickers))
-    missing = sorted(list(all_set - cache_tickers))
-
-    stale = []
-    if not cache.empty:
-        cutoff = now - pd.Timedelta(days=ttl_days)
-        stale = cache.loc[cache["LastUpdated"].isna() | (cache["LastUpdated"] < cutoff), "Ticker"].astype(str).tolist()
-        stale = sorted(list(set(stale) & all_set))
-
-    to_fetch = sorted(list(set(missing + stale)))
-
-    if to_fetch:
-        print(f"\nYahoo metadata: fetching {len(to_fetch)} tickers (missing={len(missing)}, stale={len(stale)})")
-        rows = []
-        for i, t in enumerate(to_fetch, 1):
-            row = _fetch_one_yahoo_metadata(t)
-            row["LastUpdated"] = now
-            rows.append(row)
-
-            if sleep_s and i < len(to_fetch):
-                time.sleep(sleep_s)
-
-        upd = pd.DataFrame(rows)
-        cache = pd.concat([cache, upd], ignore_index=True)
-        cache = cache.drop_duplicates(subset=["Ticker"], keep="last")
-        cache.to_parquet(cache_path, index=False)
-        print(f"Saved metadata cache: {cache_path}")
-    else:
-        print("\nYahoo metadata: cache already up-to-date for this universe.")
-
-    return cache
-
-
-# ============================================================
-# 5. PIPELINE FUNCTIONS (COPIED FROM STREAMLIT, LOGIC UNCHANGED)
-# ============================================================
-
-def load_price_data_parquet(path: str) -> pd.DataFrame:
-    df = pd.read_parquet(path)
-    df["Date"] = pd.to_datetime(df["Date"])
-
-    ohlc_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
-
-    if "Adj Close" in df.columns:
-        df["Price"] = df["Adj Close"]
-    elif "Close" in df.columns:
-        df["Price"] = df["Close"]
-    else:
-        raise ValueError("No 'Adj Close' or 'Close' found in parquet.")
-
-    keep = ["Ticker", "Date", "Price", "Index"] + ohlc_cols
-    missing = [c for c in ["Ticker", "Date", "Price", "Index"] if c not in df.columns]
+    required = {"date", "ticker", "open", "high", "low", "close"}
+    missing = sorted(list(required - set(df.columns)))
     if missing:
-        raise ValueError(f"Missing required columns in price parquet: {missing}")
+        raise ValueError(f"Parquet missing required columns: {missing}. Found: {sorted(df.columns)}")
 
-    df = df[keep].drop_duplicates(subset=["Ticker", "Date"], keep="last")
-    df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
+    df["ticker"] = df["ticker"].astype(str)
+
+    if "index" not in df.columns:
+        df["index"] = "UNKNOWN"
+
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["date", "ticker", "open", "high", "low", "close"]).copy()
+    df = df.sort_values(["ticker", "date"]).drop_duplicates(subset=["ticker", "date"], keep="last").reset_index(drop=True)
+
+    df["turnover"] = df["close"].astype(float) * df["volume"].astype(float)
+
     return df
 
 
-def load_index_returns_parquet(path: str) -> pd.DataFrame:
-    idx = pd.read_parquet(path)
-    idx.columns = idx.columns.str.lower().str.replace(" ", "_")
-    idx["date"] = pd.to_datetime(idx["date"])
+def load_index_returns_from_parquet(path: str) -> pd.DataFrame:
+    idx = pd.read_parquet(path).copy()
+    idx.columns = [str(c).strip().lower() for c in idx.columns]
 
-    if "index_name" in idx.columns:
-        idx = idx.rename(columns={"index_name": "index"})
+    if "date" not in idx.columns:
+        raise ValueError(f"Index parquet missing 'date'. Found: {sorted(idx.columns)}")
+    if "index_name" not in idx.columns:
+        raise ValueError(f"Index parquet missing 'index_name'. Found: {sorted(idx.columns)}")
 
-    required = {"date", "close", "index"}
-    missing = required - set(idx.columns)
-    if missing:
-        raise ValueError(f"Missing required columns in index parquet: {sorted(missing)}")
+    idx["date"] = pd.to_datetime(idx["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    idx["index_name"] = idx["index_name"].astype(str).str.upper().str.strip()
 
-    frames = []
-    for _, g in idx.groupby("index"):
-        g = g.sort_values("date").copy()
-        close = g["close"]
+    for rc in ["ret_1d", "ret_5d", "ret_20d", "ret_60d"]:
+        if rc in idx.columns:
+            idx[rc] = pd.to_numeric(idx[rc], errors="coerce")
 
-        g["idx_ret_1d"] = close.pct_change()
-        g["idx_ret_20d"] = close.pct_change(20)
-        g["idx_ret_60d"] = close.pct_change(60)
-        g["idx_uptrend"] = (g["idx_ret_60d"] > 0).astype(int)
+    idx = idx.dropna(subset=["date", "index_name"]).copy()
+    idx = idx.sort_values(["index_name", "date"]).drop_duplicates(subset=["index_name", "date"], keep="last").reset_index(drop=True)
 
-        frames.append(g[["date", "index", "idx_ret_1d", "idx_ret_20d", "idx_ret_60d", "idx_uptrend"]])
-
-    return pd.concat(frames, ignore_index=True)
-
-
-def filter_by_index(df: pd.DataFrame, index_name: str) -> pd.DataFrame:
-    return df[df["Index"] == index_name].reset_index(drop=True)
-
-
-def add_absolute_returns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["1D Return"] = df.groupby("Ticker")["Price"].pct_change() + 1
-    return df
-
-
-def compute_index_momentum(idx: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90)) -> pd.DataFrame:
-    idx = idx.copy().sort_values(["index", "date"])
-    idx["idx_1d"] = 1.0 + idx["idx_ret_1d"]
-
-    for w in windows:
-        idx[f"idx_{w}D"] = (
-            idx.groupby("index")["idx_1d"]
-            .rolling(w, min_periods=w)
-            .apply(np.prod, raw=True)
-            .reset_index(level=0, drop=True) - 1
-        )
     return idx
 
 
-def calculate_momentum_features(df: pd.DataFrame, windows=(5, 10, 30, 45, 60, 90)) -> pd.DataFrame:
-    df = df.copy()
+def infer_index_name_for_row(ticker: str, index_col_val: str) -> str:
+    t = str(ticker).upper().strip()
+    idxv = str(index_col_val).upper().strip() if index_col_val is not None else ""
+
+    if "SP500" in idxv or "S&P" in idxv:
+        return "SP500"
+    if idxv == "HSI" or "HANG" in idxv:
+        return "HSI"
+    if idxv == "STI" or "STRAITS" in idxv:
+        return "STI"
+
+    if t.endswith(".HK"):
+        return "HSI"
+    if t.endswith(".SI"):
+        return "STI"
+    return "SP500"
+
+
+# ============================================================
+# 5) SYSTEM 1: WEEKLY SWING
+# ============================================================
+
+@dataclass
+class WeeklySwingConfig:
+    max_open_positions: int = 20
+    max_entries_per_day: int = 10
+
+    profit_target_mult: float = 1.10
+    holding_days_max: int = 30
+
+    tight_range_5d_max: float = 0.12
+    close_pos20_min: float = 0.60
+    sma20_slope_floor_mult: float = -0.002
+
+    pause_days_min: int = 4
+    pause_days_max: int = 9
+    pause_near_high_frac: float = 0.97
+    pause_range20_max: float = 0.22
+
+    fib_lookback: int = 10
+    fib_frac: float = 0.382
+
+    pullback_min_pct_below_close: float = 0.02
+    pullback_max_pct_below_close: float = 0.25
+    max_hh_dist_from_close: float = 0.20
+
+    turnover_baseline_days: int = 10
+    turnover_expansion_min_A: float = 1.0
+    turnover_expansion_min_C: float = 1.0
+
+    breakout_buffer_pct: float = 0.0
+
+    adv_turnover_20_min: float = 0.0
+
+
+def _hh_and_low_since_hh_py(high: np.ndarray, low: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(high)
+    hh = np.full(n, np.nan, dtype=float)
+    low_since = np.full(n, np.nan, dtype=float)
+
+    for i in range(n):
+        if i < window - 1:
+            continue
+        s = i - window + 1
+        win_high = high[s: i + 1]
+        win_low = low[s: i + 1]
+
+        k = int(np.argmax(win_high))
+        hh_i = float(win_high[k])
+        low_i = float(np.min(win_low[k:]))
+
+        hh[i] = hh_i
+        low_since[i] = low_i
+
+    return hh, low_since
+
+
+def weekly_add_indicators(df: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFrame:
+    d = df.sort_values(["ticker", "date"]).copy()
+
+    g = d.groupby("ticker", sort=False)
+
+    close = d["close"].astype(float)
+    d["sma20"] = g["close"].rolling(20, min_periods=20).mean().reset_index(level=0, drop=True)
+    d["sma50"] = g["close"].rolling(50, min_periods=50).mean().reset_index(level=0, drop=True)
+    d["sma20_slope5"] = d["sma20"] - g["sma20"].shift(5)
+
+    d["prev_close"] = g["close"].shift(1)
+    high = d["high"].astype(float)
+    low = d["low"].astype(float)
+    prev_close = d["prev_close"].astype(float)
+
+    tr1 = (high - low).to_numpy()
+    tr2 = (high - prev_close).abs().to_numpy()
+    tr3 = (low - prev_close).abs().to_numpy()
+    d["tr"] = np.maximum(tr1, np.maximum(tr2, tr3))
+
+    d["atr5"] = g["tr"].rolling(5, min_periods=5).mean().reset_index(level=0, drop=True)
+    d["atr20"] = g["tr"].rolling(20, min_periods=20).mean().reset_index(level=0, drop=True)
+
+    d["hh5"] = g["high"].rolling(5, min_periods=5).max().reset_index(level=0, drop=True)
+    d["ll5"] = g["low"].rolling(5, min_periods=5).min().reset_index(level=0, drop=True)
+    d["range5_pct"] = (d["hh5"] - d["ll5"]) / close
+
+    d["hh20"] = g["high"].rolling(20, min_periods=20).max().reset_index(level=0, drop=True)
+    d["ll20"] = g["low"].rolling(20, min_periods=20).min().reset_index(level=0, drop=True)
+    d["range20_pct"] = (d["hh20"] - d["ll20"]) / close
+
+    denom20 = (d["hh20"] - d["ll20"]).replace(0, np.nan)
+    d["close_pos_20"] = (close - d["ll20"]) / denom20
+
+    d["turnover_5d"] = g["turnover"].rolling(5, min_periods=5).sum().reset_index(level=0, drop=True)
+    d["adv_turnover_20"] = g["turnover"].rolling(20, min_periods=20).mean().reset_index(level=0, drop=True)
+
+    d["avg_turnover_10d"] = (
+        g["turnover"]
+        .rolling(cfg.turnover_baseline_days, min_periods=cfg.turnover_baseline_days)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    d["baseline_5d_turnover"] = d["avg_turnover_10d"] * 5.0
+
+    d["hh10_close"] = g["close"].rolling(10, min_periods=10).max().reset_index(level=0, drop=True)
+
+    d["hh_fib"] = np.nan
+    d["low_since_hh_fib"] = np.nan
+
+    for _, sub in d.groupby("ticker", sort=False):
+        if len(sub) < cfg.fib_lookback:
+            continue
+        hi = sub["high"].to_numpy(dtype=np.float64)
+        lo = sub["low"].to_numpy(dtype=np.float64)
+        hh, low_since = _hh_and_low_since_hh_py(hi, lo, cfg.fib_lookback)
+        d.loc[sub.index, "hh_fib"] = hh
+        d.loc[sub.index, "low_since_hh_fib"] = low_since
+
+    return d
+
+
+def weekly_universe_filter_parquet_only(df: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFrame:
+    needed = [
+        "sma20",
+        "sma50",
+        "sma20_slope5",
+        "atr5",
+        "atr20",
+        "hh5",
+        "ll5",
+        "range5_pct",
+        "range20_pct",
+        "close_pos_20",
+        "turnover_5d",
+        "baseline_5d_turnover",
+        "adv_turnover_20",
+        "hh10_close",
+        "hh_fib",
+        "low_since_hh_fib",
+    ]
+    d = df.dropna(subset=needed).copy()
+    if d.empty:
+        return d
+
+    if cfg.adv_turnover_20_min and cfg.adv_turnover_20_min > 0:
+        d = d[d["adv_turnover_20"].astype(float) >= float(cfg.adv_turnover_20_min)].copy()
+
+    return d
+
+
+def weekly_score(out: pd.DataFrame) -> pd.DataFrame:
+    o = out.copy()
+    denom = o["baseline_5d_turnover"].replace(0, np.nan)
+    o["turnover_expansion"] = (o["turnover_5d"] / denom).replace([np.inf, -np.inf], np.nan)
+
+    o["range_compression_score"] = 1.0 / (o["range5_pct"].clip(lower=1e-6))
+    o["dist_20dma"] = (o["close"] - o["sma20"]) / o["sma20"]
+
+    for col in ["turnover_expansion", "range_compression_score", "dist_20dma"]:
+        o[col + "_r"] = o.groupby("signal_date")[col].rank(pct=True)
+
+    o["score"] = (
+        0.5 * o["turnover_expansion_r"] +
+        0.3 * o["range_compression_score_r"] +
+        0.2 * o["dist_20dma_r"]
+    )
+    return o
+
+
+def weekly_detect_setups(df_raw: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFrame:
+    df = df_raw.sort_values(["ticker", "date"]).copy()
+    df = weekly_universe_filter_parquet_only(df, cfg)
+    if df.empty:
+        return pd.DataFrame()
+
+    denom = df["baseline_5d_turnover"].replace(0, np.nan)
+    df["turnover_expansion"] = (df["turnover_5d"] / denom).replace([np.inf, -np.inf], np.nan)
+
+    near_high = df["close"] >= (cfg.pause_near_high_frac * df["hh10_close"])
+    contraction = (df["range5_pct"] < df["range20_pct"]) | (df["atr5"] < df["atr20"])
+    df["pause_day"] = (near_high & contraction).astype(int)
+
+    df["pause_count"] = (
+        df.groupby("ticker")["pause_day"]
+        .transform(lambda x: x.rolling(cfg.pause_days_max, min_periods=cfg.pause_days_max).sum())
+    )
+
+    trend_up = (
+        (df["close"] > df["sma20"]) &
+        (df["sma20"] > df["sma50"]) &
+        (df["sma20_slope5"] >= cfg.sma20_slope_floor_mult * df["sma20"])
+    )
+
+    vol_compress = (df["atr5"] < df["atr20"]) & (df["range5_pct"] < df["range20_pct"])
+    tight = df["range5_pct"] <= cfg.tight_range_5d_max
+    location = df["close_pos_20"] >= cfg.close_pos20_min
+    vol_confirm_a = df["turnover_expansion"] >= cfg.turnover_expansion_min_A
+    mask_a = trend_up & vol_compress & tight & location & vol_confirm_a
+    a_frame = df.loc[mask_a, :].copy()
+    if not a_frame.empty:
+        a_frame["signal_date"] = a_frame["date"].dt.normalize()
+        a_frame["setup_tag"] = "VOL_COMPRESSION_BREAKOUT"
+        a_frame["entry_type"] = "BREAKOUT"
+        a_frame["breakout_level"] = a_frame["hh5"]
+        a_frame["pullback_level"] = np.nan
+        a_frame["stop_level"] = a_frame["ll5"]
+
+    mask_pause_base = (
+        trend_up &
+        (df["pause_count"] >= cfg.pause_days_min) &
+        (df["pause_count"] <= cfg.pause_days_max) &
+        (df["range20_pct"] <= cfg.pause_range20_max) &
+        (df["hh_fib"] <= df["close"] * (1.0 + cfg.max_hh_dist_from_close))
+    )
+    pb = df.loc[mask_pause_base, :].copy()
+    if not pb.empty:
+        pb["signal_date"] = pb["date"].dt.normalize()
+
+    c1 = pb.copy()
+    if not c1.empty:
+        c1 = c1[c1["turnover_expansion"] >= cfg.turnover_expansion_min_C].copy()
+        c1["setup_tag"] = "TREND_PAUSE_BREAKOUT"
+        c1["entry_type"] = "BREAKOUT"
+        c1["breakout_level"] = c1["hh5"]
+        c1["pullback_level"] = np.nan
+        c1["stop_level"] = c1["ll5"]
+
+    c2 = pb.copy()
+    if not c2.empty:
+        hh = c2["hh_fib"].astype(float)
+        lsh = c2["low_since_hh_fib"].astype(float)
+        rng = (hh - lsh).clip(lower=1e-9)
+        fib38 = hh - cfg.fib_frac * rng
+
+        c2["setup_tag"] = "TREND_PAUSE_38PULLBACK"
+        c2["entry_type"] = "PULLBACK"
+        c2["breakout_level"] = c2["hh5"]
+        c2["pullback_level"] = fib38
+        c2["stop_level"] = c2["ll5"]
+
+        close = c2["close"].astype(float)
+        min_level = close * (1.0 - cfg.pullback_max_pct_below_close)
+        max_level = close * (1.0 - cfg.pullback_min_pct_below_close)
+        c2 = c2[(c2["pullback_level"] >= min_level) & (c2["pullback_level"] <= max_level)].copy()
+
+    frames = [x for x in [a_frame, c1, c2] if x is not None and not x.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["signal_date", "ticker", "setup_tag"], keep="first")
+    out = weekly_score(out)
+
+    keep = [
+        "signal_date",
+        "ticker",
+        "setup_tag",
+        "entry_type",
+        "score",
+        "breakout_level",
+        "pullback_level",
+        "stop_level",
+        "close",
+        "sma20",
+        "sma50",
+        "turnover_expansion",
+    ]
+    keep = [c for c in keep if c in out.columns]
+    return out[keep].sort_values(["signal_date", "score"], ascending=[False, False]).reset_index(drop=True)
+
+
+def weekly_current_signals(df_prices: pd.DataFrame, cfg: WeeklySwingConfig, n_days: int = 3) -> pd.DataFrame:
+    d = weekly_add_indicators(df_prices, cfg)
+    sig = weekly_detect_setups(d, cfg)
+    if sig.empty:
+        return sig
+
+    cal = pd.to_datetime(pd.Index(sorted(d["date"].dt.normalize().unique()))).normalize()
+    last_dates = cal[-n_days:] if len(cal) >= n_days else cal
+
+    sig = sig[pd.to_datetime(sig["signal_date"]).isin(last_dates)].copy()
+    if sig.empty:
+        return sig
+
+    sig = sig.sort_values(["ticker", "signal_date", "score"], ascending=[True, False, False])
+    sig = sig.groupby("ticker", as_index=False).head(1)
+
+    sig["System"] = sig["setup_tag"].apply(lambda x: f"weekly_swing::{x}")
+    sig["Signal"] = sig["entry_type"]
+    return sig.sort_values(["signal_date", "score"], ascending=[False, False]).reset_index(drop=True)
+
+
+# ============================================================
+# 6) SYSTEM 2: FIBONACCI
+# ============================================================
+
+LOOKBACK_DAYS = 300
+
+
+def find_swing_as_of_quick(group: pd.DataFrame, current_date: pd.Timestamp, lookback_days: int = LOOKBACK_DAYS):
+    window = group[(group["date"] <= current_date) & (group["date"] >= (current_date - pd.Timedelta(days=lookback_days)))].copy()
+    if len(window) < 10:
+        return None
+
+    highs = window["high"].values
+    lows = window["low"].values
+    dates = window["date"].values
+
+    look = 5
+    pivots = []
+    for i in range(look, len(highs) - look):
+        if highs[i] == max(highs[i - look: i + look + 1]):
+            pivots.append(i)
+    if not pivots:
+        return None
+
+    best_rel_idx = max(pivots, key=lambda idx: highs[idx])
+    swing_high_price = float(highs[best_rel_idx])
+    swing_high_date = pd.to_datetime(dates[best_rel_idx])
+
+    prior_segment = window.iloc[: best_rel_idx + 1]
+    low_pos = prior_segment["low"].idxmin()
+
+    swing_low_price = float(group.loc[low_pos, "low"])
+    swing_low_date = pd.to_datetime(group.loc[low_pos, "date"])
+
+    if swing_low_price >= swing_high_price:
+        return None
+
+    swing_range = swing_high_price - swing_low_price
+    return {
+        "Swing Low Date": swing_low_date,
+        "Swing Low Price": swing_low_price,
+        "Swing High Date": swing_high_date,
+        "Swing High Price": swing_high_price,
+        "Stop Consider (78.6%)": swing_high_price - 0.786 * swing_range,
+    }
+
+
+def fib_build_watchlist(df: pd.DataFrame, lookback_days: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    rows = []
+    for ticker, g in df.groupby("ticker", sort=False):
+        g = g.sort_values("date")
+        latest_price = float(g["close"].iloc[-1])
+        latest_date = pd.to_datetime(g["date"].iloc[-1])
+
+        swing = find_swing_as_of_quick(g, latest_date, lookback_days)
+        if swing is None:
+            continue
+
+        post_high = g[(g["date"] > swing["Swing High Date"]) & (g["date"] <= latest_date)]
+        if (not post_high.empty) and (post_high["low"] < swing["Stop Consider (78.6%)"]).any():
+            continue
+
+        retracement = (swing["Swing High Price"] - latest_price) / (swing["Swing High Price"] - swing["Swing Low Price"])
+        if retracement >= 0.38:
+            rows.append({
+                "Ticker": ticker,
+                "Latest Date": latest_date,
+                "Latest Price": latest_price,
+                "Swing Low Date": swing["Swing Low Date"],
+                "Swing Low Price": float(swing["Swing Low Price"]),
+                "Swing High Date": swing["Swing High Date"],
+                "Swing High Price": float(swing["Swing High Price"]),
+                "Swing Range": float(swing["Swing High Price"] - swing["Swing Low Price"]),
+                "Retracement": float(retracement),
+            })
+    return pd.DataFrame(rows)
+
+
+def shape_priority(shape: str) -> int:
+    order = {
+        "consolidation under BOS": 1,
+        "rounded recovery": 2,
+        "strong recovery": 3,
+        "normal recovery": 4,
+        "V-reversal": 5,
+        "volatile pullback": 6,
+        "insufficient data": 7,
+    }
+    return order.get(shape, 7)
+
+
+def setup_shape(g: pd.DataFrame, retr_low_date, last_local_high):
+    post = g[g["date"] > retr_low_date].copy()
+    if post.empty or len(post) < 6:
+        return "insufficient data"
+
+    closes = post["close"].values
+    x = np.arange(len(closes))
+    coeffs = np.polyfit(x, closes, 1)
+    slope = coeffs[0]
+
+    fitted = np.polyval(coeffs, x)
+    noise = np.std(closes - fitted)
+    noise_ratio = noise / max(np.mean(closes), 1e-9)
+
+    total_up = closes[-1] - closes[0]
+    range_up = max(closes) - min(closes)
+    recovery_pct = 0 if range_up == 0 else total_up / range_up
+
+    if last_local_high is not None and np.isfinite(last_local_high) and last_local_high != 0:
+        dist_to_bos = (last_local_high - closes[-1]) / last_local_high
+    else:
+        dist_to_bos = None
+
+    if dist_to_bos is not None and dist_to_bos < 0.02 and noise_ratio < 0.008:
+        return "consolidation under BOS"
+    if slope > 0 and noise_ratio < 0.015 and recovery_pct > 0.60:
+        return "rounded recovery"
+    if slope > 0 and recovery_pct > 0.75:
+        return "strong recovery"
+    if slope > np.mean(closes) * 0.0008 and recovery_pct > 0.85 and noise_ratio < 0.02:
+        return "V-reversal"
+    if noise_ratio > 0.03:
+        return "volatile pullback"
+    return "normal recovery"
+
+
+def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.DataFrame:
+    results = []
+
+    for _, row in watch.iterrows():
+        ticker = row["Ticker"]
+        swing_low_date = row["Swing Low Date"]
+        swing_high_date = row["Swing High Date"]
+
+        g = df_prices[df_prices["ticker"] == ticker].sort_values("date").copy()
+        if g.empty or len(g) < 40:
+            continue
+
+        fib50 = row["Swing High Price"] - 0.50 * (row["Swing High Price"] - row["Swing Low Price"])
+        fib786 = row["Swing High Price"] - 0.786 * (row["Swing High Price"] - row["Swing Low Price"])
+
+        correction = g[(g["date"] > swing_high_date) & (g["date"] <= row["Latest Date"])].copy()
+        if correction.empty:
+            continue
+
+        retr_idx = correction["low"].idxmin()
+        retr_low_price = float(correction.loc[retr_idx, "low"])
+        retr_low_date = pd.to_datetime(correction.loc[retr_idx, "date"])
+
+        post = g[g["date"] > retr_low_date].copy()
+
+        retr_in_zone = (retr_low_price <= fib50) and (retr_low_price >= fib786)
+        no_lower_after = True if post.empty else (post["low"].min() >= retr_low_price)
+        retracement_floor_respected = retr_in_zone and no_lower_after
+
+        higher_low_found = False
+        hl_price = np.nan
+        if len(post) >= 6:
+            lows = post["low"].values
+            pivot_lows = []
+            for i in range(1, len(lows) - 1):
+                if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
+                    pivot_lows.append(i)
+            for idx in pivot_lows:
+                pivot_low = lows[idx]
+                if pivot_low <= retr_low_price:
+                    continue
+                if post["low"].iloc[idx + 1:].min() < pivot_low:
+                    continue
+                higher_low_found = True
+                hl_price = float(pivot_low)
+                break
+
+        bullish_candle = False
+        corr = correction.reset_index(drop=True)
+        for i in range(1, len(corr)):
+            o = corr["open"].iloc[i]
+            c = corr["close"].iloc[i]
+            l = corr["low"].iloc[i]
+            in_fib_zone = (l <= fib50) and (l >= fib786)
+            if in_fib_zone and c >= o:
+                bullish_candle = True
+                break
+
+        corr2 = g[(g["date"] > retr_low_date) & (g["date"] < row["Latest Date"])].copy()
+        if corr2.empty or len(corr2) < 6:
+            last_local_high = np.nan
+            bos = False
+        else:
+            highs = corr2["high"].values
+            pivot_highs = []
+            for i in range(2, len(highs) - 2):
+                if highs[i] > highs[i - 1] and highs[i] > highs[i + 1] and highs[i] > highs[i - 2] and highs[i] > highs[i + 2]:
+                    pivot_highs.append(highs[i])
+            bos_level = max(pivot_highs) if pivot_highs else float(corr2["high"].max())
+            last_local_high = float(bos_level)
+            post2 = g[g["date"] > retr_low_date]
+            bos = (post2["close"] > bos_level).any()
+
+        gp = g.copy()
+        gp["SMA10"] = gp["close"].rolling(10).mean()
+
+        delta = gp["close"].diff()
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        roll_up = pd.Series(gain).rolling(14).mean()
+        roll_down = pd.Series(loss).rolling(14).mean()
+        rs = roll_up / roll_down.replace(0, np.nan)
+        gp["RSI"] = 100 - (100 / (1 + rs))
+
+        ema12 = gp["close"].ewm(span=12, adjust=False).mean()
+        ema26 = gp["close"].ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        gp["MACDH"] = macd - signal
+
+        last_row = gp.iloc[-1]
+        close_now = float(last_row["close"])
+        sma10 = float(last_row["SMA10"]) if pd.notna(last_row["SMA10"]) else np.nan
+        rsi_now = float(last_row["RSI"]) if pd.notna(last_row["RSI"]) else np.nan
+        macdh_now = float(last_row["MACDH"]) if pd.notna(last_row["MACDH"]) else np.nan
+
+        cond1 = close_now > sma10 if np.isfinite(sma10) else False
+        cond2 = macdh_now > 0 if np.isfinite(macdh_now) else False
+        cond3 = rsi_now > 50 if np.isfinite(rsi_now) else False
+        momentum_ok = (int(cond1) + int(cond2) + int(cond3)) >= 2
+
+        shape = setup_shape(g, retr_low_date, last_local_high)
+        shape_pr = shape_priority(shape)
+
+        retracement_held = (retracement_floor_respected and higher_low_found and bullish_candle)
+        uptrend_resumed = (bos and momentum_ok)
+
+        final_signal = "BUY" if (retracement_held and uptrend_resumed) else "WATCH" if retracement_held else "INVALID"
+
+        bos_prox = 0.0
+        if np.isfinite(last_local_high) and last_local_high != 0:
+            bos_prox = float(np.clip(1 - ((last_local_high - close_now) / max(close_now, 1e-9)), 0, 1))
+
+        readiness = 100 * (
+            0.25 * int(retracement_floor_respected) +
+            0.20 * int(higher_low_found) +
+            0.15 * int(bullish_candle) +
+            0.20 * int(momentum_ok) +
+            0.20 * bos_prox
+        )
+
+        results.append({
+            "ticker": ticker,
+            "System": "fibonacci",
+            "Signal": final_signal,
+            "READINESS_SCORE": round(float(np.clip(readiness, 0, 100)), 2),
+            "LastLocalHigh": float(last_local_high) if np.isfinite(last_local_high) else np.nan,
+            "HL_Price": float(hl_price) if np.isfinite(hl_price) else np.nan,
+            "LatestPrice": close_now,
+            "Shape": shape,
+            "ShapePriority": shape_pr,
+        })
+
+    out = pd.DataFrame(results)
+    if out.empty:
+        return out
+
+    sig_rank = out["Signal"].map({"BUY": 0, "WATCH": 1, "INVALID": 2}).fillna(9)
+    out = out.assign(_r=sig_rank).sort_values(["_r", "READINESS_SCORE"], ascending=[True, False]).drop(columns=["_r"])
+    return out.reset_index(drop=True)
+
+
+# ============================================================
+# 7) SYSTEM 3: MOMENTUM BUCKET C
+# ============================================================
+
+def add_absolute_returns(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"]).dt.normalize()
+    d = d.sort_values(["ticker", "date"]).copy()
+    d["1D Return"] = d.groupby("ticker")["close"].pct_change()
+    return d
+
+
+def attach_benchmark_and_alpha(df_prices: pd.DataFrame, idx_returns: pd.DataFrame) -> pd.DataFrame:
+    d = df_prices.copy()
+    d["date"] = pd.to_datetime(d["date"]).dt.normalize()
+    d = d.sort_values(["ticker", "date"]).copy()
+
+    d["stock_ret_1d"] = d.groupby("ticker")["close"].pct_change()
+
+    d["index_name"] = [
+        infer_index_name_for_row(t, idxv) for t, idxv in zip(d["ticker"].astype(str), d.get("index", "UNKNOWN"))
+    ]
+
+    idx = idx_returns.copy()
+    idx = idx[idx["index_name"].isin(["SP500", "HSI", "STI"])].copy()
+
+    if "ret_1d" not in idx.columns:
+        raise ValueError(f"Index returns parquet must contain 'ret_1d'. Found: {sorted(idx.columns)}")
+
+    idx_small = idx[["date", "index_name", "ret_1d"]].rename(columns={"ret_1d": "bm_ret_1d"}).copy()
+
+    d = d.merge(idx_small, on=["date", "index_name"], how="left")
+
+    d["alpha_1d"] = d["stock_ret_1d"] - d["bm_ret_1d"]
+
+    d["bm_ret_1d"] = d["bm_ret_1d"].fillna(0.0)
+    d["alpha_1d"] = d["alpha_1d"].fillna(0.0)
+
+    return d
+
+
+def calculate_momentum_features(
+    df: pd.DataFrame,
+    windows=(5, 10, 30, 45, 60, 90),
+    base_col: str = "1D Return",
+) -> pd.DataFrame:
+    d = df.copy()
+    d = d.sort_values(["ticker", "date"]).copy()
+
+    if base_col not in d.columns:
+        raise ValueError(f"calculate_momentum_features: missing base_col='{base_col}'")
+
+    gross_col = "__gross__"
+    d[gross_col] = 1.0 + pd.to_numeric(d[base_col], errors="coerce").fillna(0.0)
 
     for w in windows:
         r = f"{w}D Return"
         z = f"{w}D zscore"
         dz = f"{w}D zscore change"
 
-        df[r] = (
-            df.groupby("Ticker")["1D Return"]
+        d[r] = (
+            d.groupby("ticker")[gross_col]
             .rolling(w, min_periods=w)
             .apply(np.prod, raw=True)
-            .reset_index(level=0, drop=True) - 1
+            .reset_index(level=0, drop=True) - 1.0
         )
 
-        mean = df.groupby("Date")[r].transform("mean")
-        std = df.groupby("Date")[r].transform("std").replace(0, np.nan)
-        df[z] = ((df[r] - mean) / std)
+        mean = d.groupby("date")[r].transform("mean")
+        std = d.groupby("date")[r].transform("std").replace(0, np.nan)
+        d[z] = ((d[r] - mean) / std)
 
-        df[dz] = (
-            df.groupby("Ticker")[z]
+        d[dz] = (
+            d.groupby("ticker")[z]
             .diff()
             .ewm(span=w, adjust=False)
             .mean()
         )
 
-    num_cols = df.select_dtypes(include=[np.number]).columns
-    df[num_cols] = df[num_cols].fillna(0.0)
-    return df
+    num_cols = d.select_dtypes(include=[np.number]).columns
+    d[num_cols] = d[num_cols].fillna(0.0)
+
+    if gross_col in d.columns:
+        d = d.drop(columns=[gross_col])
+
+    return d
 
 
 def add_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    df["Momentum_Fast"] = (0.6 * df["5D zscore"] + 0.4 * df["10D zscore"])
-    df["Momentum_Mid"] = (0.5 * df["30D zscore"] + 0.5 * df["45D zscore"])
-    df["Momentum_Slow"] = (0.5 * df["60D zscore"] + 0.5 * df["90D zscore"])
-
-    df["Momentum Score"] = (
-        0.5 * df["Momentum_Slow"] +
-        0.3 * df["Momentum_Mid"] +
-        0.2 * df["Momentum_Fast"]
-    )
-    return df.fillna(0.0)
+    d = df.copy()
+    d["Momentum_Fast"] = (0.6 * d["5D zscore"] + 0.4 * d["10D zscore"])
+    d["Momentum_Mid"] = (0.5 * d["30D zscore"] + 0.5 * d["45D zscore"])
+    d["Momentum_Slow"] = (0.5 * d["60D zscore"] + 0.5 * d["90D zscore"])
+    d["Momentum Score"] = (0.5 * d["Momentum_Slow"] + 0.3 * d["Momentum_Mid"] + 0.2 * d["Momentum_Fast"])
+    return d.fillna(0.0)
 
 
 def add_regime_acceleration(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["Accel_Fast"] = df.groupby("Ticker")["Momentum_Fast"].diff()
-    df["Accel_Mid"] = df.groupby("Ticker")["Momentum_Mid"].diff()
-    df["Accel_Slow"] = df.groupby("Ticker")["Momentum_Slow"].diff()
+    d = df.copy()
+    d["Accel_Fast"] = d.groupby("ticker")["Momentum_Fast"].diff()
+    d["Accel_Mid"] = d.groupby("ticker")["Momentum_Mid"].diff()
+    d["Accel_Slow"] = d.groupby("ticker")["Momentum_Slow"].diff()
 
     def zscore_safe(x: pd.Series) -> pd.Series:
         s = x.std()
@@ -416,24 +946,17 @@ def add_regime_acceleration(df: pd.DataFrame) -> pd.DataFrame:
             return (x - x.mean()).fillna(0.0)
         return ((x - x.mean()) / s).fillna(0.0)
 
-    df["Accel_Fast_z"] = df.groupby("Date")["Accel_Fast"].transform(zscore_safe)
-    df["Accel_Mid_z"] = df.groupby("Date")["Accel_Mid"].transform(zscore_safe)
-    df["Accel_Slow_z"] = df.groupby("Date")["Accel_Slow"].transform(zscore_safe)
+    d["Accel_Fast_z"] = d.groupby("date")["Accel_Fast"].transform(zscore_safe)
+    d["Accel_Mid_z"] = d.groupby("date")["Accel_Mid"].transform(zscore_safe)
+    d["Accel_Slow_z"] = d.groupby("date")["Accel_Slow"].transform(zscore_safe)
 
-    df["Acceleration Score"] = (
-        0.5 * df["Accel_Fast_z"] +
-        0.3 * df["Accel_Mid_z"] +
-        0.2 * df["Accel_Slow_z"]
-    )
-    return df.fillna(0.0)
+    d["Acceleration Score"] = (0.5 * d["Accel_Fast_z"] + 0.3 * d["Accel_Mid_z"] + 0.2 * d["Accel_Slow_z"])
+    return d.fillna(0.0)
 
 
 def add_regime_residual_momentum(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["Residual_Momentum"] = (
-        df["Momentum_Fast"] -
-        df.groupby("Ticker")["Momentum_Slow"].transform("mean")
-    )
+    d = df.copy()
+    d["Residual_Momentum"] = d["Momentum_Fast"] - d.groupby("ticker")["Momentum_Slow"].transform("mean")
 
     def zscore_safe(x: pd.Series) -> pd.Series:
         s = x.std()
@@ -441,86 +964,30 @@ def add_regime_residual_momentum(df: pd.DataFrame) -> pd.DataFrame:
             return (x - x.mean()).fillna(0.0)
         return ((x - x.mean()) / s).fillna(0.0)
 
-    df["Residual_Momentum_z"] = df.groupby("Date")["Residual_Momentum"].transform(zscore_safe)
-    return df.fillna(0.0)
+    d["Residual_Momentum_z"] = d.groupby("date")["Residual_Momentum"].transform(zscore_safe)
+    return d.fillna(0.0)
 
 
 def add_regime_early_momentum(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["Early_Fast"] = (0.6 * df["Accel_Fast_z"] + 0.4 * df["Momentum_Fast"])
-    df["Early_Mid"] = (0.5 * df["Accel_Mid_z"] + 0.5 * df["Momentum_Mid"])
-    df["Early_Slow"] = (0.5 * df["Accel_Slow_z"] + 0.5 * df["Momentum_Slow"])
-
-    df["Early Momentum Score"] = (
-        0.5 * df["Early_Slow"] +
-        0.3 * df["Early_Mid"] +
-        0.2 * df["Early_Fast"]
-    )
-    return df.fillna(0.0)
-
-
-def add_relative_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Uses df's existing stock returns features (5D/10D/30D/45D/60D/90D Return)
-    and index momentum columns (idx_5D..idx_90D) to build relative regimes,
-    then sets Momentum_* and Momentum Score from relative z-scores.
-    """
-    df = df.copy()
-
-    # Relative regime components
-    df["Rel_Slow"] = (
-        0.5 * df["60D Return"] + 0.5 * df["90D Return"]
-    ) - (
-        0.5 * df["idx_60D"] + 0.5 * df["idx_90D"]
-    )
-
-    df["Rel_Mid"] = (
-        0.5 * df["30D Return"] + 0.5 * df["45D Return"]
-    ) - (
-        0.5 * df["idx_30D"] + 0.5 * df["idx_45D"]
-    )
-
-    df["Rel_Fast"] = (
-        0.6 * df["5D Return"] + 0.4 * df["10D Return"]
-    ) - (
-        0.6 * df["idx_5D"] + 0.4 * df["idx_10D"]
-    )
-
-    # Cross-sectional z-scores AFTER benchmark subtraction
-    for col in ["Rel_Slow", "Rel_Mid", "Rel_Fast"]:
-        mean = df.groupby("Date")[col].transform("mean")
-        std = df.groupby("Date")[col].transform("std").replace(0, np.nan)
-        df[col + "_z"] = ((df[col] - mean) / std).fillna(0.0)
-
-    # Define regime scaffolding using RELATIVE z-scores
-    df["Momentum_Slow"] = df["Rel_Slow_z"]
-    df["Momentum_Mid"] = df["Rel_Mid_z"]
-    df["Momentum_Fast"] = df["Rel_Fast_z"]
-
-    # Momentum Score built from relative regimes
-    df["Momentum Score"] = (
-        0.5 * df["Momentum_Slow"] +
-        0.3 * df["Momentum_Mid"] +
-        0.2 * df["Momentum_Fast"]
-    )
-
-    return df.fillna(0.0)
+    d = df.copy()
+    d["Early_Fast"] = (0.6 * d["Accel_Fast_z"] + 0.4 * d["Momentum_Fast"])
+    d["Early_Mid"] = (0.5 * d["Accel_Mid_z"] + 0.5 * d["Momentum_Mid"])
+    d["Early_Slow"] = (0.5 * d["Accel_Slow_z"] + 0.5 * d["Momentum_Slow"])
+    d["Early Momentum Score"] = (0.5 * d["Early_Slow"] + 0.3 * d["Early_Mid"] + 0.2 * d["Early_Fast"])
+    return d.fillna(0.0)
 
 
 def build_daily_lists(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     records = []
-    for d in sorted(df["Date"].unique()):
-        snap = df[df["Date"] == d].sort_values("Momentum Score", ascending=False).head(top_n).copy()
+    for d0 in sorted(df["date"].unique()):
+        snap = df[df["date"] == d0].sort_values("Momentum Score", ascending=False).head(top_n).copy()
         if snap.empty:
             continue
-
-        # rank 1..top_n (1 = best)
         snap["Rank"] = np.arange(1, len(snap) + 1)
-
         for _, r in snap.iterrows():
             records.append({
-                "Date": d,
-                "Ticker": r["Ticker"],
+                "date": d0,
+                "ticker": r["ticker"],
                 "Rank": int(r["Rank"]),
                 "Momentum Score": float(r["Momentum Score"]),
                 "Early Momentum Score": float(r["Early Momentum Score"]),
@@ -535,383 +1002,160 @@ def final_selection_from_daily(
     w_early: float = 0.30,
     w_consistency: float = 0.20,
     as_of_date=None,
-    top_n: int = 10
+    top_n: int = 10,
 ) -> pd.DataFrame:
     if daily_df is None or daily_df.empty:
         return pd.DataFrame()
-
     if as_of_date is None:
-        as_of_date = daily_df["Date"].max()
+        as_of_date = daily_df["date"].max()
 
-    dates = sorted(
-        daily_df.loc[daily_df["Date"] <= as_of_date, "Date"].unique(),
-        reverse=True
-    )[:lookback_days]
-
+    dates = sorted(daily_df.loc[daily_df["date"] <= as_of_date, "date"].unique(), reverse=True)[:lookback_days]
     if not dates:
         return pd.DataFrame()
 
-    window = daily_df[daily_df["Date"].isin(dates)]
+    window = daily_df[daily_df["date"].isin(dates)]
     if window.empty:
         return pd.DataFrame()
 
     agg = (
-        window.groupby("Ticker")
+        window.groupby("ticker")
         .agg(
             Momentum_Score=("Momentum Score", "mean"),
             Early_Momentum_Score=("Early Momentum Score", "mean"),
-            Appearances=("Date", "count"),
+            Appearances=("date", "count"),
             Rank_Mean=("Rank", "mean"),
             Rank_Std=("Rank", "std"),
         )
         .reset_index()
     )
-
-    # std can be NaN when only 1 appearance; treat that as perfectly stable (std=0)
     agg["Rank_Std"] = agg["Rank_Std"].fillna(0.0)
-
     agg["Consistency"] = agg["Appearances"] / len(dates)
+
     agg["Weighted_Score"] = (
         w_momentum * agg["Momentum_Score"] +
         w_early * agg["Early_Momentum_Score"] +
         w_consistency * agg["Consistency"]
     )
 
-    # Consistency already 0..1
     agg["ConsistencyScore"] = agg["Consistency"] * 100.0
-
-    # Rank stability from Rank_Std (lower is better)
-    # Normalize: std >= (top_n/2) is considered "very unstable" => score goes to 0
     max_std = max(1.0, top_n / 2.0)
     agg["RankStabilityScore"] = (1.0 - (agg["Rank_Std"] / max_std)).clip(0.0, 1.0) * 100.0
-
-    # 50/50 confidence
     agg["Signal_Confidence"] = 0.5 * agg["ConsistencyScore"] + 0.5 * agg["RankStabilityScore"]
 
-    return (
-        agg.sort_values("Weighted_Score", ascending=False)
-        .head(top_n)
-        .reset_index(drop=True)
-    )
+    return agg.sort_values("Weighted_Score", ascending=False).head(top_n).reset_index(drop=True)
 
 
-def monthly_rebalance_dates(df_prices: pd.DataFrame) -> list:
-    dates = pd.to_datetime(df_prices["Date"]).dropna().sort_values().unique()
-    if len(dates) == 0:
-        return []
-    tmp = pd.DataFrame({"Date": dates})
-    tmp["Month"] = tmp["Date"].dt.to_period("M")
-    return tmp.groupby("Month")["Date"].max().tolist()
-
-
-def get_last_price(price_table: pd.DataFrame, ticker: str, date) -> float | None:
-    try:
-        s = price_table.loc[:date, ticker].dropna()
-        if s.empty:
-            return None
-        return float(s.iloc[-1])
-    except Exception:
-        return None
-
-
-def build_bucket_c_signals(
-    dailyA: pd.DataFrame,
-    dailyB: pd.DataFrame,
-    as_of_date,
-    lookback_days,
-    w_momentum,
-    w_early,
-    w_consistency,
-    top_n,
-    total_capital,
-    weight_A=0.20,
-    weight_B=0.80,
+def momentum_bucketC_latest(
+    df_prices: pd.DataFrame,
+    index_returns: pd.DataFrame,
+    top_n_daily: int = 10,
+    final_top_n: int = 10,
+    lookback_days: int = 10,
 ) -> pd.DataFrame:
-    """
-    Bucket C = combine final selection from A and B, allocate dollars by weights,
-    and aggregate diagnostics per ticker (showing Consistency etc.).
-    """
-    selA = final_selection_from_daily(
-        dailyA,
-        lookback_days=lookback_days,
-        w_momentum=w_momentum,
-        w_early=w_early,
-        w_consistency=w_consistency,
-        as_of_date=as_of_date,
-        top_n=top_n
-    ).copy()
+    d0 = df_prices.copy()
 
-    selB = final_selection_from_daily(
-        dailyB,
-        lookback_days=lookback_days,
-        w_momentum=w_momentum,
-        w_early=w_early,
-        w_consistency=w_consistency,
-        as_of_date=as_of_date,
-        top_n=top_n
-    ).copy()
+    if "index" in d0.columns and (d0["index"] != "UNKNOWN").any():
+        if (d0["index"].astype(str) == "SP500").any():
+            d0 = d0[d0["index"].astype(str) == "SP500"].copy()
+
+    if d0["date"].nunique() < 120:
+        return pd.DataFrame()
+
+    df_a = add_absolute_returns(d0)
+    df_a = calculate_momentum_features(df_a, base_col="1D Return")
+    df_a = add_regime_momentum_score(df_a)
+    df_a = add_regime_acceleration(df_a)
+    df_a = add_regime_residual_momentum(df_a)
+    df_a = add_regime_early_momentum(df_a)
+    daily_a = build_daily_lists(df_a, top_n=top_n_daily)
+
+    d_alpha = attach_benchmark_and_alpha(d0, index_returns)
+
+    df_b = d_alpha.copy()
+    df_b = calculate_momentum_features(df_b, base_col="alpha_1d")
+    df_b = add_regime_momentum_score(df_b)
+    df_b = add_regime_acceleration(df_b)
+    df_b = add_regime_residual_momentum(df_b)
+    df_b = add_regime_early_momentum(df_b)
+
+    df_b = df_b[(df_b["Momentum_Slow"] > 0.25) & (df_b["Momentum_Mid"] > 0.10)].copy()
+    daily_b = build_daily_lists(df_b, top_n=top_n_daily)
+
+    common_dates = sorted(set(daily_a["date"]).intersection(set(daily_b["date"])))
+    if not common_dates:
+        return pd.DataFrame()
+    as_of = common_dates[-1]
+
+    sel_a = final_selection_from_daily(daily_a, lookback_days=lookback_days, as_of_date=as_of, top_n=final_top_n).copy()
+    sel_b = final_selection_from_daily(daily_b, lookback_days=lookback_days, as_of_date=as_of, top_n=final_top_n).copy()
 
     frames = []
+    total_capital = 100_000.0
+    weight_a, weight_b = 0.20, 0.80
 
-    if not selA.empty:
-        selA["Bucket"] = "A"
-        selA["Position_Size"] = (total_capital * weight_A) / len(selA)
-        frames.append(selA)
-
-    if not selB.empty:
-        selB["Bucket"] = "B"
-        selB["Position_Size"] = (total_capital * weight_B) / len(selB)
-        frames.append(selB)
+    if not sel_a.empty:
+        sel_a["Bucket"] = "A"
+        sel_a["Target_dollars"] = (total_capital * weight_a) / len(sel_a)
+        frames.append(sel_a)
+    if not sel_b.empty:
+        sel_b["Bucket"] = "B"
+        sel_b["Target_dollars"] = (total_capital * weight_b) / len(sel_b)
+        frames.append(sel_b)
 
     if not frames:
         return pd.DataFrame()
 
     combo = pd.concat(frames, ignore_index=True)
 
-    # Aggregate per ticker
     out = (
-        combo.groupby("Ticker", as_index=False)
+        combo.groupby("ticker", as_index=False)
         .agg(
-            Position_Size=("Position_Size", "sum"),
+            Target_dollars=("Target_dollars", "sum"),
+            Signal_Confidence=("Signal_Confidence", "max"),
             Weighted_Score=("Weighted_Score", "max"),
             Momentum_Score=("Momentum_Score", "max"),
             Early_Momentum_Score=("Early_Momentum_Score", "max"),
             Consistency=("Consistency", "max"),
-
-            # ✅ add these
-            Rank_Std=("Rank_Std", "min"),  # smaller = more stable
-            RankStabilityScore=("RankStabilityScore", "max"),
-            Signal_Confidence=("Signal_Confidence", "max"),
-
-            Bucket_Source=("Bucket", lambda x: "+".join(sorted(set(x))))
+            Bucket_Source=("Bucket", lambda x: "+".join(sorted(set(x)))),
         )
-        .sort_values(["Position_Size", "Signal_Confidence"], ascending=[False, False])
+        .sort_values(["Signal_Confidence", "Weighted_Score"], ascending=[False, False])
         .reset_index(drop=True)
     )
 
-    # Normalize source formatting
-    out["Bucket_Source"] = out["Bucket_Source"].replace({"A+B": "A+B", "A": "A", "B": "B"})
-    return out
+    out["System"] = "momentum_bucketC"
+    out["Signal"] = "HOLDINGS_CANDIDATE"
+    out["Signal_Date"] = pd.to_datetime(as_of)
 
+    total = float(out["Target_dollars"].sum()) if len(out) else 0.0
+    out["Weight_%"] = (out["Target_dollars"] / total * 100.0) if total > 0 else np.nan
+    out["Consistency_%"] = out["Consistency"] * 100.0
 
-def simulate_unified_portfolio(
-    df_prices: pd.DataFrame,
-    price_table: pd.DataFrame,
-    dailyA: pd.DataFrame,
-    dailyB: pd.DataFrame,
-    lookback_days: int = 10,
-    w_momentum: float = 0.50,
-    w_early: float = 0.30,
-    w_consistency: float = 0.20,
-    top_n: int = 10,
-    total_capital: float = 100_000.0,
-    weight_A: float = 0.20,
-    weight_B: float = 0.80,
-):
-    rebalance_dates = monthly_rebalance_dates(df_prices)
-
-    cash = total_capital
-    portfolio = {}  # ticker -> shares
-    cost_basis = {}  # ticker -> dollars invested
-
-    history = []
-    trades = []
-
-    for d in rebalance_dates:
-        target_df = build_bucket_c_signals(
-            dailyA=dailyA,
-            dailyB=dailyB,
-            as_of_date=d,
-            lookback_days=lookback_days,
-            w_momentum=w_momentum,
-            w_early=w_early,
-            w_consistency=w_consistency,
-            top_n=top_n,
-            total_capital=total_capital,
-            weight_A=weight_A,
-            weight_B=weight_B
-        )
-        if target_df.empty:
-            continue
-
-        target_sizes = dict(zip(target_df["Ticker"], target_df["Position_Size"]))
-        target = set(target_sizes.keys())
-        held = set(portfolio.keys())
-
-        # SELL
-        for t in list(held - target):
-            px = get_last_price(price_table, t, d)
-            if px is None or px <= 0:
-                continue
-            shares = portfolio[t]
-            proceeds = shares * px
-            cash += proceeds
-            pnl = proceeds - cost_basis.get(t, 0.0)
-            trades.append({"Date": d, "Ticker": t, "Action": "Sell", "Price": px, "PnL": pnl})
-            portfolio.pop(t, None)
-            cost_basis.pop(t, None)
-
-        # BUY / RESIZE
-        for t, target_dollars in target_sizes.items():
-            px = get_last_price(price_table, t, d)
-            if px is None or px <= 0:
-                continue
-
-            current_shares = portfolio.get(t, 0.0)
-            current_value = current_shares * px
-            delta_value = target_dollars - current_value
-
-            if delta_value > 0:
-                if delta_value > cash:
-                    continue
-                delta_shares = delta_value / px
-                portfolio[t] = current_shares + delta_shares
-                cost_basis[t] = cost_basis.get(t, 0.0) + delta_value
-                cash -= delta_value
-                trades.append({"Date": d, "Ticker": t, "Action": "Buy", "Price": px, "PnL": 0.0})
-
-            elif delta_value < 0:
-                trim_value = -delta_value
-                trim_shares = trim_value / px
-                portfolio[t] = current_shares - trim_shares
-                cost_basis[t] = cost_basis.get(t, 0.0) - trim_value
-                cash += trim_value
-                trades.append({"Date": d, "Ticker": t, "Action": "Resize", "Price": px, "PnL": 0.0})
-
-        holdings_value = sum(
-            get_last_price(price_table, t, d) * s
-            for t, s in portfolio.items()
-            if get_last_price(price_table, t, d) is not None
-        )
-        nav = cash + holdings_value
-        history.append({"Date": d, "Portfolio Value": nav})
-
-    return pd.DataFrame(history), pd.DataFrame(trades)
-
-
-def compute_performance_stats(history_df: pd.DataFrame) -> dict:
-    df = history_df.sort_values("Date").copy()
-    if df.empty or len(df) < 2:
-        return {"Message": "Not enough history"}
-
-    start = float(df["Portfolio Value"].iloc[0])
-    end = float(df["Portfolio Value"].iloc[-1])
-    if start <= 0:
-        return {"Message": "Invalid start value"}
-
-    total_return = (end / start - 1) * 100
-    years = (df["Date"].iloc[-1] - df["Date"].iloc[0]).days / 365.25
-
-    cagr = ((end / start) ** (1 / years) - 1) * 100 if (end > 0 and years > 0) else np.nan
-
-    ret = df["Portfolio Value"].pct_change().dropna()
-
-    std = ret.std()
-    sharpe = np.sqrt(252) * ret.mean() / std if (std is not None and std > 0) else np.nan
-
-    downside = ret[ret < 0]
-    dstd = downside.std()
-    sortino = np.sqrt(252) * ret.mean() / dstd if (dstd is not None and dstd > 0) else np.nan
-
-    rolling_max = df["Portfolio Value"].cummax()
-    drawdown = (df["Portfolio Value"] - rolling_max) / rolling_max
-
-    return {
-        "Total Return (%)": float(total_return),
-        "CAGR (%)": float(cagr) if pd.notna(cagr) else np.nan,
-        "Sharpe Ratio": float(sharpe) if pd.notna(sharpe) else np.nan,
-        "Sortino Ratio": float(sortino) if pd.notna(sortino) else np.nan,
-        "Max Drawdown (%)": float(drawdown.min() * 100),
-    }
-
-
-def compute_trade_stats(trades_df: pd.DataFrame) -> dict:
-    if trades_df is None or trades_df.empty:
-        return {"Message": "No trades"}
-    sells = trades_df[trades_df["Action"] == "Sell"].copy()
-    if sells.empty:
-        return {"Message": "No closed trades"}
-
-    wins = sells[sells["PnL"] > 0]
-    losses = sells[sells["PnL"] < 0]
-
-    total_win = wins["PnL"].sum()
-    total_loss = abs(losses["PnL"].sum())
-
-    return {
-        "Number of Trades": int(len(sells)),
-        "Win Rate (%)": float(len(wins) / len(sells) * 100),
-        "Average Win ($)": float(wins["PnL"].mean()) if not wins.empty else 0.0,
-        "Average Loss ($)": float(losses["PnL"].mean()) if not losses.empty else 0.0,
-        "Profit Factor": float(total_win / total_loss) if total_loss > 0 else np.nan,
-    }
-
-
-def build_bucket_c_signal_preview(
-    dailyA,
-    dailyB,
-    as_of_date,
-    lookback_days,
-    w_momentum,
-    w_early,
-    w_consistency,
-    top_n,
-    total_capital,
-    weight_A=0.20,
-    weight_B=0.80,
-):
-    tgtC = build_bucket_c_signals(
-        dailyA=dailyA,
-        dailyB=dailyB,
-        as_of_date=as_of_date,
-        lookback_days=lookback_days,
-        w_momentum=w_momentum,
-        w_early=w_early,
-        w_consistency=w_consistency,
-        top_n=top_n,
-        total_capital=total_capital,
-        weight_A=weight_A,
-        weight_B=weight_B,
-    )
-
-    if tgtC is None or tgtC.empty:
-        return pd.DataFrame()
-
-    out = tgtC.copy()
-    out = out.rename(columns={"Position_Size": "Target_$"})
-    total = float(out["Target_$"].sum()) if "Target_$" in out.columns else 0.0
-    out["Weight_%"] = (out["Target_$"] / total * 100.0) if total > 0 else np.nan
-
-    # Order / keep columns for the Signals tab (includes Consistency)
-    cols = [
-        "Ticker", "Name",
-        "Target_$", "Weight_%",
+    keep = [
+        "ticker",
+        "System",
+        "Signal",
+        "Signal_Date",
+        "Weight_%",
+        "Target_dollars",
         "Signal_Confidence",
-        "Weighted_Score", "Momentum_Score", "Early_Momentum_Score",
-        "Sector", "Industry",
+        "Weighted_Score",
+        "Bucket_Source",
+        "Consistency_%",
     ]
-
-    out["Consistency"] = out["Consistency"] * 100.0  # convert to %
-
-    cols = [c for c in cols if c in out.columns]
-    out = out[cols].sort_values(["Signal_Confidence", "Weighted_Score"], ascending=[False, False]).reset_index(drop=True)
-
-    return out
+    return out[keep].head(25).reset_index(drop=True)
 
 
 # ============================================================
-# 6. RAW REFRESH + REFERENCE BUILD
+# 8) RAW REFRESH + SIGNAL BUILD
 # ============================================================
 
 def refresh_raw_parquets():
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-    # ---------- Build universes ----------
     sp500 = get_sp500_universe()
     hsi = get_hsi_universe()
     sti = get_sti_universe()
 
-    # ---------- Download constituents ----------
     frames = []
     frames += download_5yr_ohlc(sp500["Ticker"].tolist(), "SP500")
     frames += download_5yr_ohlc(hsi["Ticker"].tolist(), "HSI")
@@ -921,7 +1165,6 @@ def refresh_raw_parquets():
     full_constituents.to_parquet(RAW_CONSTITUENTS_PATH, index=False)
     print(f"Saved {RAW_CONSTITUENTS_PATH}")
 
-    # ---------- Download index returns ----------
     index_map = {
         "^GSPC": "SP500",
         "^HSI": "HSI",
@@ -942,166 +1185,149 @@ def refresh_raw_parquets():
     return full_constituents
 
 
-def build_reference_parquets():
-    # (Same params as Streamlit)
-    DAILY_TOP_N = 10
-    FINAL_TOP_N = 10
-    LOOKBACK_DAYS = 10
-    WINDOWS = (5, 10, 30, 45, 60, 90)
+def build_signal_parquets():
+    df_prices = load_prices_from_parquet(RAW_CONSTITUENTS_PATH)
+    idx_returns = load_index_returns_from_parquet(RAW_INDEX_RETURNS_PATH)
 
-    W_MOM = 0.50
-    W_EARLY = 0.30
-    W_CONS = 0.20
-
-    # Load raw artifacts (just refreshed)
-    base = load_price_data_parquet(RAW_CONSTITUENTS_PATH)
-    base = filter_by_index(base, "SP500")
-    idx = load_index_returns_parquet(RAW_INDEX_RETURNS_PATH)
-
-    # Save base SP500 for Streamlit charts
-    base.to_parquet(BASE_SP500_PATH, index=False)
-    print(f"Saved {BASE_SP500_PATH}")
-
-    # ---------------- Bucket A (absolute) ----------------
-    dfA = calculate_momentum_features(add_absolute_returns(base), windows=WINDOWS)
-    dfA = add_regime_momentum_score(dfA)
-    dfA = add_regime_acceleration(dfA)
-    dfA = add_regime_residual_momentum(dfA)
-    dfA = add_regime_early_momentum(dfA)
-
-    priceA = dfA.pivot(index="Date", columns="Ticker", values="Price").sort_index()
-    dailyA = build_daily_lists(dfA, top_n=DAILY_TOP_N)
-
-    scoreA = dfA[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
-
-    dailyA.to_parquet(DAILYA_PATH, index=False)
-    scoreA.to_parquet(SCOREA_PATH, index=False)
-    priceA.reset_index().to_parquet(PRICEA_PATH, index=False)
-
-    print(f"Saved {DAILYA_PATH}")
-    print(f"Saved {SCOREA_PATH}")
-    print(f"Saved {PRICEA_PATH}")
-
-    # ---------------- Bucket B (relative) ----------------
-    dfB = base.copy()
-    dfB = dfB.merge(
-        idx,
-        left_on=["Date", "Index"],
-        right_on=["date", "index"],
-        how="left",
-        validate="many_to_one"
-    ).drop(columns=["date", "index"], errors="ignore")
-
-    dfB = dfB[dfB["idx_ret_1d"].notna()].copy()
-
-    dfB = calculate_momentum_features(add_absolute_returns(dfB), windows=WINDOWS)
-
-    idx_mom = compute_index_momentum(idx, windows=WINDOWS)
-    dfB = dfB.merge(
-        idx_mom[["date", "index", "idx_5D", "idx_10D", "idx_30D", "idx_45D", "idx_60D", "idx_90D"]],
-        left_on=["Date", "Index"],
-        right_on=["date", "index"],
-        how="left"
-    ).drop(columns=["date", "index"], errors="ignore")
-
-    dfB = add_relative_regime_momentum_score(dfB)
-
-    # Filters (as in your original long version)
-    dfB = dfB[dfB["Momentum_Slow"] > 1].copy()
-    dfB = dfB[dfB["Momentum_Mid"] > 0.5].copy()
-    dfB = dfB[dfB["Momentum_Fast"] > 1].copy()
-
-    dfB = add_regime_acceleration(dfB)
-    dfB = add_regime_residual_momentum(dfB)
-    dfB = add_regime_early_momentum(dfB)
-
-    dailyB = build_daily_lists(dfB, top_n=DAILY_TOP_N)
-    scoreB = dfB[["Date", "Ticker", "Momentum Score", "Early Momentum Score"]].copy()
-
-    dailyB.to_parquet(DAILYB_PATH, index=False)
-    scoreB.to_parquet(SCOREB_PATH, index=False)
-
-    print(f"Saved {DAILYB_PATH}")
-    print(f"Saved {SCOREB_PATH}")
-
-    # ---------------- Bucket C (unified) backtest ----------------
-    histU, tradesU = simulate_unified_portfolio(
-        df_prices=base,
-        price_table=priceA,
-        dailyA=dailyA,
-        dailyB=dailyB,
-        lookback_days=LOOKBACK_DAYS,
-        w_momentum=W_MOM,
-        w_early=W_EARLY,
-        w_consistency=W_CONS,
-        top_n=FINAL_TOP_N,
-        total_capital=100_000.0,
-        weight_A=0.20,
-        weight_B=0.80
+    weekly_cfg = WeeklySwingConfig(
+        adv_turnover_20_min=0.0,
+        breakout_buffer_pct=0.001,
     )
 
-    statsU = compute_performance_stats(histU)
-    trade_statsU = compute_trade_stats(tradesU)
+    weekly_sig = weekly_current_signals(df_prices, weekly_cfg, n_days=3)
+    if not weekly_sig.empty:
+        keep = [
+            "ticker",
+            "System",
+            "Signal",
+            "signal_date",
+            "score",
+            "breakout_level",
+            "pullback_level",
+            "stop_level",
+            "close",
+            "turnover_expansion",
+        ]
+        keep = [c for c in keep if c in weekly_sig.columns]
+        weekly_sig = weekly_sig[keep].sort_values(["signal_date", "score"], ascending=[False, False]).reset_index(drop=True)
 
-    histU.to_parquet(BUCKETC_HISTORY_PATH, index=False)
-    tradesU.to_parquet(BUCKETC_TRADES_PATH, index=False)
+    watch = fib_build_watchlist(df_prices, lookback_days=LOOKBACK_DAYS)
+    fib_sig = pd.DataFrame()
+    if watch is not None and not watch.empty:
+        fib_sig = fib_confirmation_engine(df_prices, watch)
+        if not fib_sig.empty:
+            fib_sig = fib_sig.sort_values(["Signal", "READINESS_SCORE"], ascending=[True, False]).reset_index(drop=True)
 
-    pd.DataFrame([{"Metric": k, "Value": v} for k, v in statsU.items()]).to_parquet(BUCKETC_STATS_PATH, index=False)
-    pd.DataFrame([{"Metric": k, "Value": v} for k, v in trade_statsU.items()]).to_parquet(BUCKETC_TRADE_STATS_PATH, index=False)
-
-    print(f"Saved {BUCKETC_HISTORY_PATH}")
-    print(f"Saved {BUCKETC_TRADES_PATH}")
-    print(f"Saved {BUCKETC_STATS_PATH}")
-    print(f"Saved {BUCKETC_TRADE_STATS_PATH}")
-
-    # ---------------- Latest preview (ready-to-display) ----------------
-    common_dates = sorted(set(dailyA["Date"]).intersection(set(dailyB["Date"])))
-    signal_date = common_dates[-1] if common_dates else None
-    if signal_date is None:
-        print("WARNING: No overlapping signal dates between dailyA and dailyB. Preview not saved.")
-        return
-
-    preview = build_bucket_c_signal_preview(
-        dailyA=dailyA,
-        dailyB=dailyB,
-        as_of_date=signal_date,
-        lookback_days=LOOKBACK_DAYS,
-        w_momentum=W_MOM,
-        w_early=W_EARLY,
-        w_consistency=W_CONS,
-        top_n=FINAL_TOP_N,
-        total_capital=100_000.0,
-        weight_A=0.20,
-        weight_B=0.80
+    mom_sig = momentum_bucketC_latest(
+        df_prices=df_prices,
+        index_returns=idx_returns,
+        top_n_daily=10,
+        final_top_n=10,
+        lookback_days=10,
     )
 
-    # Full-universe metadata cache (incremental)
-    # Use ALL tickers present in raw constituents parquet (SP500+HSI+STI)
-    raw_const = pd.read_parquet(RAW_CONSTITUENTS_PATH)
-    universe_tickers = sorted(raw_const["Ticker"].astype(str).unique().tolist())
-    meta = update_metadata_cache(universe_tickers, cache_path=YAHOO_META_CACHE_PATH, ttl_days=90, sleep_s=0.0)
+    def _best_weekly(x: pd.DataFrame) -> pd.Series:
+        x = x.sort_values("score", ascending=False)
+        r = x.iloc[0]
+        return pd.Series({
+            "weekly_tag": r.get("System", np.nan),
+            "weekly_signal": r.get("Signal", np.nan),
+            "weekly_score": r.get("score", np.nan),
+            "weekly_date": r.get("signal_date", np.nan),
+            "weekly_breakout": r.get("breakout_level", np.nan),
+            "weekly_stop": r.get("stop_level", np.nan),
+        })
 
-    preview = preview.drop(columns=["Name", "Sector", "Industry"], errors="ignore").merge(
-        meta[["Ticker", "Name", "Sector", "Industry"]],
-        on="Ticker",
-        how="left"
+    def _best_fib(x: pd.DataFrame) -> pd.Series:
+        order = {"BUY": 0, "WATCH": 1, "INVALID": 2}
+        x = x.copy()
+        x["_o"] = x["Signal"].map(order).fillna(9)
+        x = x.sort_values(["_o", "READINESS_SCORE"], ascending=[True, False])
+        r = x.iloc[0]
+        return pd.Series({
+            "fib_signal": r.get("Signal", np.nan),
+            "fib_readiness": r.get("READINESS_SCORE", np.nan),
+            "fib_shape": r.get("Shape", np.nan),
+            "fib_last_local_high": r.get("LastLocalHigh", np.nan),
+        })
+
+    def _best_mom(x: pd.DataFrame) -> pd.Series:
+        x = x.sort_values(["Signal_Confidence", "Weight_%"], ascending=[False, False])
+        r = x.iloc[0]
+        return pd.Series({
+            "mom_signal": r.get("Signal", np.nan),
+            "mom_conf": r.get("Signal_Confidence", np.nan),
+            "mom_weight": r.get("Weight_%", np.nan),
+            "mom_bucket": r.get("Bucket_Source", np.nan),
+            "mom_date": r.get("Signal_Date", np.nan),
+        })
+
+    if weekly_sig is not None and not weekly_sig.empty:
+        w = weekly_sig.groupby("ticker").apply(_best_weekly).reset_index()
+    else:
+        w = pd.DataFrame(columns=["ticker"])
+
+    if fib_sig is not None and not fib_sig.empty:
+        f = fib_sig.groupby("ticker").apply(_best_fib).reset_index()
+    else:
+        f = pd.DataFrame(columns=["ticker"])
+
+    if mom_sig is not None and not mom_sig.empty:
+        m = mom_sig.groupby("ticker").apply(_best_mom).reset_index()
+    else:
+        m = pd.DataFrame(columns=["ticker"])
+
+    combined = w.merge(f, on="ticker", how="outer").merge(m, on="ticker", how="outer")
+
+    combined["weekly_score_100"] = pd.to_numeric(combined.get("weekly_score"), errors="coerce") * 100.0
+    combined["fib_readiness"] = pd.to_numeric(combined.get("fib_readiness"), errors="coerce")
+    combined["mom_conf"] = pd.to_numeric(combined.get("mom_conf"), errors="coerce")
+
+    fib_bump = combined["fib_signal"].map({"BUY": 15, "WATCH": 5, "INVALID": 0}).fillna(0)
+
+    combined["ACTION_SCORE"] = (
+        0.45 * combined["weekly_score_100"].fillna(0) +
+        0.35 * combined["fib_readiness"].fillna(0) +
+        0.20 * combined["mom_conf"].fillna(0) +
+        fib_bump
     )
 
-    # Stamp the signal date (handy for UI)
-    preview["Signal_Date"] = pd.to_datetime(signal_date)
+    view_cols = [
+        "ticker",
+        "ACTION_SCORE",
+        "weekly_signal",
+        "weekly_tag",
+        "weekly_date",
+        "weekly_breakout",
+        "weekly_stop",
+        "fib_signal",
+        "fib_readiness",
+        "fib_shape",
+        "mom_conf",
+        "mom_weight",
+        "mom_bucket",
+        "mom_date",
+    ]
+    view_cols = [c for c in view_cols if c in combined.columns]
 
-    preview.to_parquet(PREVIEW_LATEST_PATH, index=False)
-    print(f"Saved {PREVIEW_LATEST_PATH}")
+    combined = combined.sort_values("ACTION_SCORE", ascending=False).reset_index(drop=True)
+
+    weekly_sig.to_parquet(WEEKLY_SIGNALS_PATH, index=False)
+    fib_sig.to_parquet(FIB_SIGNALS_PATH, index=False)
+    mom_sig.to_parquet(MOMENTUM_SIGNALS_PATH, index=False)
+    combined[view_cols].to_parquet(ACTION_LIST_PATH, index=False)
+
+    print(f"Saved {WEEKLY_SIGNALS_PATH}")
+    print(f"Saved {FIB_SIGNALS_PATH}")
+    print(f"Saved {MOMENTUM_SIGNALS_PATH}")
+    print(f"Saved {ACTION_LIST_PATH}")
 
 
 def main():
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-    # 1) Refresh raw parquets
     refresh_raw_parquets()
-
-    # 2) Build reference parquets (heavy lifting)
-    build_reference_parquets()
+    build_signal_parquets()
 
     print("\n✅ Overnight batch complete.")
 
