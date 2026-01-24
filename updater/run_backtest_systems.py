@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import pandas as pd
