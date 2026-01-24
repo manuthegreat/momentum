@@ -31,6 +31,23 @@ def _format_percentage(series: pd.Series, decimals: int = 0) -> pd.Series:
     return series.map(lambda value: fmt.format(value) if pd.notna(value) else "")
 
 
+def _normalize_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    try:
+        normalized = frame.convert_dtypes(dtype_backend="numpy_nullable")
+    except TypeError:
+        normalized = frame.convert_dtypes()
+
+    for column in normalized.columns:
+        dtype = normalized[column].dtype
+        dtype_name = str(dtype).lower()
+        if "string" in dtype_name or "unicode" in dtype_name:
+            normalized[column] = normalized[column].astype("string[python]")
+        elif "arrow" in dtype_name and "large" in dtype_name:
+            normalized[column] = normalized[column].astype(object)
+
+    return normalized
+
+
 @st.cache_data(show_spinner=False)
 def load_signal_artifacts():
     required = [
@@ -46,10 +63,10 @@ def load_signal_artifacts():
             + "\n".join(missing)
         )
 
-    weekly = pd.read_parquet(WEEKLY_SIGNALS_PATH)
-    fib = pd.read_parquet(FIB_SIGNALS_PATH)
-    mom = pd.read_parquet(MOMENTUM_SIGNALS_PATH)
-    action_list = pd.read_parquet(ACTION_LIST_PATH)
+    weekly = _normalize_dataframe(pd.read_parquet(WEEKLY_SIGNALS_PATH))
+    fib = _normalize_dataframe(pd.read_parquet(FIB_SIGNALS_PATH))
+    mom = _normalize_dataframe(pd.read_parquet(MOMENTUM_SIGNALS_PATH))
+    action_list = _normalize_dataframe(pd.read_parquet(ACTION_LIST_PATH))
 
     if "signal_date" in weekly.columns:
         weekly["signal_date"] = pd.to_datetime(weekly["signal_date"])
