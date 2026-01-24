@@ -31,6 +31,31 @@ def _format_percentage(series: pd.Series, decimals: int = 0) -> pd.Series:
     return series.map(lambda value: fmt.format(value) if pd.notna(value) else "")
 
 
+def _normalize_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    try:
+        normalized = frame.convert_dtypes(dtype_backend="numpy_nullable")
+    except TypeError:
+        normalized = frame.convert_dtypes()
+
+    for column in normalized.columns:
+        dtype = normalized[column].dtype
+        dtype_name = str(dtype).lower()
+        if "string" in dtype_name or "unicode" in dtype_name:
+            normalized[column] = normalized[column].astype("string[python]")
+        elif "arrow" in dtype_name and "large" in dtype_name:
+            normalized[column] = normalized[column].astype(object)
+
+    return normalized
+
+
+def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    safe = frame.copy()
+    object_cols = safe.select_dtypes(include=["object", "string"]).columns
+    if not object_cols.empty:
+        safe[object_cols] = safe[object_cols].astype("string[python]")
+    return safe
+
+
 @st.cache_data(show_spinner=False)
 def load_signal_artifacts():
     required = [
@@ -46,10 +71,10 @@ def load_signal_artifacts():
             + "\n".join(missing)
         )
 
-    weekly = pd.read_parquet(WEEKLY_SIGNALS_PATH)
-    fib = pd.read_parquet(FIB_SIGNALS_PATH)
-    mom = pd.read_parquet(MOMENTUM_SIGNALS_PATH)
-    action_list = pd.read_parquet(ACTION_LIST_PATH)
+    weekly = _normalize_dataframe(pd.read_parquet(WEEKLY_SIGNALS_PATH))
+    fib = _normalize_dataframe(pd.read_parquet(FIB_SIGNALS_PATH))
+    mom = _normalize_dataframe(pd.read_parquet(MOMENTUM_SIGNALS_PATH))
+    action_list = _normalize_dataframe(pd.read_parquet(ACTION_LIST_PATH))
 
     if "signal_date" in weekly.columns:
         weekly["signal_date"] = pd.to_datetime(weekly["signal_date"])
@@ -94,7 +119,7 @@ with tab_weekly:
         view = weekly_sig[weekly_sig["signal_date"].dt.date == selected].copy()
 
         st.caption(f"Signals for {selected}")
-        st.dataframe(view, use_container_width=True)
+        st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
 
 with tab_fib:
     st.markdown("### Fibonacci Confirmation Signals")
@@ -109,7 +134,7 @@ with tab_fib:
             default=["BUY", "WATCH"],
         )
         view = fib_sig[fib_sig["Signal"].isin(selected_signals)].copy()
-        st.dataframe(view, use_container_width=True)
+        st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
 
 with tab_mom:
     st.markdown("### Momentum Bucket C (Latest Candidates)")
@@ -130,7 +155,11 @@ with tab_mom:
                     format="%d%%",
                 ),
             }
-            st.dataframe(mom_sig, use_container_width=True, column_config=pct_cfg)
+            st.dataframe(
+                _streamlit_safe_frame(mom_sig),
+                use_container_width=True,
+                column_config=pct_cfg,
+            )
         else:
             view = mom_sig.copy()
             if "Weight_%" in view.columns:
@@ -141,7 +170,7 @@ with tab_mom:
                 view["Signal_Confidence"] = _format_percentage(
                     view["Signal_Confidence"], decimals=0
                 )
-            st.dataframe(view, use_container_width=True)
+            st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
 
 with tab_action:
     st.markdown("### Action List (Best Signal Per Ticker)")
@@ -158,9 +187,13 @@ with tab_action:
                     format="%d%%",
                 ),
             }
-            st.dataframe(action_list, use_container_width=True, column_config=pct_cfg)
+            st.dataframe(
+                _streamlit_safe_frame(action_list),
+                use_container_width=True,
+                column_config=pct_cfg,
+            )
         else:
             view = action_list.copy()
             if "mom_conf" in view.columns:
                 view["mom_conf"] = _format_percentage(view["mom_conf"], decimals=0)
-            st.dataframe(view, use_container_width=True)
+            st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
