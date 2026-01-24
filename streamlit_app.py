@@ -22,6 +22,15 @@ ACTION_LIST_PATH = os.path.join(ARTIFACTS_DIR, "action_list.parquet")
 st.set_page_config(page_title="Momentum Signals Dashboard", layout="wide")
 
 
+def _supports_column_config() -> bool:
+    return hasattr(st, "column_config")
+
+
+def _format_percentage(series: pd.Series, decimals: int = 0) -> pd.Series:
+    fmt = f"{{:.{decimals}f}}%"
+    return series.map(lambda value: fmt.format(value) if pd.notna(value) else "")
+
+
 @st.cache_data(show_spinner=False)
 def load_signal_artifacts():
     required = [
@@ -111,11 +120,28 @@ with tab_mom:
         signal_date = pd.to_datetime(mom_sig["Signal_Date"].max()).date()
         st.caption(f"Signals as of {signal_date}")
 
-        pct_cfg = {
-            "Weight_%": st.column_config.NumberColumn("Weight %", format="%.2f"),
-            "Signal_Confidence": st.column_config.ProgressColumn("Signal Strength", min_value=0, max_value=100, format="%d%%"),
-        }
-        st.dataframe(mom_sig, use_container_width=True, column_config=pct_cfg)
+        if _supports_column_config():
+            pct_cfg = {
+                "Weight_%": st.column_config.NumberColumn("Weight %", format="%.2f"),
+                "Signal_Confidence": st.column_config.ProgressColumn(
+                    "Signal Strength",
+                    min_value=0,
+                    max_value=100,
+                    format="%d%%",
+                ),
+            }
+            st.dataframe(mom_sig, use_container_width=True, column_config=pct_cfg)
+        else:
+            view = mom_sig.copy()
+            if "Weight_%" in view.columns:
+                view["Weight_%"] = view["Weight_%"].map(
+                    lambda value: f"{value:.2f}" if pd.notna(value) else ""
+                )
+            if "Signal_Confidence" in view.columns:
+                view["Signal_Confidence"] = _format_percentage(
+                    view["Signal_Confidence"], decimals=0
+                )
+            st.dataframe(view, use_container_width=True)
 
 with tab_action:
     st.markdown("### Action List (Best Signal Per Ticker)")
@@ -123,7 +149,18 @@ with tab_action:
     if action_list.empty:
         st.info("No action list generated in the latest batch.")
     else:
-        pct_cfg = {
-            "mom_conf": st.column_config.ProgressColumn("Momentum Confidence", min_value=0, max_value=100, format="%d%%"),
-        }
-        st.dataframe(action_list, use_container_width=True, column_config=pct_cfg)
+        if _supports_column_config():
+            pct_cfg = {
+                "mom_conf": st.column_config.ProgressColumn(
+                    "Momentum Confidence",
+                    min_value=0,
+                    max_value=100,
+                    format="%d%%",
+                ),
+            }
+            st.dataframe(action_list, use_container_width=True, column_config=pct_cfg)
+        else:
+            view = action_list.copy()
+            if "mom_conf" in view.columns:
+                view["mom_conf"] = _format_percentage(view["mom_conf"], decimals=0)
+            st.dataframe(view, use_container_width=True)
