@@ -48,6 +48,14 @@ def _normalize_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
+def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    safe = frame.copy()
+    object_cols = safe.select_dtypes(include=["object", "string"]).columns
+    if not object_cols.empty:
+        safe[object_cols] = safe[object_cols].astype("string[python]")
+    return safe
+
+
 @st.cache_data(show_spinner=False)
 def load_signal_artifacts():
     required = [
@@ -111,7 +119,7 @@ with tab_weekly:
         view = weekly_sig[weekly_sig["signal_date"].dt.date == selected].copy()
 
         st.caption(f"Signals for {selected}")
-        st.dataframe(view, use_container_width=True)
+        st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
 
 with tab_fib:
     st.markdown("### Fibonacci Confirmation Signals")
@@ -126,7 +134,7 @@ with tab_fib:
             default=["BUY", "WATCH"],
         )
         view = fib_sig[fib_sig["Signal"].isin(selected_signals)].copy()
-        st.dataframe(view, use_container_width=True)
+        st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
 
 with tab_mom:
     st.markdown("### Momentum Bucket C (Latest Candidates)")
@@ -147,7 +155,11 @@ with tab_mom:
                     format="%d%%",
                 ),
             }
-            st.dataframe(mom_sig, use_container_width=True, column_config=pct_cfg)
+            st.dataframe(
+                _streamlit_safe_frame(mom_sig),
+                use_container_width=True,
+                column_config=pct_cfg,
+            )
         else:
             view = mom_sig.copy()
             if "Weight_%" in view.columns:
@@ -158,7 +170,7 @@ with tab_mom:
                 view["Signal_Confidence"] = _format_percentage(
                     view["Signal_Confidence"], decimals=0
                 )
-            st.dataframe(view, use_container_width=True)
+            st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
 
 with tab_action:
     st.markdown("### Action List (Best Signal Per Ticker)")
@@ -175,9 +187,13 @@ with tab_action:
                     format="%d%%",
                 ),
             }
-            st.dataframe(action_list, use_container_width=True, column_config=pct_cfg)
+            st.dataframe(
+                _streamlit_safe_frame(action_list),
+                use_container_width=True,
+                column_config=pct_cfg,
+            )
         else:
             view = action_list.copy()
             if "mom_conf" in view.columns:
                 view["mom_conf"] = _format_percentage(view["mom_conf"], decimals=0)
-            st.dataframe(view, use_container_width=True)
+            st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
