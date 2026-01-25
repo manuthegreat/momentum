@@ -97,7 +97,7 @@ def fx_to_usd(ticker: str) -> float:
 
 
 def build_weekly_signals(df_prices: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFrame:
-    d = df_prices.copy()
+    d = prepare_weekly_input(df_prices)
     d = weekly_add_indicators(d, cfg)
     sig = weekly_detect_setups(d, cfg)
     if sig is None or sig.empty:
@@ -105,6 +105,33 @@ def build_weekly_signals(df_prices: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.
     sig = sig.copy()
     sig["signal_date"] = pd.to_datetime(sig["signal_date"]).dt.normalize()
     return sig
+
+
+def infer_country_from_ticker(ticker: str) -> str:
+    t = str(ticker).upper()
+    if t.endswith(".HK"):
+        return "HK"
+    if t.endswith(".SI"):
+        return "SG"
+    return "US"
+
+
+def _default_mcap_for_country(country: str) -> float:
+    if country == "HK":
+        return 5e9
+    if country == "SG":
+        return 1e9
+    return 2e9
+
+
+def prepare_weekly_input(df_prices: pd.DataFrame) -> pd.DataFrame:
+    d = df_prices.copy()
+    d["country"] = d["ticker"].map(infer_country_from_ticker)
+    if "market_cap" not in d.columns:
+        d["market_cap"] = d["country"].map(_default_mcap_for_country)
+    if "turnover" not in d.columns:
+        d["turnover"] = d["close"].astype(float) * d["volume"].astype(float)
+    return d
 
 
 def momentum_bucketC_latest_asof(
@@ -475,6 +502,8 @@ def nth_trading_date_for_ticker(dates_by_ticker: Dict[str, np.ndarray], ticker: 
 def main():
     df = load_prices_from_parquet(PRICES_PATH)
     idx = load_index_returns_from_parquet(INDEX_RETURNS_PATH)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    idx["date"] = pd.to_datetime(idx["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
 
     dates_by_ticker: Dict[str, np.ndarray] = {}
     for t, g in df.groupby("ticker", sort=False):
@@ -484,9 +513,9 @@ def main():
     total_days = len(calendar)
     date_to_i: Dict[pd.Timestamp, int] = {pd.Timestamp(d).normalize(): i for i, d in enumerate(calendar)}
 
-    px_open = {(r.ticker, r.date): float(r.open) for r in df.itertuples(index=False)}
-    px_high = {(r.ticker, r.date): float(r.high) for r in df.itertuples(index=False)}
-    px_low = {(r.ticker, r.date): float(r.low) for r in df.itertuples(index=False)}
+    px_open = {(r.ticker, pd.Timestamp(r.date).normalize()): float(r.open) for r in df.itertuples(index=False)}
+    px_high = {(r.ticker, pd.Timestamp(r.date).normalize()): float(r.high) for r in df.itertuples(index=False)}
+    px_low = {(r.ticker, pd.Timestamp(r.date).normalize()): float(r.low) for r in df.itertuples(index=False)}
 
     close_ffill: Dict[str, np.ndarray] = {}
     cal_index = pd.Index(calendar)
