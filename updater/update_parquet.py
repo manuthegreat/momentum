@@ -821,6 +821,7 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
             "ticker": ticker,
             "System": "fibonacci",
             "Signal": final_signal,
+            "Signal_Date": pd.to_datetime(row["Latest Date"]).normalize(),
             "READINESS_SCORE": round(float(np.clip(readiness, 0, 100)), 2),
             "LastLocalHigh": float(last_local_high) if np.isfinite(last_local_high) else np.nan,
             "HL_Price": float(hl_price) if np.isfinite(hl_price) else np.nan,
