@@ -74,6 +74,20 @@ def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return safe
 
 
+def _render_equity_chart(frame: pd.DataFrame, height: int, key: str) -> None:
+    summary = _monthly_summary(frame)
+    if summary.empty:
+        return
+    fig = px.line(summary, x="Month", y="End", markers=True)
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title=None,
+        yaxis_title="End Equity",
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
+
+
 def _latest_date(frame: pd.DataFrame, column: str) -> pd.Timestamp | None:
     if column not in frame.columns or frame.empty:
         return None
@@ -100,8 +114,7 @@ def _monthly_summary(frame: pd.DataFrame) -> pd.DataFrame:
     return grouped[["Month", "Start", "End", "Month %", "Cum %"]]
 
 
-def _render_monthly_summary(frame: pd.DataFrame, label: str) -> None:
-    # Charts intentionally removed: keep monthly summaries as tables only.
+def _render_monthly_summary(frame: pd.DataFrame, label: str, key: str | None = None) -> None:
     summary = _monthly_summary(frame)
     if summary.empty:
         return
@@ -113,6 +126,19 @@ def _render_monthly_summary(frame: pd.DataFrame, label: str) -> None:
     summary_view["Month %"] = summary_view["Month %"].map(lambda v: f"{v:.2f}%")
     summary_view["Cum %"] = summary_view["Cum %"].map(lambda v: f"{v:.2f}%")
     st.dataframe(_streamlit_safe_frame(summary_view), use_container_width=True)
+
+    fig = px.line(summary, x="Month", y="End", markers=True)
+    fig.update_layout(
+        height=220,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title=None,
+        yaxis_title="End Equity",
+    )
+    if key:
+        st.plotly_chart(fig, use_container_width=True, key=key)
+    else:
+        st.plotly_chart(fig, use_container_width=True)
+
 
 def _filter_dataframe(frame: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     filtered = frame.copy()
