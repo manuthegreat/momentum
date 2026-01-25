@@ -11,6 +11,7 @@ import json
 import os
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 ARTIFACTS_DIR = "artifacts"
@@ -72,6 +73,18 @@ def _render_equity_chart(frame: pd.DataFrame, height: int) -> None:
     view = view.set_index("date")
 
     st.line_chart(view["equity_usd"], height=height)
+    view["date"] = pd.to_datetime(view["date"])
+    view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
+    view = view.dropna(subset=["date", "equity_usd"])
+
+    fig = px.line(view, x="date", y="equity_usd")
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title=None,
+        yaxis_title=None,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 @st.cache_data(show_spinner=False)
