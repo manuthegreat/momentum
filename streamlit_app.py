@@ -62,6 +62,10 @@ def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
     object_cols = safe.select_dtypes(include=["object", "string"]).columns
     if not object_cols.empty:
         safe[object_cols] = safe[object_cols].astype("string[python]")
+    for column in safe.columns:
+        dtype_name = str(safe[column].dtype).lower()
+        if "pyarrow" in dtype_name and ("string" in dtype_name or "utf" in dtype_name):
+            safe[column] = safe[column].astype("string[python]")
     return safe
 
 
@@ -70,12 +74,8 @@ def _render_equity_chart(frame: pd.DataFrame, height: int) -> None:
     view["date"] = pd.to_datetime(view["date"], errors="coerce")
     view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
     view = view.dropna(subset=["date", "equity_usd"]).sort_values("date")
-    view = view.set_index("date")
-
-    st.line_chart(view["equity_usd"], height=height)
-    view["date"] = pd.to_datetime(view["date"])
-    view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
-    view = view.dropna(subset=["date", "equity_usd"])
+    line_view = view.set_index("date")
+    st.line_chart(line_view["equity_usd"], height=height)
 
     fig = px.line(view, x="date", y="equity_usd")
     fig.update_layout(
