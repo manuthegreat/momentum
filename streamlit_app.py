@@ -80,9 +80,6 @@ def _render_equity_chart(frame: pd.DataFrame, height: int) -> None:
     view["date"] = pd.to_datetime(view["date"], errors="coerce")
     view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
     view = view.dropna(subset=["date", "equity_usd"]).sort_values("date")
-    line_view = view.set_index("date")
-    st.line_chart(line_view["equity_usd"], height=height)
-
     fig = px.line(view, x="date", y="equity_usd")
     fig.update_layout(
         height=height,
@@ -399,7 +396,18 @@ with tab_backtest:
         if trades.empty:
             st.info("No trades found in the backtest output.")
         else:
-            st.dataframe(_streamlit_safe_frame(trades.tail(200)), use_container_width=True)
+            portfolio_options = sorted(trades["portfolio"].dropna().unique())
+            selected_portfolios = st.multiselect(
+                "Portfolios",
+                options=portfolio_options,
+                default=portfolio_options,
+                key="backtest-trades-portfolios",
+            )
+            view = trades.copy()
+            if selected_portfolios:
+                view = view[view["portfolio"].isin(selected_portfolios)]
+            view = view.sort_values("date", ascending=False).head(200)
+            st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
 
         st.subheader("Open Positions (End of Backtest)")
         positions = backtests["positions"]
