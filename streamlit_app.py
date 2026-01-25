@@ -11,7 +11,6 @@ import json
 import os
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 ARTIFACTS_DIR = "artifacts"
@@ -414,30 +413,6 @@ with tab_backtest:
         if stats is not None and not stats.empty:
             st.subheader("Summary Stats")
             st.dataframe(_streamlit_safe_frame(stats), use_container_width=True)
-
-        st.subheader("Equity Curves")
-        equity_combined = backtests["equity_combined"]
-        if not equity_combined.empty:
-            _render_equity_chart(equity_combined, height=220, key="equity-combined")
-
-        cols = st.columns(3)
-        for col, key, label in zip(
-            cols,
-            ["equity_s1", "equity_s2", "equity_s3"],
-            ["System 1 (Weekly)", "System 2 (Fib)", "System 3 (Momentum)"],
-        ):
-            data = backtests[key]
-            if data.empty:
-                continue
-            with col:
-                st.caption(label)
-                _render_equity_chart(data, height=160, key=f"equity-{key}")
-
-        st.subheader("Monthly Summaries")
-        _render_monthly_summary(backtests["equity_s1"], "System 1 (Weekly)", key="monthly-s1")
-        _render_monthly_summary(backtests["equity_s2"], "System 2 (Fib)", key="monthly-s2")
-        _render_monthly_summary(backtests["equity_s3"], "System 3 (Momentum)", key="monthly-s3")
-        _render_monthly_summary(backtests["equity_combined"], "Combined", key="monthly-combined")
 
         st.subheader("Monthly Summaries")
         _render_monthly_summary(backtests["equity_s1"], "System 1 (Weekly)")
