@@ -11,7 +11,6 @@ import json
 import os
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 ARTIFACTS_DIR = "artifacts"
@@ -75,133 +74,6 @@ def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return safe
 
 
-def _render_equity_chart(frame: pd.DataFrame, height: int, key: str) -> None:
-    summary = _monthly_summary(frame)
-    if summary.empty:
-        return
-    fig = px.line(summary, x="Month", y="End", markers=True)
-    fig.update_layout(
-        height=height,
-        margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title=None,
-        yaxis_title="End Equity",
-    )
-    st.plotly_chart(fig, use_container_width=True, key=key)
-
-
-def _latest_date(frame: pd.DataFrame, column: str) -> pd.Timestamp | None:
-    if column not in frame.columns or frame.empty:
-        return None
-    dates = pd.to_datetime(frame[column], errors="coerce").dropna()
-    if dates.empty:
-        return None
-    return dates.max()
-
-
-def _monthly_summary(frame: pd.DataFrame) -> pd.DataFrame:
-    view = frame[["date", "equity_usd"]].copy()
-    view["date"] = pd.to_datetime(view["date"], errors="coerce")
-    view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
-    view = view.dropna(subset=["date", "equity_usd"]).sort_values("date")
-    if view.empty:
-        return pd.DataFrame()
-
-    view["month"] = view["date"].dt.to_period("M").dt.to_timestamp()
-    grouped = (
-        view.groupby("month", as_index=False, sort=True)
-        .agg(Start=("equity_usd", "first"), End=("equity_usd", "last"))
-        .rename(columns={"month": "Month"})
-    )
-    grouped["Month %"] = (grouped["End"] / grouped["Start"] - 1.0) * 100.0
-    first_equity = grouped["Start"].iloc[0]
-    grouped["Cum %"] = (grouped["End"] / first_equity - 1.0) * 100.0
-    return grouped[["Month", "Start", "End", "Month %", "Cum %"]]
-
-
-def _render_monthly_summary(frame: pd.DataFrame, label: str, key: str) -> None:
-    summary = _monthly_summary(frame)
-    if summary.empty:
-        return
-
-    st.markdown(f"#### {label}: Monthly Summary")
-    summary_view = summary.copy()
-    summary_view["Start"] = summary_view["Start"].map(lambda v: f"${v:,.0f}")
-    summary_view["End"] = summary_view["End"].map(lambda v: f"${v:,.0f}")
-    summary_view["Month %"] = summary_view["Month %"].map(lambda v: f"{v:.2f}%")
-    summary_view["Cum %"] = summary_view["Cum %"].map(lambda v: f"{v:.2f}%")
-    st.dataframe(_streamlit_safe_frame(summary_view), use_container_width=True)
-
-    fig = px.line(summary, x="Month", y="End", markers=True)
-    fig = px.line(view, x="date", y="equity_usd")
-    fig.update_layout(
-        height=220,
-        margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title=None,
-        yaxis_title="End Equity",
-    )
-    st.plotly_chart(fig, use_container_width=True, key=key)
-
-
-def _filter_dataframe(frame: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
-    filtered = frame.copy()
-    with st.expander("Filters", expanded=False):
-        filter_cols = st.multiselect(
-            "Filter columns",
-            options=list(frame.columns),
-            key=f"{key_prefix}-filter-cols",
-        )
-        for col in filter_cols:
-            series = frame[col]
-            col_key = f"{key_prefix}-{col}"
-            if pd.api.types.is_datetime64_any_dtype(series):
-                series = pd.to_datetime(series, errors="coerce")
-                min_date = series.min()
-                max_date = series.max()
-                if pd.isna(min_date) or pd.isna(max_date):
-                    continue
-                date_range = st.date_input(
-                    f"{col} range",
-                    value=(min_date.date(), max_date.date()),
-                    key=col_key,
-                )
-                if isinstance(date_range, tuple) and len(date_range) == 2:
-                    start_date, end_date = date_range
-                    mask = series.dt.date.between(start_date, end_date)
-                    filtered = filtered[mask]
-            elif pd.api.types.is_numeric_dtype(series):
-                min_val = float(series.min())
-                max_val = float(series.max())
-                if min_val == max_val:
-                    st.caption(f"{col}: {min_val}")
-                    continue
-                step = (max_val - min_val) / 100 if max_val > min_val else 1.0
-                selected = st.slider(
-                    f"{col} range",
-                    min_value=min_val,
-                    max_value=max_val,
-                    value=(min_val, max_val),
-                    step=step,
-                    key=col_key,
-                )
-                filtered = filtered[series.between(selected[0], selected[1])]
-            else:
-                unique = sorted(series.dropna().astype(str).unique())
-                if len(unique) <= 50:
-                    selected = st.multiselect(
-                        f"{col} values",
-                        options=unique,
-                        default=unique,
-                        key=col_key,
-                    )
-                    if selected:
-                        filtered = filtered[series.astype(str).isin(selected)]
-                else:
-                    query = st.text_input(f"{col} contains", key=col_key)
-                    if query:
-                        filtered = filtered[series.astype(str).str.contains(query, case=False, na=False)]
-    return filtered
-
-
 def _latest_date(frame: pd.DataFrame, column: str) -> pd.Timestamp | None:
     if column not in frame.columns or frame.empty:
         return None
@@ -229,6 +101,7 @@ def _monthly_summary(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _render_monthly_summary(frame: pd.DataFrame, label: str) -> None:
+    # Charts intentionally removed: keep monthly summaries as tables only.
     summary = _monthly_summary(frame)
     if summary.empty:
         return
@@ -240,16 +113,6 @@ def _render_monthly_summary(frame: pd.DataFrame, label: str) -> None:
     summary_view["Month %"] = summary_view["Month %"].map(lambda v: f"{v:.2f}%")
     summary_view["Cum %"] = summary_view["Cum %"].map(lambda v: f"{v:.2f}%")
     st.dataframe(_streamlit_safe_frame(summary_view), use_container_width=True)
-
-    fig = px.line(summary, x="Month", y="End", markers=True)
-    fig.update_layout(
-        height=220,
-        margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title=None,
-        yaxis_title="End Equity",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
 
 def _filter_dataframe(frame: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     filtered = frame.copy()
@@ -524,30 +387,6 @@ with tab_backtest:
         if stats is not None and not stats.empty:
             st.subheader("Summary Stats")
             st.dataframe(_streamlit_safe_frame(stats), use_container_width=True)
-
-        st.subheader("Equity Curves")
-        equity_combined = backtests["equity_combined"]
-        if not equity_combined.empty:
-            _render_equity_chart(equity_combined, height=220, key="equity-combined")
-
-        cols = st.columns(3)
-        for col, key, label in zip(
-            cols,
-            ["equity_s1", "equity_s2", "equity_s3"],
-            ["System 1 (Weekly)", "System 2 (Fib)", "System 3 (Momentum)"],
-        ):
-            data = backtests[key]
-            if data.empty:
-                continue
-            with col:
-                st.caption(label)
-                _render_equity_chart(data, height=160, key=f"equity-{key}")
-
-        st.subheader("Monthly Summaries")
-        _render_monthly_summary(backtests["equity_s1"], "System 1 (Weekly)", key="monthly-s1")
-        _render_monthly_summary(backtests["equity_s2"], "System 2 (Fib)", key="monthly-s2")
-        _render_monthly_summary(backtests["equity_s3"], "System 3 (Momentum)", key="monthly-s3")
-        _render_monthly_summary(backtests["equity_combined"], "Combined", key="monthly-combined")
 
         st.subheader("Monthly Summaries")
         _render_monthly_summary(backtests["equity_s1"], "System 1 (Weekly)")
