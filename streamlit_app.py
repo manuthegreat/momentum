@@ -99,6 +99,46 @@ def _latest_date(frame: pd.DataFrame, column: str) -> pd.Timestamp | None:
     return dates.max()
 
 
+def _monthly_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    view = frame[["date", "equity_usd"]].copy()
+    view["date"] = pd.to_datetime(view["date"], errors="coerce")
+    view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
+    view = view.dropna(subset=["date", "equity_usd"]).sort_values("date")
+    if view.empty:
+        return pd.DataFrame()
+
+    view["month"] = view["date"].dt.to_period("M").dt.to_timestamp()
+    grouped = view.groupby("month", as_index=False)["equity_usd"].agg(["first", "last"]).reset_index()
+    grouped = grouped.rename(columns={"first": "Start", "last": "End", "month": "Month"})
+    grouped["Month %"] = (grouped["End"] / grouped["Start"] - 1.0) * 100.0
+    first_equity = grouped["Start"].iloc[0]
+    grouped["Cum %"] = (grouped["End"] / first_equity - 1.0) * 100.0
+    return grouped[["Month", "Start", "End", "Month %", "Cum %"]]
+
+
+def _render_monthly_summary(frame: pd.DataFrame, label: str) -> None:
+    summary = _monthly_summary(frame)
+    if summary.empty:
+        return
+
+    st.markdown(f"#### {label}: Monthly Summary")
+    summary_view = summary.copy()
+    summary_view["Start"] = summary_view["Start"].map(lambda v: f"${v:,.0f}")
+    summary_view["End"] = summary_view["End"].map(lambda v: f"${v:,.0f}")
+    summary_view["Month %"] = summary_view["Month %"].map(lambda v: f"{v:.2f}%")
+    summary_view["Cum %"] = summary_view["Cum %"].map(lambda v: f"{v:.2f}%")
+    st.dataframe(_streamlit_safe_frame(summary_view), use_container_width=True)
+
+    fig = px.line(summary, x="Month", y="End", markers=True)
+    fig.update_layout(
+        height=220,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title=None,
+        yaxis_title="End Equity",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def _filter_dataframe(frame: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     filtered = frame.copy()
     with st.expander("Filters", expanded=False):
@@ -390,6 +430,12 @@ with tab_backtest:
             with col:
                 st.caption(label)
                 _render_equity_chart(data, height=160)
+
+        st.subheader("Monthly Summaries")
+        _render_monthly_summary(backtests["equity_s1"], "System 1 (Weekly)")
+        _render_monthly_summary(backtests["equity_s2"], "System 2 (Fib)")
+        _render_monthly_summary(backtests["equity_s3"], "System 3 (Momentum)")
+        _render_monthly_summary(backtests["equity_combined"], "Combined")
 
         st.subheader("Recent Trades")
         trades = backtests["trades"]
