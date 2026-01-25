@@ -64,6 +64,16 @@ def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return safe
 
 
+def _render_equity_chart(frame: pd.DataFrame, height: int) -> None:
+    view = frame[["date", "equity_usd"]].copy()
+    view["date"] = pd.to_datetime(view["date"], errors="coerce")
+    view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
+    view = view.dropna(subset=["date", "equity_usd"]).sort_values("date")
+    view = view.set_index("date")
+
+    st.line_chart(view["equity_usd"], height=height)
+
+
 @st.cache_data(show_spinner=False)
 def load_signal_artifacts():
     required = [
@@ -269,7 +279,7 @@ with tab_backtest:
         st.subheader("Equity Curves")
         equity_combined = backtests["equity_combined"]
         if not equity_combined.empty:
-            st.line_chart(equity_combined.set_index("date")["equity_usd"], height=220)
+            _render_equity_chart(equity_combined, height=220)
 
         cols = st.columns(3)
         for col, key, label in zip(
@@ -282,7 +292,7 @@ with tab_backtest:
                 continue
             with col:
                 st.caption(label)
-                st.line_chart(data.set_index("date")["equity_usd"], height=160)
+                _render_equity_chart(data, height=160)
 
         st.subheader("Recent Trades")
         trades = backtests["trades"]
