@@ -17,6 +17,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from updater.golden_source_validation import GoldenSourceCheck, validate_golden_source
+
 warnings.filterwarnings("ignore")
 
 ARTIFACTS_DIR = "artifacts"
@@ -28,6 +30,8 @@ WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals.parquet"
 FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals.parquet")
 MOMENTUM_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "momentum_bucketc_signals.parquet")
 ACTION_LIST_PATH = os.path.join(ARTIFACTS_DIR, "action_list.parquet")
+GOLDEN_WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals_golden.parquet")
+GOLDEN_FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals_golden.parquet")
 
 
 # ============================================================
@@ -821,6 +825,7 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
             "ticker": ticker,
             "System": "fibonacci",
             "Signal": final_signal,
+            "Signal_Date": pd.to_datetime(row["Latest Date"]).normalize(),
             "READINESS_SCORE": round(float(np.clip(readiness, 0, 100)), 2),
             "LastLocalHigh": float(last_local_high) if np.isfinite(last_local_high) else np.nan,
             "HL_Price": float(hl_price) if np.isfinite(hl_price) else np.nan,
@@ -1311,6 +1316,48 @@ def build_signal_parquets():
     view_cols = [c for c in view_cols if c in combined.columns]
 
     combined = combined.sort_values("ACTION_SCORE", ascending=False).reset_index(drop=True)
+
+    checks = [
+        GoldenSourceCheck(
+            label="weekly",
+            path=GOLDEN_WEEKLY_SIGNALS_PATH,
+            key_columns=["signal_date", "ticker"],
+            compare_columns=[
+                "System",
+                "Signal",
+                "score",
+                "breakout_level",
+                "pullback_level",
+                "stop_level",
+                "close",
+                "turnover_expansion",
+            ],
+        ),
+        GoldenSourceCheck(
+            label="fib",
+            path=GOLDEN_FIB_SIGNALS_PATH,
+            key_columns=["Signal_Date", "ticker"],
+            compare_columns=[
+                "System",
+                "Signal",
+                "READINESS_SCORE",
+                "LastLocalHigh",
+                "HL_Price",
+                "LatestPrice",
+                "Shape",
+                "ShapePriority",
+            ],
+        ),
+    ]
+    validation_messages = validate_golden_source(
+        checks,
+        {
+            "weekly": weekly_sig,
+            "fib": fib_sig,
+        },
+    )
+    for message in validation_messages:
+        print(message)
 
     weekly_sig.to_parquet(WEEKLY_SIGNALS_PATH, index=False)
     fib_sig.to_parquet(FIB_SIGNALS_PATH, index=False)
