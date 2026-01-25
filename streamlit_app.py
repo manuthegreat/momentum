@@ -51,7 +51,11 @@ def _normalize_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
         dtype_name = str(dtype).lower()
         if "string" in dtype_name or "unicode" in dtype_name:
             normalized[column] = normalized[column].astype("string[python]")
-        elif "arrow" in dtype_name and "large" in dtype_name:
+            continue
+        if "arrow" in dtype_name or "pyarrow" in dtype_name:
+            normalized[column] = normalized[column].astype(object)
+            continue
+        if hasattr(pd, "ArrowDtype") and isinstance(dtype, pd.ArrowDtype):
             normalized[column] = normalized[column].astype(object)
 
     return normalized
@@ -61,11 +65,13 @@ def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
     safe = frame.copy()
     object_cols = safe.select_dtypes(include=["object", "string"]).columns
     if not object_cols.empty:
-        safe[object_cols] = safe[object_cols].astype("string[python]")
+        safe[object_cols] = safe[object_cols].astype("string[python]").astype(object)
     for column in safe.columns:
         dtype_name = str(safe[column].dtype).lower()
-        if "pyarrow" in dtype_name and ("string" in dtype_name or "utf" in dtype_name):
-            safe[column] = safe[column].astype("string[python]")
+        if "pyarrow" in dtype_name or "arrow" in dtype_name:
+            safe[column] = safe[column].astype("string[python]").astype(object)
+        elif hasattr(pd, "ArrowDtype") and isinstance(safe[column].dtype, pd.ArrowDtype):
+            safe[column] = safe[column].astype(object)
     return safe
 
 
@@ -74,9 +80,6 @@ def _render_equity_chart(frame: pd.DataFrame, height: int) -> None:
     view["date"] = pd.to_datetime(view["date"], errors="coerce")
     view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
     view = view.dropna(subset=["date", "equity_usd"]).sort_values("date")
-    line_view = view.set_index("date")
-    st.line_chart(line_view["equity_usd"], height=height)
-
     fig = px.line(view, x="date", y="equity_usd")
     fig.update_layout(
         height=height,
@@ -85,6 +88,115 @@ def _render_equity_chart(frame: pd.DataFrame, height: int) -> None:
         yaxis_title=None,
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+def _latest_date(frame: pd.DataFrame, column: str) -> pd.Timestamp | None:
+    if column not in frame.columns or frame.empty:
+        return None
+    dates = pd.to_datetime(frame[column], errors="coerce").dropna()
+    if dates.empty:
+        return None
+    return dates.max()
+
+
+def _monthly_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    view = frame[["date", "equity_usd"]].copy()
+    view["date"] = pd.to_datetime(view["date"], errors="coerce")
+    view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
+    view = view.dropna(subset=["date", "equity_usd"]).sort_values("date")
+    if view.empty:
+        return pd.DataFrame()
+
+    view["month"] = view["date"].dt.to_period("M").dt.to_timestamp()
+    grouped = view.groupby("month", as_index=False)["equity_usd"].agg(["first", "last"]).reset_index()
+    grouped = grouped.rename(columns={"first": "Start", "last": "End", "month": "Month"})
+    grouped["Month %"] = (grouped["End"] / grouped["Start"] - 1.0) * 100.0
+    first_equity = grouped["Start"].iloc[0]
+    grouped["Cum %"] = (grouped["End"] / first_equity - 1.0) * 100.0
+    return grouped[["Month", "Start", "End", "Month %", "Cum %"]]
+
+
+def _render_monthly_summary(frame: pd.DataFrame, label: str) -> None:
+    summary = _monthly_summary(frame)
+    if summary.empty:
+        return
+
+    st.markdown(f"#### {label}: Monthly Summary")
+    summary_view = summary.copy()
+    summary_view["Start"] = summary_view["Start"].map(lambda v: f"${v:,.0f}")
+    summary_view["End"] = summary_view["End"].map(lambda v: f"${v:,.0f}")
+    summary_view["Month %"] = summary_view["Month %"].map(lambda v: f"{v:.2f}%")
+    summary_view["Cum %"] = summary_view["Cum %"].map(lambda v: f"{v:.2f}%")
+    st.dataframe(_streamlit_safe_frame(summary_view), use_container_width=True)
+
+    fig = px.line(summary, x="Month", y="End", markers=True)
+    fig.update_layout(
+        height=220,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title=None,
+        yaxis_title="End Equity",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _filter_dataframe(frame: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
+    filtered = frame.copy()
+    with st.expander("Filters", expanded=False):
+        filter_cols = st.multiselect(
+            "Filter columns",
+            options=list(frame.columns),
+            key=f"{key_prefix}-filter-cols",
+        )
+        for col in filter_cols:
+            series = frame[col]
+            col_key = f"{key_prefix}-{col}"
+            if pd.api.types.is_datetime64_any_dtype(series):
+                series = pd.to_datetime(series, errors="coerce")
+                min_date = series.min()
+                max_date = series.max()
+                if pd.isna(min_date) or pd.isna(max_date):
+                    continue
+                date_range = st.date_input(
+                    f"{col} range",
+                    value=(min_date.date(), max_date.date()),
+                    key=col_key,
+                )
+                if isinstance(date_range, tuple) and len(date_range) == 2:
+                    start_date, end_date = date_range
+                    mask = series.dt.date.between(start_date, end_date)
+                    filtered = filtered[mask]
+            elif pd.api.types.is_numeric_dtype(series):
+                min_val = float(series.min())
+                max_val = float(series.max())
+                if min_val == max_val:
+                    st.caption(f"{col}: {min_val}")
+                    continue
+                step = (max_val - min_val) / 100 if max_val > min_val else 1.0
+                selected = st.slider(
+                    f"{col} range",
+                    min_value=min_val,
+                    max_value=max_val,
+                    value=(min_val, max_val),
+                    step=step,
+                    key=col_key,
+                )
+                filtered = filtered[series.between(selected[0], selected[1])]
+            else:
+                unique = sorted(series.dropna().astype(str).unique())
+                if len(unique) <= 50:
+                    selected = st.multiselect(
+                        f"{col} values",
+                        options=unique,
+                        default=unique,
+                        key=col_key,
+                    )
+                    if selected:
+                        filtered = filtered[series.astype(str).isin(selected)]
+                else:
+                    query = st.text_input(f"{col} contains", key=col_key)
+                    if query:
+                        filtered = filtered[series.astype(str).str.contains(query, case=False, na=False)]
+    return filtered
 
 
 @st.cache_data(show_spinner=False)
@@ -109,6 +221,8 @@ def load_signal_artifacts():
 
     if "signal_date" in weekly.columns:
         weekly["signal_date"] = pd.to_datetime(weekly["signal_date"])
+    if "Signal_Date" in fib.columns:
+        fib["Signal_Date"] = pd.to_datetime(fib["Signal_Date"])
     if "Signal_Date" in mom.columns:
         mom["Signal_Date"] = pd.to_datetime(mom["Signal_Date"])
     if "mom_date" in action_list.columns:
@@ -190,12 +304,16 @@ with tab_weekly:
     if weekly_sig.empty:
         st.info("No weekly swing signals found in the latest batch.")
     else:
+        latest_weekly = _latest_date(weekly_sig, "signal_date")
+        if latest_weekly is not None:
+            st.caption(f"Latest weekly signal date: {latest_weekly.date()}")
         dates = sorted(weekly_sig["signal_date"].dt.date.unique())
         selected = st.selectbox("Signal date", options=dates, index=len(dates) - 1)
         view = weekly_sig[weekly_sig["signal_date"].dt.date == selected].copy()
 
         st.caption(f"Signals for {selected}")
-        st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
+        filtered = _filter_dataframe(view, "weekly")
+        st.dataframe(_streamlit_safe_frame(filtered), use_container_width=True)
 
 with tab_fib:
     st.markdown("### Fibonacci Confirmation Signals")
@@ -203,6 +321,9 @@ with tab_fib:
     if fib_sig.empty:
         st.info("No Fibonacci signals found in the latest batch.")
     else:
+        latest_fib = _latest_date(fib_sig, "Signal_Date")
+        if latest_fib is not None:
+            st.caption(f"Latest Fibonacci signal date: {latest_fib.date()}")
         signal_options = ["BUY", "WATCH", "INVALID"]
         selected_signals = st.multiselect(
             "Signal filter",
@@ -210,7 +331,8 @@ with tab_fib:
             default=["BUY", "WATCH"],
         )
         view = fib_sig[fib_sig["Signal"].isin(selected_signals)].copy()
-        st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
+        filtered = _filter_dataframe(view, "fib")
+        st.dataframe(_streamlit_safe_frame(filtered), use_container_width=True)
 
 with tab_mom:
     st.markdown("### Momentum Bucket C (Latest Candidates)")
@@ -220,6 +342,7 @@ with tab_mom:
     else:
         signal_date = pd.to_datetime(mom_sig["Signal_Date"].max()).date()
         st.caption(f"Signals as of {signal_date}")
+        filtered = _filter_dataframe(mom_sig, "mom")
 
         if _supports_column_config():
             pct_cfg = {
@@ -232,12 +355,12 @@ with tab_mom:
                 ),
             }
             st.dataframe(
-                _streamlit_safe_frame(mom_sig),
+                _streamlit_safe_frame(filtered),
                 use_container_width=True,
                 column_config=pct_cfg,
             )
         else:
-            view = mom_sig.copy()
+            view = filtered.copy()
             if "Weight_%" in view.columns:
                 view["Weight_%"] = view["Weight_%"].map(
                     lambda value: f"{value:.2f}" if pd.notna(value) else ""
@@ -254,6 +377,7 @@ with tab_action:
     if action_list.empty:
         st.info("No action list generated in the latest batch.")
     else:
+        filtered = _filter_dataframe(action_list, "action")
         if _supports_column_config():
             pct_cfg = {
                 "mom_conf": st.column_config.ProgressColumn(
@@ -264,12 +388,12 @@ with tab_action:
                 ),
             }
             st.dataframe(
-                _streamlit_safe_frame(action_list),
+                _streamlit_safe_frame(filtered),
                 use_container_width=True,
                 column_config=pct_cfg,
             )
         else:
-            view = action_list.copy()
+            view = filtered.copy()
             if "mom_conf" in view.columns:
                 view["mom_conf"] = _format_percentage(view["mom_conf"], decimals=0)
             st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
@@ -307,12 +431,29 @@ with tab_backtest:
                 st.caption(label)
                 _render_equity_chart(data, height=160)
 
+        st.subheader("Monthly Summaries")
+        _render_monthly_summary(backtests["equity_s1"], "System 1 (Weekly)")
+        _render_monthly_summary(backtests["equity_s2"], "System 2 (Fib)")
+        _render_monthly_summary(backtests["equity_s3"], "System 3 (Momentum)")
+        _render_monthly_summary(backtests["equity_combined"], "Combined")
+
         st.subheader("Recent Trades")
         trades = backtests["trades"]
         if trades.empty:
             st.info("No trades found in the backtest output.")
         else:
-            st.dataframe(_streamlit_safe_frame(trades.tail(200)), use_container_width=True)
+            portfolio_options = sorted(trades["portfolio"].dropna().unique())
+            selected_portfolios = st.multiselect(
+                "Portfolios",
+                options=portfolio_options,
+                default=portfolio_options,
+                key="backtest-trades-portfolios",
+            )
+            view = trades.copy()
+            if selected_portfolios:
+                view = view[view["portfolio"].isin(selected_portfolios)]
+            view = view.sort_values("date", ascending=False).head(200)
+            st.dataframe(_streamlit_safe_frame(view), use_container_width=True)
 
         st.subheader("Open Positions (End of Backtest)")
         positions = backtests["positions"]
