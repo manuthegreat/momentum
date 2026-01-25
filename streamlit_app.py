@@ -11,6 +11,7 @@ import json
 import os
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 ARTIFACTS_DIR = "artifacts"
@@ -62,6 +63,22 @@ def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if not object_cols.empty:
         safe[object_cols] = safe[object_cols].astype("string[python]")
     return safe
+
+
+def _render_equity_chart(frame: pd.DataFrame, height: int) -> None:
+    view = frame[["date", "equity_usd"]].copy()
+    view["date"] = pd.to_datetime(view["date"])
+    view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
+    view = view.dropna(subset=["date", "equity_usd"])
+
+    fig = px.line(view, x="date", y="equity_usd")
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title=None,
+        yaxis_title=None,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -269,7 +286,7 @@ with tab_backtest:
         st.subheader("Equity Curves")
         equity_combined = backtests["equity_combined"]
         if not equity_combined.empty:
-            st.line_chart(equity_combined.set_index("date")["equity_usd"], height=220)
+            _render_equity_chart(equity_combined, height=220)
 
         cols = st.columns(3)
         for col, key, label in zip(
@@ -282,7 +299,7 @@ with tab_backtest:
                 continue
             with col:
                 st.caption(label)
-                st.line_chart(data.set_index("date")["equity_usd"], height=160)
+                _render_equity_chart(data, height=160)
 
         st.subheader("Recent Trades")
         trades = backtests["trades"]
