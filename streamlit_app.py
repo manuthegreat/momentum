@@ -67,6 +67,12 @@ def _streamlit_safe_frame(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _render_equity_chart(frame: pd.DataFrame, height: int) -> None:
     view = frame[["date", "equity_usd"]].copy()
+    view["date"] = pd.to_datetime(view["date"], errors="coerce")
+    view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
+    view = view.dropna(subset=["date", "equity_usd"]).sort_values("date")
+    view = view.set_index("date")
+
+    st.line_chart(view["equity_usd"], height=height)
     view["date"] = pd.to_datetime(view["date"])
     view["equity_usd"] = pd.to_numeric(view["equity_usd"], errors="coerce")
     view = view.dropna(subset=["date", "equity_usd"])
