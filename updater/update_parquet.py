@@ -720,7 +720,7 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
         swing_high_date = row["Swing High Date"]
 
         g = df_prices[df_prices["ticker"] == ticker].sort_values("date").copy()
-        if g.empty or len(g) < 40:
+        if g.empty:
             continue
 
         fib50 = row["Swing High Price"] - 0.50 * (row["Swing High Price"] - row["Swing Low Price"])
@@ -893,9 +893,12 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
 
         final_signal = "BUY" if (retracement_held and uptrend_resumed) else "WATCH" if retracement_held else "INVALID"
 
-        bos_prox = 0.0
         if np.isfinite(last_local_high) and last_local_high != 0:
-            bos_prox = float(np.clip(1 - ((last_local_high - close_now) / max(close_now, 1e-9)), 0, 1))
+            bos_dist = last_local_high - close_now
+            raw = 1 - bos_dist / max(close_now, 1e-9)
+            bos_prox = float(np.clip(raw, 0, 1))
+        else:
+            bos_prox = 0.0
 
         if final_signal == "BUY":
             readiness = 100.0
@@ -907,13 +910,6 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
                 0.20 * int(momentum_ok) +
                 0.20 * bos_prox
             )
-        readiness = 100 * (
-            0.25 * int(retracement_held) +
-            0.20 * int(higher_low_found) +
-            0.15 * int(bullish_candle) +
-            0.20 * int(momentum_ok) +
-            0.20 * bos_prox
-        )
 
         results.append({
             "ticker": ticker,
