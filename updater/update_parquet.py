@@ -899,6 +899,16 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
         if np.isfinite(last_local_high) and last_local_high != 0:
             bos_prox = float(np.clip(1 - ((last_local_high - close_now) / max(close_now, 1e-9)), 0, 1))
 
+        if final_signal == "BUY":
+            readiness = 100.0
+        else:
+            readiness = 100 * (
+                0.25 * int(retracement_held) +
+                0.20 * int(higher_low_found) +
+                0.15 * int(bullish_candle) +
+                0.20 * int(momentum_ok) +
+                0.20 * bos_prox
+            )
         readiness = 100 * (
             0.25 * int(retracement_held) +
             0.20 * int(higher_low_found) +
