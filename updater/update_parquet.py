@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from updater.golden_source_validation import GoldenSourceCheck, validate_golden_source
 
 warnings.filterwarnings("ignore")
 
@@ -906,6 +907,13 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
                 0.20 * int(momentum_ok) +
                 0.20 * bos_prox
             )
+        readiness = 100 * (
+            0.25 * int(retracement_held) +
+            0.20 * int(higher_low_found) +
+            0.15 * int(bullish_candle) +
+            0.20 * int(momentum_ok) +
+            0.20 * bos_prox
+        )
 
         results.append({
             "ticker": ticker,
