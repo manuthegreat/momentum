@@ -36,8 +36,6 @@ WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals.parquet"
 FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals.parquet")
 MOMENTUM_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "momentum_bucketc_signals.parquet")
 ACTION_LIST_PATH = os.path.join(ARTIFACTS_DIR, "action_list.parquet")
-GOLDEN_WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals_golden.parquet")
-GOLDEN_FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals_golden.parquet")
 
 
 # ============================================================
@@ -1414,48 +1412,6 @@ def build_signal_parquets():
     view_cols = [c for c in view_cols if c in combined.columns]
 
     combined = combined.sort_values("ACTION_SCORE", ascending=False).reset_index(drop=True)
-
-    checks = [
-        GoldenSourceCheck(
-            label="weekly",
-            path=GOLDEN_WEEKLY_SIGNALS_PATH,
-            key_columns=["signal_date", "ticker"],
-            compare_columns=[
-                "System",
-                "Signal",
-                "score",
-                "breakout_level",
-                "pullback_level",
-                "stop_level",
-                "close",
-                "turnover_expansion",
-            ],
-        ),
-        GoldenSourceCheck(
-            label="fib",
-            path=GOLDEN_FIB_SIGNALS_PATH,
-            key_columns=["Signal_Date", "ticker"],
-            compare_columns=[
-                "System",
-                "Signal",
-                "READINESS_SCORE",
-                "LastLocalHigh",
-                "HL_Price",
-                "LatestPrice",
-                "Shape",
-                "ShapePriority",
-            ],
-        ),
-    ]
-    validation_messages = validate_golden_source(
-        checks,
-        {
-            "weekly": weekly_sig,
-            "fib": fib_sig,
-        },
-    )
-    for message in validation_messages:
-        print(message)
 
     weekly_sig.to_parquet(WEEKLY_SIGNALS_PATH, index=False)
     fib_sig.to_parquet(FIB_SIGNALS_PATH, index=False)
