@@ -4,7 +4,6 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -18,6 +17,8 @@ import pandas as pd
 
 from updater.update_parquet import (
     WeeklySwingConfig,
+    fib_build_watchlist,
+    fib_confirmation_engine,
     load_prices_from_parquet,
     load_index_returns_from_parquet,
     weekly_add_indicators,
@@ -71,11 +72,8 @@ S1_MAX_HOLD_DAYS = 15
 S1_USE_STOPLEVEL = True
 S1_MAX_POSITIONS = 20
 
-# Fib speed controls
+# Fib settings
 FIB_LOOKBACK_DAYS = 300
-FIB_USE_NUMBA = True
-FIB_PARALLEL = True
-FIB_MAX_WORKERS = max(1, (os.cpu_count() or 2) - 1)
 
 # Weekly signal config (same defaults as signals batch)
 WEEKLY_CFG = WeeklySwingConfig(
@@ -155,119 +153,25 @@ def momentum_bucketC_latest_asof(
     )
 
 
-def fib_levels_daily(g: pd.DataFrame, lookback_days=300) -> pd.DataFrame:
-    g = g.sort_values("date").copy()
-    dates = pd.to_datetime(g["date"]).to_numpy()
-    highs = g["high"].to_numpy(float)
-    lows = g["low"].to_numpy(float)
+def build_fib_confirmation_signals(df_prices: pd.DataFrame, lookback_days=300) -> pd.DataFrame:
+    d = df_prices.sort_values(["ticker", "date"]).copy()
+    d["date"] = pd.to_datetime(d["date"]).dt.normalize()
+    dates = sorted(d["date"].unique())
+    results: List[pd.DataFrame] = []
 
-    n = len(g)
-    swing_high = np.full(n, np.nan)
-    swing_low = np.full(n, np.nan)
-    target_382 = np.full(n, np.nan)
+    for asof in dates:
+        slice_df = d[d["date"] <= asof]
+        watch = fib_build_watchlist(slice_df, lookback_days=lookback_days)
+        if watch.empty:
+            continue
+        signals = fib_confirmation_engine(slice_df, watch)
+        if signals.empty:
+            continue
+        results.append(signals)
 
-    use_numba = False
-    if FIB_USE_NUMBA:
-        try:
-            from numba import njit  # type: ignore
-
-            @njit(cache=True)
-            def _fib_numba(dates_i64, highs_arr, lows_arr, lookback_days_i64):
-                n0 = len(dates_i64)
-                sh = np.full(n0, np.nan)
-                sl = np.full(n0, np.nan)
-                tgt = np.full(n0, np.nan)
-                day_ns = 86_400_000_000_000
-                for i in range(n0):
-                    start_ts = dates_i64[i] - lookback_days_i64 * day_ns
-                    j = np.searchsorted(dates_i64, start_ts, side="left")
-                    if i - j + 1 < 30:
-                        continue
-                    max_h = highs_arr[j]
-                    max_k = j
-                    for k in range(j + 1, i + 1):
-                        v = highs_arr[k]
-                        if v > max_h:
-                            max_h = v
-                            max_k = k
-                    min_l = lows_arr[j]
-                    for k in range(j, max_k + 1):
-                        v = lows_arr[k]
-                        if v < min_l:
-                            min_l = v
-                    if min_l >= max_h:
-                        continue
-                    sh[i] = max_h
-                    sl[i] = min_l
-                    tgt[i] = max_h - 0.382 * (max_h - min_l)
-                return sh, sl, tgt
-
-            dates_i64 = dates.astype("datetime64[ns]").astype(np.int64)
-            swing_high, swing_low, target_382 = _fib_numba(dates_i64, highs, lows, int(lookback_days))
-            use_numba = True
-        except Exception:
-            use_numba = False
-
-    if not use_numba:
-        dates_i64 = dates.astype("datetime64[ns]").astype(np.int64)
-        day_ns = 86_400_000_000_000
-        for i in range(n):
-            start_ts = dates_i64[i] - lookback_days * day_ns
-            j = int(np.searchsorted(dates_i64, start_ts, side="left"))
-            if i - j + 1 < 30:
-                continue
-            win_highs = highs[j : i + 1]
-            if win_highs.size == 0:
-                continue
-            k = int(np.argmax(win_highs))
-            hi_idx = j + k
-            hi = float(highs[hi_idx])
-            lo = float(np.min(lows[j : hi_idx + 1]))
-            if lo >= hi:
-                continue
-            swing_high[i] = hi
-            swing_low[i] = lo
-            target_382[i] = hi - 0.382 * (hi - lo)
-
-    out = g[["date", "ticker", "open", "high", "low", "close"]].copy()
-    out["fib_swing_high"] = swing_high
-    out["fib_swing_low"] = swing_low
-    out["fib_target_382"] = target_382
-    return out
-
-
-def _fib_worker(args):
-    _, g, lookback_days = args
-    return fib_levels_daily(g, lookback_days=lookback_days)
-
-
-def build_fib_signals(df_prices: pd.DataFrame, lookback_days=300) -> pd.DataFrame:
-    groups = [(t, g.copy(), lookback_days) for t, g in df_prices.groupby("ticker", sort=False)]
-    frames: List[pd.DataFrame] = []
-
-    if FIB_PARALLEL and len(groups) > 1:
-        try:
-            with ProcessPoolExecutor(max_workers=FIB_MAX_WORKERS) as ex:
-                futs = [ex.submit(_fib_worker, args) for args in groups]
-                for fut in as_completed(futs):
-                    frames.append(fut.result())
-        except Exception:
-            frames = [fib_levels_daily(g, lookback_days=lookback_days) for _, g, _ in groups]
-    else:
-        frames = [fib_levels_daily(g, lookback_days=lookback_days) for _, g, _ in groups]
-
-    fib_daily = pd.concat(frames, ignore_index=True).sort_values(["ticker", "date"]).reset_index(drop=True)
-
-    fib_daily["prev_close"] = fib_daily.groupby("ticker")["close"].shift(1)
-    fib_daily["prev_target"] = fib_daily.groupby("ticker")["fib_target_382"].shift(1)
-
-    fib_daily["buy_signal"] = (
-        np.isfinite(fib_daily["fib_target_382"])
-        & np.isfinite(fib_daily["prev_target"])
-        & (fib_daily["prev_close"] < fib_daily["prev_target"])
-        & (fib_daily["close"] >= fib_daily["fib_target_382"])
-    )
-    return fib_daily
+    if not results:
+        return pd.DataFrame()
+    return pd.concat(results, ignore_index=True).sort_values(["Signal_Date", "ticker"]).reset_index(drop=True)
 
 
 # =========================
@@ -563,20 +467,20 @@ def main():
 
             s1_entries_by_date.setdefault(entry_d, []).append({"ticker": tk, "stop": stop, "max_exit": max_exit})
 
-    fib_daily = build_fib_signals(df, lookback_days=FIB_LOOKBACK_DAYS)
-    fib_signal_dates = fib_daily[fib_daily["buy_signal"]].copy()
+    fib_daily = build_fib_confirmation_signals(df, lookback_days=FIB_LOOKBACK_DAYS)
+    fib_signal_dates = fib_daily[fib_daily["Signal"] == "BUY"].copy()
 
     s2_entries_by_date: Dict[pd.Timestamp, List[dict]] = {}
     if not fib_signal_dates.empty:
         for r in fib_signal_dates.itertuples(index=False):
             tk = str(r.ticker)
-            sig_d = pd.Timestamp(r.date).normalize()
+            sig_d = pd.Timestamp(r.Signal_Date).normalize()
             entry_d = next_trading_date_for_ticker(dates_by_ticker, tk, sig_d)
             if entry_d is None:
                 continue
             entry_d = pd.Timestamp(entry_d).normalize()
 
-            stop_px = float(r.fib_swing_low) if np.isfinite(float(r.fib_swing_low)) else None
+            stop_px = float(r.SwingLow) if np.isfinite(float(r.SwingLow)) else None
             s2_entries_by_date.setdefault(entry_d, []).append({"ticker": tk, "stop": stop_px})
 
     s3_rebalance_by_date: Dict[pd.Timestamp, pd.Timestamp] = {}
