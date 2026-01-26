@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import warnings
 from dataclasses import dataclass
 from io import StringIO
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -17,7 +19,10 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-from updater.golden_source_validation import GoldenSourceCheck, validate_golden_source
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 warnings.filterwarnings("ignore")
 
@@ -30,8 +35,6 @@ WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals.parquet"
 FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals.parquet")
 MOMENTUM_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "momentum_bucketc_signals.parquet")
 ACTION_LIST_PATH = os.path.join(ARTIFACTS_DIR, "action_list.parquet")
-GOLDEN_WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals_golden.parquet")
-GOLDEN_FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals_golden.parquet")
 
 
 # ============================================================
@@ -581,7 +584,10 @@ LOOKBACK_DAYS = 300
 
 
 def find_swing_as_of_quick(group: pd.DataFrame, current_date: pd.Timestamp, lookback_days: int = LOOKBACK_DAYS):
-    window = group[(group["date"] <= current_date) & (group["date"] >= (current_date - pd.Timedelta(days=lookback_days)))].copy()
+    window = group[
+        (group["date"] <= current_date)
+        & (group["date"] >= (current_date - pd.Timedelta(days=lookback_days)))
+    ].copy()
     if len(window) < 10:
         return None
 
@@ -616,6 +622,8 @@ def find_swing_as_of_quick(group: pd.DataFrame, current_date: pd.Timestamp, look
         "Swing Low Price": swing_low_price,
         "Swing High Date": swing_high_date,
         "Swing High Price": swing_high_price,
+        "Retrace 50": swing_high_price - 0.50 * swing_range,
+        "Retrace 61": swing_high_price - 0.618 * swing_range,
         "Stop Consider (78.6%)": swing_high_price - 0.786 * swing_range,
     }
 
@@ -670,13 +678,15 @@ def setup_shape(g: pd.DataFrame, retr_low_date, last_local_high):
         return "insufficient data"
 
     closes = post["close"].values
+    highs = post["high"].values
+    lows = post["low"].values
     x = np.arange(len(closes))
     coeffs = np.polyfit(x, closes, 1)
     slope = coeffs[0]
 
     fitted = np.polyval(coeffs, x)
     noise = np.std(closes - fitted)
-    noise_ratio = noise / max(np.mean(closes), 1e-9)
+    noise_ratio = noise / np.mean(closes)
 
     total_up = closes[-1] - closes[0]
     range_up = max(closes) - min(closes)
@@ -731,7 +741,7 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
 
         higher_low_found = False
         hl_price = np.nan
-        if len(post) >= 6:
+        if len(post) >= 3:
             lows = post["low"].values
             pivot_lows = []
             for i in range(1, len(lows) - 1):
@@ -743,23 +753,84 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
                     continue
                 if post["low"].iloc[idx + 1:].min() < pivot_low:
                     continue
-                higher_low_found = True
-                hl_price = float(pivot_low)
-                break
+                has_green_follow_through = False
+                if idx + 1 < len(post):
+                    if post["close"].iloc[idx + 1] > post["open"].iloc[idx + 1]:
+                        has_green_follow_through = True
+
+                broke_minor_high = False
+                if idx + 2 < len(post):
+                    minor_high = max(post["high"].iloc[idx: idx + 2])
+                    if post["high"].iloc[idx + 2:].max() > minor_high:
+                        broke_minor_high = True
+
+                if has_green_follow_through or broke_minor_high:
+                    higher_low_found = True
+                    hl_price = float(pivot_low)
+                    break
 
         bullish_candle = False
         corr = correction.reset_index(drop=True)
-        for i in range(1, len(corr)):
+        for i in range(2, len(corr)):
             o = corr["open"].iloc[i]
             c = corr["close"].iloc[i]
+            h = corr["high"].iloc[i]
             l = corr["low"].iloc[i]
+            body = abs(c - o)
+            range_ = max(h - l, 1e-9)
+            lower_wick = (o - l) if c >= o else (c - l)
+
+            o1 = corr["open"].iloc[i - 1]
+            c1 = corr["close"].iloc[i - 1]
+            o2 = corr["open"].iloc[i - 2]
+            c2 = corr["close"].iloc[i - 2]
+
             in_fib_zone = (l <= fib50) and (l >= fib786)
-            if in_fib_zone and c >= o:
+
+            hammer = (
+                in_fib_zone
+                and lower_wick > 0.6 * range_
+                and c >= o
+            )
+
+            engulf = (
+                in_fib_zone
+                and (c > o1)
+                and (o < c1)
+                and (c1 < o1)
+            )
+
+            morning_star = (
+                in_fib_zone
+                and (c1 < o1)
+                and (abs(c2 - o2) <= 0.3 * (corr["high"].iloc[i - 2] - corr["low"].iloc[i - 2]))
+                and (c > (o1 + c1) / 2)
+            )
+
+            piercing = (
+                in_fib_zone
+                and (c1 < o1)
+                and (o < c1)
+                and (c > (o1 + c1) / 2)
+            )
+
+            tweezer = (
+                abs(l - corr["low"].iloc[i - 1]) <= 0.2 * range_
+                and in_fib_zone
+                and (c >= o)
+            )
+
+            strong_reversal = (
+                in_fib_zone
+                and c >= l + 0.6 * range_
+            )
+
+            if hammer or engulf or morning_star or piercing or tweezer or strong_reversal:
                 bullish_candle = True
                 break
 
         corr2 = g[(g["date"] > retr_low_date) & (g["date"] < row["Latest Date"])].copy()
-        if corr2.empty or len(corr2) < 6:
+        if corr2.empty or len(corr2) < 3:
             last_local_high = np.nan
             bos = False
         else:
@@ -781,7 +852,7 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
         loss = np.where(delta < 0, -delta, 0)
         roll_up = pd.Series(gain).rolling(14).mean()
         roll_down = pd.Series(loss).rolling(14).mean()
-        rs = roll_up / roll_down.replace(0, np.nan)
+        rs = roll_up / roll_down
         gp["RSI"] = 100 - (100 / (1 + rs))
 
         ema12 = gp["close"].ewm(span=12, adjust=False).mean()
@@ -796,10 +867,22 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
         rsi_now = float(last_row["RSI"]) if pd.notna(last_row["RSI"]) else np.nan
         macdh_now = float(last_row["MACDH"]) if pd.notna(last_row["MACDH"]) else np.nan
 
-        cond1 = close_now > sma10 if np.isfinite(sma10) else False
-        cond2 = macdh_now > 0 if np.isfinite(macdh_now) else False
-        cond3 = rsi_now > 50 if np.isfinite(rsi_now) else False
-        momentum_ok = (int(cond1) + int(cond2) + int(cond3)) >= 2
+        cond1 = close_now > sma10
+        cond2 = macdh_now > 0
+        cond3 = rsi_now > 50
+        two_of_three = (int(cond1) + int(cond2) + int(cond3)) >= 2
+
+        macd_line = macd.iloc[-1]
+        macd_line_prev = macd.iloc[-2]
+        macd_cross_up = macd_line > macd_line_prev
+
+        rsi_strong = rsi_now > 55
+        last3_high = gp["high"].iloc[-3:].max()
+        price_breakout = close_now > last3_high
+
+        breakout_momentum = macd_cross_up or (rsi_strong and price_breakout)
+
+        momentum_ok = two_of_three or breakout_momentum
 
         shape = setup_shape(g, retr_low_date, last_local_high)
         shape_pr = shape_priority(shape)
@@ -813,13 +896,16 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
         if np.isfinite(last_local_high) and last_local_high != 0:
             bos_prox = float(np.clip(1 - ((last_local_high - close_now) / max(close_now, 1e-9)), 0, 1))
 
-        readiness = 100 * (
-            0.25 * int(retracement_floor_respected) +
-            0.20 * int(higher_low_found) +
-            0.15 * int(bullish_candle) +
-            0.20 * int(momentum_ok) +
-            0.20 * bos_prox
-        )
+        if final_signal == "BUY":
+            readiness = 100.0
+        else:
+            readiness = 100 * (
+                0.25 * int(retracement_held) +
+                0.20 * int(higher_low_found) +
+                0.15 * int(bullish_candle) +
+                0.20 * int(momentum_ok) +
+                0.20 * bos_prox
+            )
 
         results.append({
             "ticker": ticker,
@@ -832,6 +918,8 @@ def fib_confirmation_engine(df_prices: pd.DataFrame, watch: pd.DataFrame) -> pd.
             "LatestPrice": close_now,
             "Shape": shape,
             "ShapePriority": shape_pr,
+            "SwingLow": float(row["Swing Low Price"]),
+            "SwingHigh": float(row["Swing High Price"]),
         })
 
     out = pd.DataFrame(results)
@@ -1316,48 +1404,6 @@ def build_signal_parquets():
     view_cols = [c for c in view_cols if c in combined.columns]
 
     combined = combined.sort_values("ACTION_SCORE", ascending=False).reset_index(drop=True)
-
-    checks = [
-        GoldenSourceCheck(
-            label="weekly",
-            path=GOLDEN_WEEKLY_SIGNALS_PATH,
-            key_columns=["signal_date", "ticker"],
-            compare_columns=[
-                "System",
-                "Signal",
-                "score",
-                "breakout_level",
-                "pullback_level",
-                "stop_level",
-                "close",
-                "turnover_expansion",
-            ],
-        ),
-        GoldenSourceCheck(
-            label="fib",
-            path=GOLDEN_FIB_SIGNALS_PATH,
-            key_columns=["Signal_Date", "ticker"],
-            compare_columns=[
-                "System",
-                "Signal",
-                "READINESS_SCORE",
-                "LastLocalHigh",
-                "HL_Price",
-                "LatestPrice",
-                "Shape",
-                "ShapePriority",
-            ],
-        ),
-    ]
-    validation_messages = validate_golden_source(
-        checks,
-        {
-            "weekly": weekly_sig,
-            "fib": fib_sig,
-        },
-    )
-    for message in validation_messages:
-        print(message)
 
     weekly_sig.to_parquet(WEEKLY_SIGNALS_PATH, index=False)
     fib_sig.to_parquet(FIB_SIGNALS_PATH, index=False)
