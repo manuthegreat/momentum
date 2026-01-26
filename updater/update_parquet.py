@@ -9,15 +9,17 @@ from __future__ import annotations
 import os
 import sys
 import warnings
+import time
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -36,6 +38,24 @@ WEEKLY_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "weekly_swing_signals.parquet"
 FIB_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "fib_signals.parquet")
 MOMENTUM_SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "momentum_bucketc_signals.parquet")
 ACTION_LIST_PATH = os.path.join(ARTIFACTS_DIR, "action_list.parquet")
+
+UNIVERSE_RULES = {
+    "HK": dict(
+        mcap_min=5e9,
+        mcap_max=250e9,
+        adv_turnover_20_min=100e6,
+    ),
+    "US": dict(
+        mcap_min=2e9,
+        mcap_max=150e9,
+        adv_turnover_20_min=75e6,
+    ),
+    "SG": dict(
+        mcap_min=1e9,
+        mcap_max=80e9,
+        adv_turnover_20_min=10e6,
+    ),
+}
 
 
 # ============================================================
@@ -242,6 +262,74 @@ def load_prices_from_parquet(path: str) -> pd.DataFrame:
 
     df["turnover"] = df["close"].astype(float) * df["volume"].astype(float)
 
+    df["index_name"] = df.apply(
+        lambda row: infer_index_name_for_row(row["ticker"], row["index"]),
+        axis=1,
+    )
+    df["country"] = df["index_name"].map({"SP500": "US", "HSI": "HK", "STI": "SG"}).fillna("US")
+
+    if "market_cap" not in df.columns or df["market_cap"].isna().all():
+        tickers = df["ticker"].dropna().astype(str).unique().tolist()
+
+        def _fundamentals_one(tkr: str) -> Tuple[str, Optional[float], Optional[float]]:
+            last_err = None
+            for attempt in range(3):
+                try:
+                    yt = yf.Ticker(tkr)
+
+                    shares = None
+                    mcap_now = None
+
+                    fi = getattr(yt, "fast_info", None)
+                    if fi is not None and hasattr(fi, "get"):
+                        try:
+                            shares = fi.get("shares", None) or fi.get("shares_outstanding", None)
+                            mcap_now = fi.get("market_cap", None) or fi.get("marketCap", None)
+                        except Exception:
+                            pass
+
+                    if shares is None or mcap_now is None:
+                        try:
+                            info = yt.get_info()
+                            if shares is None:
+                                shares = info.get("sharesOutstanding", None)
+                            if mcap_now is None:
+                                mcap_now = info.get("marketCap", None)
+                        except Exception:
+                            pass
+
+                    def _clean(x):
+                        try:
+                            x = float(x)
+                            return x if np.isfinite(x) and x > 0 else None
+                        except Exception:
+                            return None
+
+                    return tkr, _clean(shares), _clean(mcap_now)
+                except Exception as e:
+                    last_err = e
+                    time.sleep(min(2.0, 0.2 * (attempt + 1)))
+
+            print(f"[WARN] fundamentals failed for {tkr}: {last_err}")
+            return tkr, None, None
+
+        shares_map: Dict[str, Optional[float]] = {}
+        mcap_now_map: Dict[str, Optional[float]] = {}
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(_fundamentals_one, t): t for t in tickers}
+            for fut in as_completed(futs):
+                tkr, so, mc = fut.result()
+                shares_map[tkr] = so
+                mcap_now_map[tkr] = mc
+
+        df["shares_outstanding"] = pd.to_numeric(df["ticker"].map(shares_map), errors="coerce")
+        market_cap_hist = df["shares_outstanding"] * df["close"].astype(float)
+        market_cap_now = pd.to_numeric(df["ticker"].map(mcap_now_map), errors="coerce")
+        df["market_cap"] = market_cap_hist.fillna(market_cap_now)
+    else:
+        df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
+
     return df
 
 
@@ -424,15 +512,23 @@ def weekly_universe_filter_parquet_only(df: pd.DataFrame, cfg: WeeklySwingConfig
         "hh10_close",
         "hh_fib",
         "low_since_hh_fib",
+        "market_cap",
+        "country",
     ]
     d = df.dropna(subset=needed).copy()
     if d.empty:
         return d
 
-    if cfg.adv_turnover_20_min and cfg.adv_turnover_20_min > 0:
-        d = d[d["adv_turnover_20"].astype(float) >= float(cfg.adv_turnover_20_min)].copy()
+    c = d["country"].astype(str)
+    mcap_min = c.map(lambda x: UNIVERSE_RULES.get(x, {}).get("mcap_min", np.nan)).astype(float)
+    mcap_max = c.map(lambda x: UNIVERSE_RULES.get(x, {}).get("mcap_max", np.nan)).astype(float)
+    adv_min = c.map(lambda x: UNIVERSE_RULES.get(x, {}).get("adv_turnover_20_min", np.nan)).astype(float)
 
-    return d
+    mc = d["market_cap"].astype(float)
+    adv = d["adv_turnover_20"].astype(float)
+
+    mask = (mc >= mcap_min) & (mc <= mcap_max) & (adv >= adv_min)
+    return d.loc[mask].copy()
 
 
 def weekly_score(out: pd.DataFrame) -> pd.DataFrame:
