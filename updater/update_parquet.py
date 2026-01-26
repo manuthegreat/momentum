@@ -657,7 +657,13 @@ def fib_build_watchlist(df: pd.DataFrame, lookback_days: int = LOOKBACK_DAYS) ->
                 "Swing Range": float(swing["Swing High Price"] - swing["Swing Low Price"]),
                 "Retracement": float(retracement),
             })
-    return pd.DataFrame(rows)
+    watch = pd.DataFrame(rows)
+    if watch.empty:
+        return watch
+
+    watch["Retracement %"] = watch["Retracement"] * 100.0
+    watch["Prime Setup"] = watch["Retracement %"].between(50, 78.6)
+    return watch[watch["Prime Setup"]].reset_index(drop=True)
 
 
 def shape_priority(shape: str) -> int:
