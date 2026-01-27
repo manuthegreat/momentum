@@ -604,6 +604,12 @@ def main():
                 fib786 = float(o["fib786"])
                 zone_low = min(fib50, fib786)
                 zone_high = max(fib50, fib786)
+                    continue
+
+                fib50 = float(o["fib50"])
+                fib786 = float(o["fib786"])
+                zone_low = min(fib50, fib786)
+                zone_high = max(fib50, fib786)
                 if not (zone_low <= px <= zone_high):
                     continue
 
@@ -670,6 +676,25 @@ def main():
                 px_high_val = px_high.get((tk, d0), np.nan)
                 px_low_val = px_low.get((tk, d0), np.nan)
                 if not np.isfinite(px_open_val) or not np.isfinite(px_high_val) or not np.isfinite(px_low_val):
+                    continue
+
+                entry_px = None
+                entry_type = o.get("entry_type")
+                breakout_level = o.get("breakout_level", np.nan)
+                pullback_level = o.get("pullback_level", np.nan)
+
+                if entry_type == "BREAKOUT":
+                    if np.isfinite(breakout_level) and px_high_val >= breakout_level:
+                        entry_px = float(px_open_val) if px_open_val >= breakout_level else float(breakout_level)
+                elif entry_type == "PULLBACK":
+                    if np.isfinite(pullback_level) and px_low_val <= pullback_level:
+                        entry_px = float(px_open_val) if px_open_val <= pullback_level else float(pullback_level)
+                else:
+                    entry_px = float(px_open_val)
+
+                if entry_px is None:
+                    continue
+
                     continue
 
                 entry_px = None
