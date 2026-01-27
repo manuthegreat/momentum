@@ -59,7 +59,7 @@ S3_MONTHLY_CONTRIB = 0.0  # force off
 # -------------------------
 S2_TRADE_DOLLARS = 10_000.0
 S2_INITIAL_CASH = 500_000.0
-S2_PROFIT_TGT = 0.08
+S2_TARGET_FIB_RETRACEMENT = 0.382
 
 # -------------------------
 # System 1 (Weekly swing)
@@ -480,8 +480,25 @@ def main():
                 continue
             entry_d = pd.Timestamp(entry_d).normalize()
 
-            stop_px = float(r.SwingLow) if np.isfinite(float(r.SwingLow)) else None
-            s2_entries_by_date.setdefault(entry_d, []).append({"ticker": tk, "stop": stop_px})
+            swing_low = float(r.SwingLow) if np.isfinite(float(r.SwingLow)) else None
+            swing_high = float(r.SwingHigh) if np.isfinite(float(r.SwingHigh)) else None
+            if swing_low is None or swing_high is None:
+                continue
+            fib_range = swing_high - swing_low
+            if not np.isfinite(fib_range) or fib_range <= 0:
+                continue
+            fib50 = swing_high - 0.50 * fib_range
+            fib786 = swing_high - 0.786 * fib_range
+            fib38 = swing_high - S2_TARGET_FIB_RETRACEMENT * fib_range
+            s2_entries_by_date.setdefault(entry_d, []).append(
+                {
+                    "ticker": tk,
+                    "stop": swing_low,
+                    "fib50": fib50,
+                    "fib786": fib786,
+                    "target": fib38,
+                }
+            )
 
     s3_rebalance_by_date: Dict[pd.Timestamp, pd.Timestamp] = {}
     for d0 in sorted(month_ends):
@@ -569,7 +586,14 @@ def main():
                 if not np.isfinite(px):
                     continue
 
-                target_px = float(px) * (1.0 + S2_PROFIT_TGT)
+                fib50 = float(o["fib50"])
+                fib786 = float(o["fib786"])
+                zone_low = min(fib50, fib786)
+                zone_high = max(fib50, fib786)
+                if not (zone_low <= px <= zone_high):
+                    continue
+
+                target_px = float(o["target"])
                 stop_px = o["stop"]
 
                 p2.buy_usd(
