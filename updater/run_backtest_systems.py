@@ -604,14 +604,6 @@ def main():
                 fib786 = float(o["fib786"])
                 zone_low = min(fib50, fib786)
                 zone_high = max(fib50, fib786)
-                    continue
-
-                fib50 = float(o["fib50"])
-                fib786 = float(o["fib786"])
-                zone_low = min(fib50, fib786)
-                zone_high = max(fib50, fib786)
-                if not (zone_low <= px <= zone_high):
-                    continue
 
                 target_px = float(o["target"])
                 stop_px = o["stop"]
