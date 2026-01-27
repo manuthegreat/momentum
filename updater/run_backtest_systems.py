@@ -465,7 +465,19 @@ def main():
                 except Exception:
                     stop = None
 
-            s1_entries_by_date.setdefault(entry_d, []).append({"ticker": tk, "stop": stop, "max_exit": max_exit})
+            entry_type = getattr(s, "entry_type", None)
+            breakout_level = getattr(s, "breakout_level", np.nan)
+            pullback_level = getattr(s, "pullback_level", np.nan)
+            s1_entries_by_date.setdefault(entry_d, []).append(
+                {
+                    "ticker": tk,
+                    "stop": stop,
+                    "max_exit": max_exit,
+                    "entry_type": entry_type,
+                    "breakout_level": breakout_level,
+                    "pullback_level": pullback_level,
+                }
+            )
 
     fib_daily = build_fib_confirmation_signals(df, lookback_days=FIB_LOOKBACK_DAYS)
     fib_signal_dates = fib_daily[fib_daily["Signal"] == "BUY"].copy()
@@ -582,8 +594,10 @@ def main():
                 tk = o["ticker"]
                 if tk in p2.positions:
                     continue
-                px = px_open.get((tk, d0), np.nan)
-                if not np.isfinite(px):
+                px_open_val = px_open.get((tk, d0), np.nan)
+                px_high_val = px_high.get((tk, d0), np.nan)
+                px_low_val = px_low.get((tk, d0), np.nan)
+                if not np.isfinite(px_open_val) or not np.isfinite(px_high_val) or not np.isfinite(px_low_val):
                     continue
 
                 fib50 = float(o["fib50"])
@@ -596,10 +610,20 @@ def main():
                 target_px = float(o["target"])
                 stop_px = o["stop"]
 
+                entry_px = None
+                if zone_low <= px_open_val <= zone_high:
+                    entry_px = float(px_open_val)
+                elif px_open_val > zone_high and px_low_val <= zone_high:
+                    entry_px = float(zone_high)
+                elif px_open_val < zone_low and px_high_val >= zone_low:
+                    entry_px = float(zone_low)
+                if entry_px is None:
+                    continue
+
                 p2.buy_usd(
                     tk,
                     d0,
-                    float(px),
+                    float(entry_px),
                     min(S2_TRADE_DOLLARS, p2.cash_usd),
                     target_px_local=target_px,
                     stop_px_local=stop_px,
@@ -642,13 +666,33 @@ def main():
                     continue
                 if len(p1.positions) >= S1_MAX_POSITIONS:
                     continue
-                px = px_open.get((tk, d0), np.nan)
-                if not np.isfinite(px):
+                px_open_val = px_open.get((tk, d0), np.nan)
+                px_high_val = px_high.get((tk, d0), np.nan)
+                px_low_val = px_low.get((tk, d0), np.nan)
+                if not np.isfinite(px_open_val) or not np.isfinite(px_high_val) or not np.isfinite(px_low_val):
                     continue
+
+                entry_px = None
+                entry_type = o.get("entry_type")
+                breakout_level = o.get("breakout_level", np.nan)
+                pullback_level = o.get("pullback_level", np.nan)
+
+                if entry_type == "BREAKOUT":
+                    if np.isfinite(breakout_level) and px_high_val >= breakout_level:
+                        entry_px = float(px_open_val) if px_open_val >= breakout_level else float(breakout_level)
+                elif entry_type == "PULLBACK":
+                    if np.isfinite(pullback_level) and px_low_val <= pullback_level:
+                        entry_px = float(px_open_val) if px_open_val <= pullback_level else float(pullback_level)
+                else:
+                    entry_px = float(px_open_val)
+
+                if entry_px is None:
+                    continue
+
                 p1.buy_usd(
                     tk,
                     d0,
-                    float(px),
+                    float(entry_px),
                     min(S1_TRADE_DOLLARS, p1.cash_usd),
                     stop_px_local=o["stop"],
                     max_exit_date=o["max_exit"],
