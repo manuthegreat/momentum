@@ -374,78 +374,213 @@ def infer_index_name_for_row(ticker: str, index_col_val: str) -> str:
 
 
 # ============================================================
-# 5) SYSTEM 1: WEEKLY SWING
+# 5) SYSTEM 1: WEEKLY SWING (ALPHA5)
 # ============================================================
 
-@dataclass
-class WeeklySwingConfig:
-    max_open_positions: int = 20
-    max_entries_per_day: int = 10
-
-    profit_target_mult: float = 1.10
-    holding_days_max: int = 30
-
-    tight_range_5d_max: float = 0.12
-    close_pos20_min: float = 0.60
-    sma20_slope_floor_mult: float = -0.002
-
-    pause_days_min: int = 4
-    pause_days_max: int = 9
-    pause_near_high_frac: float = 0.97
-    pause_range20_max: float = 0.22
-
-    fib_lookback: int = 10
-    fib_frac: float = 0.382
-
-    pullback_min_pct_below_close: float = 0.02
-    pullback_max_pct_below_close: float = 0.25
-    max_hh_dist_from_close: float = 0.20
-
-    turnover_baseline_days: int = 10
-    turnover_expansion_min_A: float = 1.0
-    turnover_expansion_min_C: float = 1.0
-
-    breakout_buffer_pct: float = 0.0
-
-    adv_turnover_20_min: float = 0.0
+def _norm_date(x) -> pd.Timestamp:
+    return pd.to_datetime(x, errors="coerce").tz_localize(None).normalize()
 
 
-def _hh_and_low_since_hh_py(high: np.ndarray, low: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
-    n = len(high)
-    hh = np.full(n, np.nan, dtype=float)
-    low_since = np.full(n, np.nan, dtype=float)
-
-    for i in range(n):
-        if i < window - 1:
-            continue
-        s = i - window + 1
-        win_high = high[s: i + 1]
-        win_low = low[s: i + 1]
-
-        k = int(np.argmax(win_high))
-        hh_i = float(win_high[k])
-        low_i = float(np.min(win_low[k:]))
-
-        hh[i] = hh_i
-        low_since[i] = low_i
-
-    return hh, low_since
+def _norm_date_col(df: pd.DataFrame, col: str = "date") -> pd.DataFrame:
+    out = df.copy()
+    out[col] = pd.to_datetime(out[col], errors="coerce").dt.tz_localize(None).dt.normalize()
+    return out
 
 
-def weekly_add_indicators(df: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFrame:
+def _to_num(s, fill: Optional[float] = None) -> pd.Series:
+    x = pd.to_numeric(s, errors="coerce")
+    return x.fillna(fill) if fill is not None else x
+
+
+def _rolling_prod_1p(ret: pd.Series, window: int) -> pd.Series:
+    gross = 1.0 + ret.fillna(0.0)
+    return (
+        gross.rolling(window, min_periods=window)
+        .apply(np.prod, raw=True) - 1.0
+    )
+
+
+def _zscore_by_date(df: pd.DataFrame, col: str) -> pd.Series:
+    mean = df.groupby("date")[col].transform("mean")
+    std = df.groupby("date")[col].transform("std").replace(0, np.nan)
+    return ((df[col] - mean) / std).fillna(0.0)
+
+
+def normalize_01_by_date(df: pd.DataFrame, col: str) -> pd.Series:
+    x = df[col].astype(float)
+    lo = df.groupby("date")[col].transform("min")
+    hi = df.groupby("date")[col].transform("max")
+    denom = (hi - lo).replace(0, np.nan)
+    return ((x - lo) / denom).fillna(0.0).clip(0.0, 1.0)
+
+
+def attach_benchmark_and_alpha(
+    df_prices: pd.DataFrame,
+    idx_returns: pd.DataFrame,
+    bm_lookback: int = 20,
+) -> pd.DataFrame:
+    d = _norm_date_col(df_prices, "date").sort_values(["ticker", "date"]).copy()
+    d["stock_ret_1d"] = d.groupby("ticker")["close"].pct_change()
+
+    idx_col = d["index"] if "index" in d.columns else "UNKNOWN"
+    d["index_name"] = [
+        infer_index_name_for_row(t, idxv)
+        for t, idxv in zip(d["ticker"].astype(str), idx_col)
+    ]
+
+    idx = idx_returns.copy()
+    if "ret_1d" not in idx.columns:
+        raise ValueError("Index returns parquet must contain 'ret_1d'.")
+
+    idx = _norm_date_col(idx, "date")
+    idx["index_name"] = idx["index_name"].astype(str).str.upper().str.strip()
+    idx = idx[idx["index_name"].isin(["SP500", "HSI", "STI"])].copy()
+
+    idx_small = idx[["date", "index_name", "ret_1d"]].rename(columns={"ret_1d": "bm_ret_1d"}).copy()
+    idx_small["bm_ret_1d"] = _to_num(idx_small["bm_ret_1d"], fill=0.0)
+
+    idx_small = idx_small.sort_values(["index_name", "date"]).copy()
+    idx_small["bm_cumret_lb"] = (
+        idx_small.groupby("index_name", sort=False)["bm_ret_1d"]
+        .apply(lambda s: _rolling_prod_1p(s, int(bm_lookback)))
+        .reset_index(level=0, drop=True)
+    )
+    idx_small["bm_cumret_lb"] = _to_num(idx_small["bm_cumret_lb"], fill=0.0)
+
+    d = d.merge(idx_small, on=["date", "index_name"], how="left")
+    d["bm_ret_1d"] = _to_num(d["bm_ret_1d"], fill=0.0)
+    d["bm_cumret_lb"] = _to_num(d["bm_cumret_lb"], fill=0.0)
+
+    d["alpha_1d"] = (_to_num(d["stock_ret_1d"], fill=0.0) - d["bm_ret_1d"]).fillna(0.0)
+    return d
+
+
+def calculate_momentum_features(
+    df: pd.DataFrame,
+    windows=(5, 10, 30, 45, 60, 90),
+    base_col: str = "alpha_1d",
+) -> pd.DataFrame:
     d = df.sort_values(["ticker", "date"]).copy()
+    if base_col not in d.columns:
+        raise ValueError(f"calculate_momentum_features: missing base_col='{base_col}'")
 
+    base = _to_num(d[base_col], fill=0.0)
+
+    for w in windows:
+        r = f"{w}D Return"
+        z = f"{w}D zscore"
+        dz = f"{w}D zscore change"
+
+        d[r] = (
+            d.groupby("ticker", sort=False)[base_col]
+            .apply(lambda s: _rolling_prod_1p(_to_num(s, fill=0.0), int(w)))
+            .reset_index(level=0, drop=True)
+        )
+
+        d[z] = _zscore_by_date(d, r)
+
+        d[dz] = (
+            d.groupby("ticker", sort=False)[z]
+            .diff()
+            .ewm(span=int(w), adjust=False)
+            .mean()
+        )
+
+    num_cols = d.select_dtypes(include=[np.number]).columns
+    d[num_cols] = d[num_cols].fillna(0.0)
+    return d
+
+
+def add_regime_momentum_score(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["Momentum_Fast"] = (0.6 * d["5D zscore"] + 0.4 * d["10D zscore"])
+    d["Momentum_Mid"] = (0.5 * d["30D zscore"] + 0.5 * d["45D zscore"])
+    d["Momentum_Slow"] = (0.5 * d["60D zscore"] + 0.5 * d["90D zscore"])
+    d["Momentum Score"] = (0.5 * d["Momentum_Slow"] + 0.3 * d["Momentum_Mid"] + 0.2 * d["Momentum_Fast"])
+    return d.fillna(0.0)
+
+
+def add_regime_acceleration(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["Accel_Fast"] = d.groupby("ticker", sort=False)["Momentum_Fast"].diff()
+    d["Accel_Mid"] = d.groupby("ticker", sort=False)["Momentum_Mid"].diff()
+    d["Accel_Slow"] = d.groupby("ticker", sort=False)["Momentum_Slow"].diff()
+
+    def zscore_safe(x: pd.Series) -> pd.Series:
+        s = x.std()
+        if s == 0 or pd.isna(s):
+            return (x - x.mean()).fillna(0.0)
+        return ((x - x.mean()) / s).fillna(0.0)
+
+    d["Accel_Fast_z"] = d.groupby("date")["Accel_Fast"].transform(zscore_safe)
+    d["Accel_Mid_z"] = d.groupby("date")["Accel_Mid"].transform(zscore_safe)
+    d["Accel_Slow_z"] = d.groupby("date")["Accel_Slow"].transform(zscore_safe)
+
+    d["Acceleration Score"] = (0.5 * d["Accel_Fast_z"] + 0.3 * d["Accel_Mid_z"] + 0.2 * d["Accel_Slow_z"])
+    return d.fillna(0.0)
+
+
+def add_regime_early_momentum(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["Early_Fast"] = (0.6 * d["Accel_Fast_z"] + 0.4 * d["Momentum_Fast"])
+    d["Early_Mid"] = (0.5 * d["Accel_Mid_z"] + 0.5 * d["Momentum_Mid"])
+    d["Early_Slow"] = (0.5 * d["Accel_Slow_z"] + 0.5 * d["Momentum_Slow"])
+    d["Early Momentum Score"] = (0.5 * d["Early_Slow"] + 0.3 * d["Early_Mid"] + 0.2 * d["Early_Fast"])
+    return d.fillna(0.0)
+
+
+@dataclass
+class Alpha5Config:
+    min_sma_trend: bool = True
+    min_alpha_slow: float = 0.0
+
+    bm_gate_on: bool = True
+    bm_lookback: int = 20
+    bm_min_cum_ret: float = 0.0
+
+    max_signals: int = 25
+
+    mce_fast_abs_max: float = 0.40
+    mce_mid_abs_max: float = 0.35
+    mce_atr_ratio_pct_max: float = 0.30
+    mce_near_high_max_dist: float = 0.10
+
+    fbd_lookback: int = 8
+    fbd_reclaim_days: int = 4
+    fbd_expansion_mult: float = 1.15
+    fbd_close_pos_min: float = 0.65
+
+    rot_slow_pct_min: float = 0.60
+    rot_slow_pct_max: float = 0.85
+    rot_accel_mid_z_min: float = 0.75
+    rot_near_high_max_dist: float = 0.14
+    rot_atr_ratio_pct_max: float = 0.45
+
+    shock_lookback: int = 12
+    shock_tr_mult: float = 1.80
+    shock_close_pos_min: float = 0.60
+    shock_consol_days: int = 5
+    shock_consol_range5_pct_max: float = 0.12
+
+    min_R: float = 3.0
+    fresh_days: int = 7
+
+    w_struct: float = 0.50
+    w_engine: float = 0.30
+    w_geom: float = 0.20
+
+
+def add_daily_indicators(df_prices: pd.DataFrame) -> pd.DataFrame:
+    d = _norm_date_col(df_prices, "date").sort_values(["ticker", "date"]).copy()
     g = d.groupby("ticker", sort=False)
 
-    close = d["close"].astype(float)
     d["sma20"] = g["close"].rolling(20, min_periods=20).mean().reset_index(level=0, drop=True)
     d["sma50"] = g["close"].rolling(50, min_periods=50).mean().reset_index(level=0, drop=True)
-    d["sma20_slope5"] = d["sma20"] - g["sma20"].shift(5)
 
     d["prev_close"] = g["close"].shift(1)
-    high = d["high"].astype(float)
-    low = d["low"].astype(float)
-    prev_close = d["prev_close"].astype(float)
+    high = _to_num(d["high"])
+    low = _to_num(d["low"])
+    prev_close = _to_num(d["prev_close"])
 
     tr1 = (high - low).to_numpy()
     tr2 = (high - prev_close).abs().to_numpy()
@@ -457,220 +592,425 @@ def weekly_add_indicators(df: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFr
 
     d["hh5"] = g["high"].rolling(5, min_periods=5).max().reset_index(level=0, drop=True)
     d["ll5"] = g["low"].rolling(5, min_periods=5).min().reset_index(level=0, drop=True)
-    d["range5_pct"] = (d["hh5"] - d["ll5"]) / close
 
     d["hh20"] = g["high"].rolling(20, min_periods=20).max().reset_index(level=0, drop=True)
     d["ll20"] = g["low"].rolling(20, min_periods=20).min().reset_index(level=0, drop=True)
-    d["range20_pct"] = (d["hh20"] - d["ll20"]) / close
 
+    close = _to_num(d["close"])
     denom20 = (d["hh20"] - d["ll20"]).replace(0, np.nan)
-    d["close_pos_20"] = (close - d["ll20"]) / denom20
-
-    d["turnover_5d"] = g["turnover"].rolling(5, min_periods=5).sum().reset_index(level=0, drop=True)
-    d["adv_turnover_20"] = g["turnover"].rolling(20, min_periods=20).mean().reset_index(level=0, drop=True)
-
-    d["avg_turnover_10d"] = (
-        g["turnover"]
-        .rolling(cfg.turnover_baseline_days, min_periods=cfg.turnover_baseline_days)
-        .mean()
-        .reset_index(level=0, drop=True)
-    )
-    d["baseline_5d_turnover"] = d["avg_turnover_10d"] * 5.0
-
-    d["hh10_close"] = g["close"].rolling(10, min_periods=10).max().reset_index(level=0, drop=True)
-
-    d["hh_fib"] = np.nan
-    d["low_since_hh_fib"] = np.nan
-
-    for _, sub in d.groupby("ticker", sort=False):
-        if len(sub) < cfg.fib_lookback:
-            continue
-        hi = sub["high"].to_numpy(dtype=np.float64)
-        lo = sub["low"].to_numpy(dtype=np.float64)
-        hh, low_since = _hh_and_low_since_hh_py(hi, lo, cfg.fib_lookback)
-        d.loc[sub.index, "hh_fib"] = hh
-        d.loc[sub.index, "low_since_hh_fib"] = low_since
+    d["close_pos_20"] = ((close - d["ll20"]) / denom20).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    d["near_high_20_dist"] = ((d["hh20"] - close) / close).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    d["range5_pct"] = ((d["hh5"] - d["ll5"]) / close).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    d["atr_ratio"] = (d["atr5"] / d["atr20"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
     return d
 
 
-def weekly_universe_filter_parquet_only(df: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFrame:
-    needed = [
-        "sma20",
-        "sma50",
-        "sma20_slope5",
-        "atr5",
-        "atr20",
-        "hh5",
-        "ll5",
-        "range5_pct",
-        "range20_pct",
-        "close_pos_20",
-        "turnover_5d",
-        "baseline_5d_turnover",
-        "adv_turnover_20",
-        "hh10_close",
-        "hh_fib",
-        "low_since_hh_fib",
-        "market_cap",
-        "country",
-    ]
-    d = df.dropna(subset=needed).copy()
-    if d.empty:
-        return d
-
-    c = d["country"].astype(str)
-    mcap_min = c.map(lambda x: UNIVERSE_RULES.get(x, {}).get("mcap_min", np.nan)).astype(float)
-    mcap_max = c.map(lambda x: UNIVERSE_RULES.get(x, {}).get("mcap_max", np.nan)).astype(float)
-    adv_min = c.map(lambda x: UNIVERSE_RULES.get(x, {}).get("adv_turnover_20_min", np.nan)).astype(float)
-
-    mc = d["market_cap"].astype(float)
-    adv = d["adv_turnover_20"].astype(float)
-
-    mask = (mc >= mcap_min) & (mc <= mcap_max) & (adv >= adv_min)
-    return d.loc[mask].copy()
-
-
-def weekly_score(out: pd.DataFrame) -> pd.DataFrame:
-    o = out.copy()
-    denom = o["baseline_5d_turnover"].replace(0, np.nan)
-    o["turnover_expansion"] = (o["turnover_5d"] / denom).replace([np.inf, -np.inf], np.nan)
-
-    o["range_compression_score"] = 1.0 / (o["range5_pct"].clip(lower=1e-6))
-    o["dist_20dma"] = (o["close"] - o["sma20"]) / o["sma20"]
-
-    for col in ["turnover_expansion", "range_compression_score", "dist_20dma"]:
-        o[col + "_r"] = o.groupby("signal_date")[col].rank(pct=True)
-
-    o["score"] = (
-        0.5 * o["turnover_expansion_r"] +
-        0.3 * o["range_compression_score_r"] +
-        0.2 * o["dist_20dma_r"]
-    )
-    return o
-
-
-def weekly_detect_setups(df_raw: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFrame:
-    df = df_raw.sort_values(["ticker", "date"]).copy()
-    df = weekly_universe_filter_parquet_only(df, cfg)
-    if df.empty:
-        return pd.DataFrame()
-
-    denom = df["baseline_5d_turnover"].replace(0, np.nan)
-    df["turnover_expansion"] = (df["turnover_5d"] / denom).replace([np.inf, -np.inf], np.nan)
-
-    near_high = df["close"] >= (cfg.pause_near_high_frac * df["hh10_close"])
-    contraction = (df["range5_pct"] < df["range20_pct"]) | (df["atr5"] < df["atr20"])
-    df["pause_day"] = (near_high & contraction).astype(int)
-
-    df["pause_count"] = (
-        df.groupby("ticker")["pause_day"]
-        .transform(lambda x: x.rolling(cfg.pause_days_max, min_periods=cfg.pause_days_max).sum())
-    )
-
-    trend_up = (
-        (df["close"] > df["sma20"]) &
-        (df["sma20"] > df["sma50"]) &
-        (df["sma20_slope5"] >= cfg.sma20_slope_floor_mult * df["sma20"])
-    )
-
-    vol_compress = (df["atr5"] < df["atr20"]) & (df["range5_pct"] < df["range20_pct"])
-    tight = df["range5_pct"] <= cfg.tight_range_5d_max
-    location = df["close_pos_20"] >= cfg.close_pos20_min
-    vol_confirm_a = df["turnover_expansion"] >= cfg.turnover_expansion_min_A
-    mask_a = trend_up & vol_compress & tight & location & vol_confirm_a
-    a_frame = df.loc[mask_a, :].copy()
-    if not a_frame.empty:
-        a_frame["signal_date"] = a_frame["date"].dt.normalize()
-        a_frame["setup_tag"] = "VOL_COMPRESSION_BREAKOUT"
-        a_frame["entry_type"] = "BREAKOUT"
-        a_frame["breakout_level"] = a_frame["hh5"]
-        a_frame["pullback_level"] = np.nan
-        a_frame["stop_level"] = a_frame["ll5"]
-
-    mask_pause_base = (
-        trend_up &
-        (df["pause_count"] >= cfg.pause_days_min) &
-        (df["pause_count"] <= cfg.pause_days_max) &
-        (df["range20_pct"] <= cfg.pause_range20_max) &
-        (df["hh_fib"] <= df["close"] * (1.0 + cfg.max_hh_dist_from_close))
-    )
-    pb = df.loc[mask_pause_base, :].copy()
-    if not pb.empty:
-        pb["signal_date"] = pb["date"].dt.normalize()
-
-    c1 = pb.copy()
-    if not c1.empty:
-        c1 = c1[c1["turnover_expansion"] >= cfg.turnover_expansion_min_C].copy()
-        c1["setup_tag"] = "TREND_PAUSE_BREAKOUT"
-        c1["entry_type"] = "BREAKOUT"
-        c1["breakout_level"] = c1["hh5"]
-        c1["pullback_level"] = np.nan
-        c1["stop_level"] = c1["ll5"]
-
-    c2 = pb.copy()
-    if not c2.empty:
-        hh = c2["hh_fib"].astype(float)
-        lsh = c2["low_since_hh_fib"].astype(float)
-        rng = (hh - lsh).clip(lower=1e-9)
-        fib38 = hh - cfg.fib_frac * rng
-
-        c2["setup_tag"] = "TREND_PAUSE_38PULLBACK"
-        c2["entry_type"] = "PULLBACK"
-        c2["breakout_level"] = c2["hh5"]
-        c2["pullback_level"] = fib38
-        c2["stop_level"] = c2["ll5"]
-
-        close = c2["close"].astype(float)
-        min_level = close * (1.0 - cfg.pullback_max_pct_below_close)
-        max_level = close * (1.0 - cfg.pullback_min_pct_below_close)
-        c2 = c2[(c2["pullback_level"] >= min_level) & (c2["pullback_level"] <= max_level)].copy()
-
-    frames = [x for x in [a_frame, c1, c2] if x is not None and not x.empty]
-    if not frames:
-        return pd.DataFrame()
-
-    out = pd.concat(frames, ignore_index=True)
-    out = out.drop_duplicates(subset=["signal_date", "ticker", "setup_tag"], keep="first")
-    out = weekly_score(out)
+def build_alpha_momentum_panel(df_prices: pd.DataFrame, idx_returns: pd.DataFrame, cfg: Alpha5Config) -> pd.DataFrame:
+    d = attach_benchmark_and_alpha(df_prices, idx_returns, bm_lookback=int(cfg.bm_lookback))
+    d = d.dropna(subset=["date", "ticker", "close"]).copy()
+    d = calculate_momentum_features(d, base_col="alpha_1d")
+    d = add_regime_momentum_score(d)
+    d = add_regime_acceleration(d)
+    d = add_regime_early_momentum(d)
 
     keep = [
-        "signal_date",
-        "ticker",
-        "setup_tag",
-        "entry_type",
-        "score",
-        "breakout_level",
-        "pullback_level",
-        "stop_level",
-        "close",
-        "sma20",
-        "sma50",
-        "turnover_expansion",
+        "date", "ticker", "close",
+        "Momentum_Fast", "Momentum_Mid", "Momentum_Slow", "Momentum Score",
+        "Accel_Fast_z", "Accel_Mid_z", "Accel_Slow_z", "Acceleration Score",
+        "Early Momentum Score",
+        "stock_ret_1d", "alpha_1d",
+        "index_name", "bm_ret_1d", "bm_cumret_lb",
     ]
-    keep = [c for c in keep if c in out.columns]
-    return out[keep].sort_values(["signal_date", "score"], ascending=[False, False]).reset_index(drop=True)
+    keep = [c for c in keep if c in d.columns]
+    return d[keep].copy()
 
 
-def weekly_current_signals(df_prices: pd.DataFrame, cfg: WeeklySwingConfig, n_days: int = 3) -> pd.DataFrame:
-    d = weekly_add_indicators(df_prices, cfg)
-    sig = weekly_detect_setups(d, cfg)
-    if sig.empty:
-        return sig
+def structural_gate(latest: pd.DataFrame, cfg: Alpha5Config) -> pd.Series:
+    ok = pd.Series(True, index=latest.index)
 
-    cal = pd.to_datetime(pd.Index(sorted(d["date"].dt.normalize().unique()))).normalize()
-    last_dates = cal[-n_days:] if len(cal) >= n_days else cal
+    if cfg.min_sma_trend:
+        ok &= (latest["close"] > latest["sma50"]) & (latest["sma20"] > latest["sma50"])
 
-    sig = sig[pd.to_datetime(sig["signal_date"]).isin(last_dates)].copy()
-    if sig.empty:
-        return sig
+    ok &= (latest["Momentum_Slow"] > cfg.min_alpha_slow)
 
-    sig = sig.sort_values(["ticker", "signal_date", "score"], ascending=[True, False, False])
-    sig = sig.groupby("ticker", as_index=False).head(1)
+    if cfg.bm_gate_on and "bm_cumret_lb" in latest.columns:
+        ok &= (latest["bm_cumret_lb"] >= cfg.bm_min_cum_ret)
 
-    sig["System"] = sig["setup_tag"].apply(lambda x: f"weekly_swing::{x}")
-    sig["Signal"] = sig["entry_type"]
-    return sig.sort_values(["signal_date", "score"], ascending=[False, False]).reset_index(drop=True)
+    return ok.fillna(False)
+
+
+def engine_mce(latest: pd.DataFrame, cfg: Alpha5Config) -> pd.DataFrame:
+    d = latest.copy()
+    d["atr_ratio_pct"] = d.groupby("date")["atr_ratio"].rank(pct=True)
+
+    cond = (
+        (d["Momentum_Slow"] > 0) &
+        (d["Momentum_Fast"].abs() <= cfg.mce_fast_abs_max) &
+        (d["Momentum_Mid"].abs() <= cfg.mce_mid_abs_max) &
+        (d["Accel_Fast_z"] > 0) &
+        (d["atr_ratio_pct"] <= cfg.mce_atr_ratio_pct_max) &
+        (d["near_high_20_dist"] <= cfg.mce_near_high_max_dist)
+    )
+
+    out = d.loc[cond, ["ticker", "date", "close", "hh5", "ll5", "sma20", "sma50", "atr20", "atr_ratio_pct", "near_high_20_dist"]].copy()
+    if out.empty:
+        return out
+
+    out["engine"] = "MCE"
+    out["entry_type"] = "BREAKOUT"
+    out["entry_level"] = out["hh5"]
+    out["stop_level"] = out["ll5"]
+    out["timing_bonus"] = (1.0 - out["atr_ratio_pct"]).clip(0, 1)
+    return out
+
+
+def engine_fbd(df_all: pd.DataFrame, latest: pd.DataFrame, cfg: Alpha5Config) -> pd.DataFrame:
+    d = df_all.sort_values(["ticker", "date"]).copy()
+    latest_tickers = set(latest["ticker"].astype(str))
+    out_rows = []
+
+    for t, g in d.groupby("ticker", sort=False):
+        if t not in latest_tickers:
+            continue
+
+        g = g.dropna(subset=["sma20", "atr20", "ll20", "tr", "ll5", "high", "low", "close"]).copy()
+        if len(g) < 60:
+            continue
+
+        g_tail = g.tail(cfg.fbd_lookback + cfg.fbd_reclaim_days + 2).copy()
+        if g_tail.empty:
+            continue
+
+        breakdown_mask = (g_tail["close"] < g_tail["ll20"]) | (g_tail["close"] < g_tail["sma20"])
+        if not breakdown_mask.any():
+            continue
+
+        bd_idx = g_tail.index[np.where(breakdown_mask.values)[0][-1]]
+        bd_date = _norm_date(g_tail.loc[bd_idx, "date"])
+        bd_level = float(min(g_tail.loc[bd_idx, "ll20"], g_tail.loc[bd_idx, "sma20"]))
+
+        after = g_tail[g_tail["date"] > bd_date].head(cfg.fbd_reclaim_days)
+        if after.empty:
+            continue
+
+        reclaim = after[after["close"] > after["sma20"]]
+        if reclaim.empty:
+            continue
+
+        r0 = reclaim.iloc[-1]
+        rng = float(r0["high"] - r0["low"])
+        close_pos = float(r0["close"] - r0["low"]) / max(rng, 1e-9)
+        exp_ok = (float(r0["tr"]) >= cfg.fbd_expansion_mult * float(r0["atr20"])) and (close_pos >= cfg.fbd_close_pos_min)
+        if not exp_ok:
+            continue
+
+        lt = latest[latest["ticker"] == t].iloc[-1]
+        if float(lt["Momentum_Slow"]) <= 0:
+            continue
+
+        out_rows.append({
+            "ticker": t,
+            "date": _norm_date(r0["date"]),
+            "close": float(r0["close"]),
+            "engine": "FBD",
+            "entry_type": "RECLAIM",
+            "entry_level": float(r0["sma20"]),
+            "stop_level": float(min(r0["low"], r0["ll5"])),
+            "timing_bonus": 1.0,
+            "bd_level": bd_level,
+        })
+
+    return pd.DataFrame(out_rows)
+
+
+def engine_rotation(latest: pd.DataFrame, cfg: Alpha5Config) -> pd.DataFrame:
+    d = latest.copy()
+    d["slow_pct"] = d.groupby("date")["Momentum_Slow"].rank(pct=True)
+    d["atr_ratio_pct"] = d.groupby("date")["atr_ratio"].rank(pct=True)
+
+    cond = (
+        (d["slow_pct"] >= cfg.rot_slow_pct_min) &
+        (d["slow_pct"] <= cfg.rot_slow_pct_max) &
+        (d["Accel_Mid_z"] >= cfg.rot_accel_mid_z_min) &
+        (d["near_high_20_dist"] <= cfg.rot_near_high_max_dist) &
+        (d["atr_ratio_pct"] <= cfg.rot_atr_ratio_pct_max)
+    )
+
+    out = d.loc[cond, ["ticker", "date", "close", "hh5", "ll5", "sma20", "sma50", "atr20", "slow_pct", "atr_ratio_pct", "near_high_20_dist"]].copy()
+    if out.empty:
+        return out
+
+    out["engine"] = "ROT"
+    out["entry_type"] = "BREAKOUT"
+    out["entry_level"] = out["hh5"]
+    out["stop_level"] = out["ll5"]
+    out["timing_bonus"] = (0.6 * (1.0 - out["near_high_20_dist"].clip(0, 1)) + 0.4 * out["slow_pct"]).clip(0, 1)
+    return out
+
+
+def engine_shock_absorption(df_all: pd.DataFrame, latest: pd.DataFrame, cfg: Alpha5Config) -> pd.DataFrame:
+    d = df_all.sort_values(["ticker", "date"]).copy()
+    latest_tickers = set(latest["ticker"].astype(str))
+    out_rows = []
+
+    for t, g in d.groupby("ticker", sort=False):
+        if t not in latest_tickers:
+            continue
+
+        g = g.dropna(subset=["atr20", "tr", "hh5", "ll5", "range5_pct", "high", "low", "close"]).copy()
+        if len(g) < 80:
+            continue
+
+        tail = g.tail(cfg.shock_lookback + cfg.shock_consol_days + 10).copy()
+        if tail.empty:
+            continue
+
+        shock_mask = (tail["tr"] >= cfg.shock_tr_mult * tail["atr20"])
+        if not shock_mask.any():
+            continue
+
+        sidx = tail.index[np.where(shock_mask.values)[0][-1]]
+        srow = tail.loc[sidx]
+        rng = float(srow["high"] - srow["low"])
+        close_pos = float(srow["close"] - srow["low"]) / max(rng, 1e-9)
+        if close_pos < cfg.shock_close_pos_min:
+            continue
+
+        shock_low = float(srow["low"])
+        shock_date = _norm_date(srow["date"])
+
+        post = tail[tail["date"] > shock_date].head(cfg.shock_consol_days)
+        if len(post) < cfg.shock_consol_days:
+            continue
+
+        holds = float(post["low"].min()) >= shock_low
+        tight = float(post["range5_pct"].iloc[-1]) <= cfg.shock_consol_range5_pct_max
+        if not (holds and tight):
+            continue
+
+        lt = latest[latest["ticker"] == t].iloc[-1]
+        if float(lt["Momentum_Slow"]) <= 0:
+            continue
+
+        entry = float(post["hh5"].iloc[-1])
+        stop = float(min(shock_low, post["ll5"].iloc[-1]))
+
+        out_rows.append({
+            "ticker": t,
+            "date": _norm_date(post["date"].iloc[-1]),
+            "close": float(post["close"].iloc[-1]),
+            "engine": "SHOCK",
+            "entry_type": "BREAKOUT",
+            "entry_level": entry,
+            "stop_level": stop,
+            "timing_bonus": 1.0,
+            "shock_date": shock_date,
+        })
+
+    return pd.DataFrame(out_rows)
+
+
+def compute_geometry(entry: pd.Series, stop: pd.Series, cfg: Alpha5Config) -> pd.DataFrame:
+    e = _to_num(entry)
+    s = _to_num(stop)
+    risk = (e - s).clip(lower=1e-9)
+
+    target = e + cfg.min_R * risk
+    geom_score = (1.0 / risk).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return pd.DataFrame({
+        "risk_per_share": risk,
+        "target_level": target,
+        "R_multiple": float(cfg.min_R),
+        "geom_raw": geom_score,
+    })
+
+
+_SIGNALS_MERGE_COLS = [
+    "Momentum_Slow", "Momentum Score", "Early Momentum Score",
+    "Accel_Fast_z", "Accel_Mid_z", "near_high_20_dist", "atr_ratio",
+    "sma20", "sma50", "hh20", "ll20", "range5_pct", "close",
+    "bm_ret_1d", "bm_cumret_lb",
+]
+_SIGNALS_MUST_HAVE = ["close", "Momentum_Slow", "Accel_Fast_z"]
+
+_SIGNALS_KEEP_BASE = [
+    "ticker", "System", "Signal_Date",
+    "FINAL_ALPHA_SCORE",
+    "engines_fired",
+    "entry_type", "entry_level", "stop_level", "target_level", "R_multiple",
+    "risk_per_share",
+    "close",
+    "event_date",
+]
+_SIGNALS_KEEP_EXTRA = [
+    "struct_score", "geom_score", "engine_score",
+    "Momentum_Slow", "Early Momentum Score", "Accel_Fast_z", "Accel_Mid_z",
+]
+
+
+def _run_engines(d_all: pd.DataFrame, latest_g: pd.DataFrame, cfg: Alpha5Config) -> pd.DataFrame:
+    if latest_g is None or latest_g.empty:
+        return pd.DataFrame()
+
+    engines = [
+        engine_mce(latest_g, cfg),
+        engine_fbd(d_all, latest_g, cfg),
+        engine_rotation(latest_g, cfg),
+        engine_shock_absorption(d_all, latest_g, cfg),
+    ]
+    engines = [x for x in engines if x is not None and not x.empty]
+    return pd.concat(engines, ignore_index=True) if engines else pd.DataFrame()
+
+
+def _merge_latest_scoring(engines: pd.DataFrame, latest: pd.DataFrame) -> pd.DataFrame:
+    add_cols = [c for c in _SIGNALS_MERGE_COLS if c in latest.columns]
+    engines = engines.drop(columns=[c for c in add_cols if c in engines.columns], errors="ignore")
+    return engines.merge(latest[["ticker", "date"] + add_cols], on=["ticker", "date"], how="left")
+
+
+def _postprocess_engines(engines: pd.DataFrame, latest: pd.DataFrame, as_of: pd.Timestamp, cfg: Alpha5Config) -> pd.DataFrame:
+    if engines is None or engines.empty:
+        return pd.DataFrame()
+
+    engines = engines.copy()
+    engines["event_date"] = pd.to_datetime(engines["date"]).dt.normalize()
+    engines["date"] = as_of
+
+    engines = engines[engines["event_date"] >= (as_of - pd.Timedelta(days=int(cfg.fresh_days)))].copy()
+    if engines.empty:
+        return pd.DataFrame()
+
+    engines = _merge_latest_scoring(engines, latest)
+
+    must_have = [c for c in _SIGNALS_MUST_HAVE if c in engines.columns]
+    engines = engines.dropna(subset=must_have).copy()
+    if engines.empty:
+        return pd.DataFrame()
+
+    geom = compute_geometry(engines["entry_level"], engines["stop_level"], cfg)
+    engines = pd.concat([engines.reset_index(drop=True), geom.reset_index(drop=True)], axis=1)
+
+    engines["engine"] = engines["engine"].astype(str)
+    agg = (
+        engines.groupby(["ticker", "date"], as_index=False)
+        .agg(
+            engines_fired=("engine", lambda x: "+".join(sorted(set(x)))),
+            engine_count=("engine", lambda x: len(set(x))),
+        )
+    )
+    return engines.merge(agg, on=["ticker", "date"], how="left")
+
+
+def _score_and_select(engines: pd.DataFrame, as_of: pd.Timestamp, cfg: Alpha5Config, include_scores: bool) -> pd.DataFrame:
+    engines = engines.copy()
+
+    engines["struct_raw"] = (
+        0.65 * engines["Momentum_Slow"].fillna(0.0)
+        + 0.35 * engines["Early Momentum Score"].fillna(0.0)
+    )
+    engines["struct_score"] = normalize_01_by_date(engines, "struct_raw")
+    engines["geom_score"] = normalize_01_by_date(engines, "geom_raw")
+    engines["engine_score"] = (engines["engine_count"].astype(float) / 4.0).clip(0.0, 1.0)
+
+    engines["FINAL_ALPHA_SCORE"] = (
+        float(cfg.w_struct) * engines["struct_score"] +
+        float(cfg.w_engine) * engines["engine_score"] +
+        float(cfg.w_geom) * engines["geom_score"]
+    ).clip(0.0, 1.0)
+
+    engines = engines.sort_values(["ticker", "FINAL_ALPHA_SCORE"], ascending=[True, False]).copy()
+    best = engines.groupby("ticker", as_index=False).head(1)
+
+    best = (
+        best.sort_values(["FINAL_ALPHA_SCORE", "engine_count", "struct_score"], ascending=[False, False, False])
+        .head(int(cfg.max_signals))
+        .reset_index(drop=True)
+    )
+
+    best["System"] = "weekly_swing_alpha5"
+    best["Signal"] = "TRADE_CANDIDATE"
+    best["Signal_Date"] = pd.to_datetime(as_of)
+
+    keep = _SIGNALS_KEEP_BASE + (_SIGNALS_KEEP_EXTRA if include_scores else [])
+    keep = [c for c in keep if c in best.columns]
+    return best[keep].copy()
+
+
+def _build_signals_from_d_all(d_all: pd.DataFrame, cfg: Alpha5Config, include_scores: bool) -> pd.DataFrame:
+    as_of = _norm_date(d_all["date"].max())
+    latest = d_all[d_all["date"] == as_of].copy()
+    if latest.empty:
+        return pd.DataFrame()
+
+    gate = structural_gate(latest, cfg)
+    latest_g = latest.loc[gate].copy()
+    if latest_g.empty:
+        return pd.DataFrame()
+
+    engines = _run_engines(d_all, latest_g, cfg)
+    if engines.empty:
+        return pd.DataFrame()
+
+    engines = _postprocess_engines(engines, latest, as_of, cfg)
+    if engines.empty:
+        return pd.DataFrame()
+
+    return _score_and_select(engines, as_of, cfg, include_scores=include_scores)
+
+
+def _precompute_alpha5_d_all(df_prices: pd.DataFrame, idx_returns: pd.DataFrame, cfg: Alpha5Config) -> pd.DataFrame:
+    w = add_daily_indicators(df_prices)
+    w = w.dropna(subset=["sma20", "sma50", "atr20", "hh5", "ll5", "hh20", "ll20"]).copy()
+    if w.empty:
+        return pd.DataFrame()
+
+    mom_panel = build_alpha_momentum_panel(df_prices, idx_returns, cfg=cfg)
+    mom = mom_panel.dropna(subset=["Momentum_Slow", "Accel_Fast_z", "Accel_Mid_z"]).copy()
+    if mom.empty:
+        return pd.DataFrame()
+
+    d_all = w.merge(
+        mom[
+            [
+                "date", "ticker",
+                "Momentum_Fast", "Momentum_Mid", "Momentum_Slow", "Momentum Score",
+                "Accel_Fast_z", "Accel_Mid_z", "Accel_Slow_z", "Early Momentum Score",
+                "bm_ret_1d", "bm_cumret_lb",
+            ]
+        ],
+        on=["date", "ticker"],
+        how="left",
+    )
+    d_all = d_all.dropna(subset=["Momentum_Slow"]).copy()
+    d_all["date"] = pd.to_datetime(d_all["date"]).dt.normalize()
+    d_all["ticker"] = d_all["ticker"].astype(str)
+    return d_all.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+
+def weekly_swing_alpha5_signals(
+    df_prices: pd.DataFrame,
+    idx_returns: pd.DataFrame,
+    cfg: Optional[Alpha5Config] = None,
+) -> pd.DataFrame:
+    cfg = cfg or Alpha5Config()
+    d_all = _precompute_alpha5_d_all(df_prices, idx_returns, cfg=cfg)
+    if d_all.empty:
+        return pd.DataFrame()
+    return _build_signals_from_d_all(d_all=d_all, cfg=cfg, include_scores=True)
+
+
+def weekly_swing_alpha5_signals_from_panel(
+    d_all: pd.DataFrame,
+    mom_panel: Optional[pd.DataFrame] = None,
+    cfg: Optional[Alpha5Config] = None,
+) -> pd.DataFrame:
+    cfg = cfg or Alpha5Config()
+    _ = mom_panel
+    if d_all is None or d_all.empty:
+        return pd.DataFrame()
+    return _build_signals_from_d_all(d_all=d_all, cfg=cfg, include_scores=False)
 
 
 # ============================================================
@@ -1388,27 +1728,32 @@ def build_signal_parquets():
     df_prices = load_prices_from_parquet(RAW_CONSTITUENTS_PATH)
     idx_returns = load_index_returns_from_parquet(RAW_INDEX_RETURNS_PATH)
 
-    weekly_cfg = WeeklySwingConfig(
-        adv_turnover_20_min=0.0,
-        breakout_buffer_pct=0.001,
+    weekly_cfg = Alpha5Config(
+        max_signals=25,
+        min_R=3.0,
+        fresh_days=7,
+        bm_gate_on=True,
+        bm_lookback=20,
+        bm_min_cum_ret=0.0,
     )
 
-    weekly_sig = weekly_current_signals(df_prices, weekly_cfg, n_days=3)
+    weekly_sig = weekly_swing_alpha5_signals(df_prices, idx_returns, weekly_cfg)
     if not weekly_sig.empty:
         keep = [
             "ticker",
             "System",
             "Signal",
-            "signal_date",
-            "score",
-            "breakout_level",
-            "pullback_level",
+            "Signal_Date",
+            "FINAL_ALPHA_SCORE",
+            "entry_level",
             "stop_level",
             "close",
-            "turnover_expansion",
+            "risk_per_share",
+            "target_level",
+            "event_date",
         ]
         keep = [c for c in keep if c in weekly_sig.columns]
-        weekly_sig = weekly_sig[keep].sort_values(["signal_date", "score"], ascending=[False, False]).reset_index(drop=True)
+        weekly_sig = weekly_sig[keep].sort_values(["Signal_Date", "FINAL_ALPHA_SCORE"], ascending=[False, False]).reset_index(drop=True)
 
     watch = fib_build_watchlist(df_prices, lookback_days=LOOKBACK_DAYS)
     fib_sig = pd.DataFrame()
@@ -1426,14 +1771,14 @@ def build_signal_parquets():
     )
 
     def _best_weekly(x: pd.DataFrame) -> pd.Series:
-        x = x.sort_values("score", ascending=False)
+        x = x.sort_values("FINAL_ALPHA_SCORE", ascending=False)
         r = x.iloc[0]
         return pd.Series({
             "weekly_tag": r.get("System", np.nan),
             "weekly_signal": r.get("Signal", np.nan),
-            "weekly_score": r.get("score", np.nan),
-            "weekly_date": r.get("signal_date", np.nan),
-            "weekly_breakout": r.get("breakout_level", np.nan),
+            "weekly_score": r.get("FINAL_ALPHA_SCORE", np.nan),
+            "weekly_date": r.get("Signal_Date", np.nan),
+            "weekly_breakout": r.get("entry_level", np.nan),
             "weekly_stop": r.get("stop_level", np.nan),
         })
 
