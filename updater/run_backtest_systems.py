@@ -64,13 +64,11 @@ S2_TARGET_FIB_RETRACEMENT = 0.382
 # -------------------------
 # System 1 (Weekly swing)
 # -------------------------
-S1_TRADE_DOLLARS = 5_000.0
+S1_TRADE_DOLLARS = 10_000.0
 S1_INITIAL_CASH = 250_000.0
-S1_SCORE_MIN = 0.7
-S1_PROFIT_TGT = 0.08
-S1_MAX_HOLD_DAYS = 15
-S1_USE_STOPLEVEL = True
-S1_MAX_POSITIONS = 20
+S1_SCORE_MIN = 0.30
+S1_PROFIT_TGT = 0.05
+S1_MAX_POSITIONS = 15
 
 # Fib settings
 FIB_LOOKBACK_DAYS = 300
@@ -428,7 +426,7 @@ def main():
 
     weekly_all = build_weekly_signals(df, idx, WEEKLY_CFG)
     if not weekly_all.empty:
-        weekly_all = weekly_all[weekly_all["FINAL_ALPHA_SCORE"] >= S1_SCORE_MIN].copy()
+        weekly_all = weekly_all[weekly_all["FINAL_ALPHA_SCORE"] > S1_SCORE_MIN].copy()
         weekly_all["Signal_Date"] = pd.to_datetime(weekly_all["Signal_Date"]).dt.normalize()
 
     s1_entries_by_date: Dict[pd.Timestamp, List[dict]] = {}
@@ -441,25 +439,9 @@ def main():
                 continue
             entry_d = pd.Timestamp(entry_d).normalize()
 
-            max_exit = nth_trading_date_for_ticker(dates_by_ticker, tk, entry_d, S1_MAX_HOLD_DAYS)
-            max_exit = pd.Timestamp(max_exit).normalize() if max_exit is not None else None
-
-            stop = None
-            if S1_USE_STOPLEVEL and hasattr(s, "stop_level"):
-                try:
-                    stop = float(s.stop_level) if np.isfinite(float(s.stop_level)) else None
-                except Exception:
-                    stop = None
-
-            entry_type = getattr(s, "entry_type", None)
-            entry_level = getattr(s, "entry_level", np.nan)
             s1_entries_by_date.setdefault(entry_d, []).append(
                 {
                     "ticker": tk,
-                    "stop": stop,
-                    "max_exit": max_exit,
-                    "entry_type": entry_type,
-                    "entry_level": entry_level,
                 }
             )
 
@@ -624,23 +606,6 @@ def main():
                 p1.sell_all(tk, d0, tgt)
                 continue
 
-            if S1_USE_STOPLEVEL and pos.stop_px_local is not None and lo <= pos.stop_px_local:
-                p1.sell_all(tk, d0, pos.stop_px_local)
-                continue
-
-            if pos.max_exit_date is not None and d0 >= pos.max_exit_date:
-                px = px_open.get((tk, d0), np.nan)
-                if not np.isfinite(px):
-                    arr = close_ffill.get(tk)
-                    if arr is None:
-                        continue
-                    ii = date_to_i.get(d0, None)
-                    if ii is None or not np.isfinite(arr[ii]):
-                        continue
-                    px = float(arr[ii])
-                p1.sell_all(tk, d0, float(px))
-                continue
-
         if d0 in s1_entries_by_date:
             for o in s1_entries_by_date[d0]:
                 tk = o["ticker"]
@@ -649,34 +614,14 @@ def main():
                 if len(p1.positions) >= S1_MAX_POSITIONS:
                     continue
                 px_open_val = px_open.get((tk, d0), np.nan)
-                px_high_val = px_high.get((tk, d0), np.nan)
-                px_low_val = px_low.get((tk, d0), np.nan)
-                if not np.isfinite(px_open_val) or not np.isfinite(px_high_val) or not np.isfinite(px_low_val):
-                    continue
-
-                entry_px = None
-                entry_type = o.get("entry_type")
-                entry_level = o.get("entry_level", np.nan)
-
-                if entry_type == "BREAKOUT":
-                    if np.isfinite(entry_level) and px_high_val >= entry_level:
-                        entry_px = float(px_open_val) if px_open_val >= entry_level else float(entry_level)
-                elif entry_type == "RECLAIM":
-                    if np.isfinite(entry_level) and px_low_val <= entry_level:
-                        entry_px = float(px_open_val) if px_open_val <= entry_level else float(entry_level)
-                else:
-                    entry_px = float(px_open_val)
-
-                if entry_px is None:
+                if not np.isfinite(px_open_val):
                     continue
 
                 p1.buy_usd(
                     tk,
                     d0,
-                    float(entry_px),
+                    float(px_open_val),
                     min(S1_TRADE_DOLLARS, p1.cash_usd),
-                    stop_px_local=o["stop"],
-                    max_exit_date=o["max_exit"],
                 )
 
         p1.mark_to_market(close_ffill, date_to_i, d0)
