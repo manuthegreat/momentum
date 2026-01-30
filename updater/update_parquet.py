@@ -1389,7 +1389,7 @@ def add_absolute_returns(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def attach_benchmark_and_alpha(df_prices: pd.DataFrame, idx_returns: pd.DataFrame) -> pd.DataFrame:
+def attach_benchmark_and_alpha_bucketc(df_prices: pd.DataFrame, idx_returns: pd.DataFrame) -> pd.DataFrame:
     d = df_prices.copy()
     d["date"] = pd.to_datetime(d["date"]).dt.normalize()
     d = d.sort_values(["ticker", "date"]).copy()
@@ -1608,7 +1608,7 @@ def momentum_bucketC_latest(
     df_a = add_regime_early_momentum(df_a)
     daily_a = build_daily_lists(df_a, top_n=top_n_daily)
 
-    d_alpha = attach_benchmark_and_alpha(d0, index_returns)
+    d_alpha = attach_benchmark_and_alpha_bucketc(d0, index_returns)
 
     df_b = d_alpha.copy()
     df_b = calculate_momentum_features(df_b, base_col="alpha_1d")
