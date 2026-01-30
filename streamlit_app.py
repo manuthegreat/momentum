@@ -114,6 +114,79 @@ def _render_monthly_summary(frame: pd.DataFrame, label: str) -> None:
     st.dataframe(_streamlit_safe_frame(summary_view), use_container_width=True)
 
 
+def _add_trade_pnl(trades: pd.DataFrame) -> pd.DataFrame:
+    required = {"portfolio", "ticker", "side", "date", "usd", "shares"}
+    if trades.empty or not required.issubset(trades.columns):
+        return trades
+
+    view = trades.copy()
+    view["date"] = pd.to_datetime(view["date"], errors="coerce")
+    view["usd"] = pd.to_numeric(view["usd"], errors="coerce")
+    view["shares"] = pd.to_numeric(view["shares"], errors="coerce")
+    view = view.sort_values(["portfolio", "ticker", "date"]).reset_index(drop=True)
+
+    holdings = {}
+    pnl_values = []
+
+    for _, row in view.iterrows():
+        key = (row["portfolio"], row["ticker"])
+        side = str(row["side"]).upper()
+        usd = float(row["usd"]) if pd.notna(row["usd"]) else 0.0
+        shares = float(row["shares"]) if pd.notna(row["shares"]) else 0.0
+
+        position = holdings.get(key, {"shares": 0.0, "cost_usd": 0.0})
+        held_shares = position["shares"]
+        held_cost = position["cost_usd"]
+        avg_cost = (held_cost / held_shares) if held_shares else 0.0
+
+        pnl = 0.0
+        if side == "BUY":
+            position["shares"] = held_shares + shares
+            position["cost_usd"] = held_cost + usd
+        elif side == "SELL":
+            pnl = usd - (avg_cost * shares)
+            new_shares = held_shares - shares
+            new_shares = max(new_shares, 0.0)
+            position["shares"] = new_shares
+            position["cost_usd"] = avg_cost * new_shares
+
+        holdings[key] = position
+        pnl_values.append(pnl)
+
+    view["pnl_usd"] = pnl_values
+    return view
+
+
+def _add_position_pnl(positions: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:
+    required = {"ticker", "avg_entry_px_local", "shares"}
+    if positions.empty or not required.issubset(positions.columns):
+        return positions
+
+    view = positions.copy()
+    view["avg_entry_px_local"] = pd.to_numeric(view["avg_entry_px_local"], errors="coerce")
+    view["shares"] = pd.to_numeric(view["shares"], errors="coerce")
+
+    if trades.empty or "px_local" not in trades.columns:
+        view["last_px_local"] = pd.NA
+        view["unrealized_pnl_local"] = pd.NA
+        return view
+
+    last_px = (
+        trades.copy()
+        .assign(date=pd.to_datetime(trades["date"], errors="coerce"))
+        .sort_values("date")
+        .dropna(subset=["px_local"])
+        .groupby("ticker")["px_local"]
+        .last()
+    )
+
+    view["last_px_local"] = view["ticker"].map(last_px)
+    view["unrealized_pnl_local"] = (
+        (view["last_px_local"] - view["avg_entry_px_local"]) * view["shares"]
+    )
+    return view
+
+
 def _filter_dataframe(frame: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     filtered = frame.copy()
     with st.expander("Filters", expanded=False):
@@ -408,7 +481,7 @@ with tab_backtest:
                 default=portfolio_options,
                 key="backtest-trades-portfolios",
             )
-            view = trades.copy()
+            view = _add_trade_pnl(trades)
             if selected_portfolios:
                 view = view[view["portfolio"].isin(selected_portfolios)]
             view = view.sort_values("date", ascending=False).head(200)
@@ -419,4 +492,5 @@ with tab_backtest:
         if positions.empty:
             st.info("No open positions at the end of the backtest.")
         else:
-            st.dataframe(_streamlit_safe_frame(positions), use_container_width=True)
+            positions_view = _add_position_pnl(positions, trades)
+            st.dataframe(_streamlit_safe_frame(positions_view), use_container_width=True)
