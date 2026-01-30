@@ -196,6 +196,8 @@ def load_signal_artifacts():
 
     if "signal_date" in weekly.columns:
         weekly["signal_date"] = pd.to_datetime(weekly["signal_date"])
+    elif "Signal_Date" in weekly.columns:
+        weekly["signal_date"] = pd.to_datetime(weekly["Signal_Date"])
     if "Signal_Date" in fib.columns:
         fib["Signal_Date"] = pd.to_datetime(fib["Signal_Date"])
     if "Signal_Date" in mom.columns:
