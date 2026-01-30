@@ -16,13 +16,13 @@ import numpy as np
 import pandas as pd
 
 from updater.update_parquet import (
-    WeeklySwingConfig,
+    Alpha5Config,
+    _build_signals_from_d_all,
+    _precompute_alpha5_d_all,
     fib_build_watchlist,
     fib_confirmation_engine,
     load_prices_from_parquet,
     load_index_returns_from_parquet,
-    weekly_add_indicators,
-    weekly_detect_setups,
     momentum_bucketC_latest,
 )
 
@@ -76,9 +76,13 @@ S1_MAX_POSITIONS = 20
 FIB_LOOKBACK_DAYS = 300
 
 # Weekly signal config (same defaults as signals batch)
-WEEKLY_CFG = WeeklySwingConfig(
-    adv_turnover_20_min=0.0,
-    breakout_buffer_pct=0.0,
+WEEKLY_CFG = Alpha5Config(
+    max_signals=25,
+    min_R=3.0,
+    fresh_days=7,
+    bm_gate_on=True,
+    bm_lookback=20,
+    bm_min_cum_ret=0.0,
 )
 
 
@@ -94,42 +98,24 @@ def fx_to_usd(ticker: str) -> float:
     return 1.0
 
 
-def build_weekly_signals(df_prices: pd.DataFrame, cfg: WeeklySwingConfig) -> pd.DataFrame:
-    d = prepare_weekly_input(df_prices)
-    d = weekly_add_indicators(d, cfg)
-    sig = weekly_detect_setups(d, cfg)
-    if sig is None or sig.empty:
+def build_weekly_signals(df_prices: pd.DataFrame, index_returns: pd.DataFrame, cfg: Alpha5Config) -> pd.DataFrame:
+    d_all = _precompute_alpha5_d_all(df_prices, index_returns, cfg=cfg)
+    if d_all is None or d_all.empty:
         return pd.DataFrame()
-    sig = sig.copy()
-    sig["signal_date"] = pd.to_datetime(sig["signal_date"]).dt.normalize()
-    return sig
 
+    frames = []
+    for as_of in sorted(d_all["date"].unique()):
+        subset = d_all[d_all["date"] <= as_of].copy()
+        sig = _build_signals_from_d_all(subset, cfg=cfg, include_scores=True)
+        if sig is not None and not sig.empty:
+            frames.append(sig)
 
-def infer_country_from_ticker(ticker: str) -> str:
-    t = str(ticker).upper()
-    if t.endswith(".HK"):
-        return "HK"
-    if t.endswith(".SI"):
-        return "SG"
-    return "US"
+    if not frames:
+        return pd.DataFrame()
 
-
-def _default_mcap_for_country(country: str) -> float:
-    if country == "HK":
-        return 5e9
-    if country == "SG":
-        return 1e9
-    return 2e9
-
-
-def prepare_weekly_input(df_prices: pd.DataFrame) -> pd.DataFrame:
-    d = df_prices.copy()
-    d["country"] = d["ticker"].map(infer_country_from_ticker)
-    if "market_cap" not in d.columns:
-        d["market_cap"] = d["country"].map(_default_mcap_for_country)
-    if "turnover" not in d.columns:
-        d["turnover"] = d["close"].astype(float) * d["volume"].astype(float)
-    return d
+    out = pd.concat(frames, ignore_index=True)
+    out["Signal_Date"] = pd.to_datetime(out["Signal_Date"]).dt.normalize()
+    return out
 
 
 def momentum_bucketC_latest_asof(
@@ -440,16 +426,16 @@ def main():
     if total_days > 0:
         p3.add_flow(pd.Timestamp(calendar[0]).normalize(), S3_INITIAL_CASH)
 
-    weekly_all = build_weekly_signals(df, WEEKLY_CFG)
+    weekly_all = build_weekly_signals(df, idx, WEEKLY_CFG)
     if not weekly_all.empty:
-        weekly_all = weekly_all[weekly_all["score"] >= S1_SCORE_MIN].copy()
-        weekly_all["signal_date"] = pd.to_datetime(weekly_all["signal_date"]).dt.normalize()
+        weekly_all = weekly_all[weekly_all["FINAL_ALPHA_SCORE"] >= S1_SCORE_MIN].copy()
+        weekly_all["Signal_Date"] = pd.to_datetime(weekly_all["Signal_Date"]).dt.normalize()
 
     s1_entries_by_date: Dict[pd.Timestamp, List[dict]] = {}
     if weekly_all is not None and not weekly_all.empty:
         for s in weekly_all.itertuples(index=False):
             tk = str(s.ticker)
-            sig_d = pd.Timestamp(s.signal_date).normalize()
+            sig_d = pd.Timestamp(s.Signal_Date).normalize()
             entry_d = next_trading_date_for_ticker(dates_by_ticker, tk, sig_d)
             if entry_d is None:
                 continue
@@ -466,16 +452,14 @@ def main():
                     stop = None
 
             entry_type = getattr(s, "entry_type", None)
-            breakout_level = getattr(s, "breakout_level", np.nan)
-            pullback_level = getattr(s, "pullback_level", np.nan)
+            entry_level = getattr(s, "entry_level", np.nan)
             s1_entries_by_date.setdefault(entry_d, []).append(
                 {
                     "ticker": tk,
                     "stop": stop,
                     "max_exit": max_exit,
                     "entry_type": entry_type,
-                    "breakout_level": breakout_level,
-                    "pullback_level": pullback_level,
+                    "entry_level": entry_level,
                 }
             )
 
@@ -672,34 +656,14 @@ def main():
 
                 entry_px = None
                 entry_type = o.get("entry_type")
-                breakout_level = o.get("breakout_level", np.nan)
-                pullback_level = o.get("pullback_level", np.nan)
+                entry_level = o.get("entry_level", np.nan)
 
                 if entry_type == "BREAKOUT":
-                    if np.isfinite(breakout_level) and px_high_val >= breakout_level:
-                        entry_px = float(px_open_val) if px_open_val >= breakout_level else float(breakout_level)
-                elif entry_type == "PULLBACK":
-                    if np.isfinite(pullback_level) and px_low_val <= pullback_level:
-                        entry_px = float(px_open_val) if px_open_val <= pullback_level else float(pullback_level)
-                else:
-                    entry_px = float(px_open_val)
-
-                if entry_px is None:
-                    continue
-
-                    continue
-
-                entry_px = None
-                entry_type = o.get("entry_type")
-                breakout_level = o.get("breakout_level", np.nan)
-                pullback_level = o.get("pullback_level", np.nan)
-
-                if entry_type == "BREAKOUT":
-                    if np.isfinite(breakout_level) and px_high_val >= breakout_level:
-                        entry_px = float(px_open_val) if px_open_val >= breakout_level else float(breakout_level)
-                elif entry_type == "PULLBACK":
-                    if np.isfinite(pullback_level) and px_low_val <= pullback_level:
-                        entry_px = float(px_open_val) if px_open_val <= pullback_level else float(pullback_level)
+                    if np.isfinite(entry_level) and px_high_val >= entry_level:
+                        entry_px = float(px_open_val) if px_open_val >= entry_level else float(entry_level)
+                elif entry_type == "RECLAIM":
+                    if np.isfinite(entry_level) and px_low_val <= entry_level:
+                        entry_px = float(px_open_val) if px_open_val <= entry_level else float(entry_level)
                 else:
                     entry_px = float(px_open_val)
 
