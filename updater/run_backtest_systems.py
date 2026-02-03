@@ -60,7 +60,7 @@ S3_MONTHLY_CONTRIB = 0.0  # force off
 S2_TRADE_DOLLARS = 10_000.0
 S2_INITIAL_CASH = 500_000.0
 S2_TARGET_FIB_RETRACEMENT = 0.382
-S2_MAX_HOLD_DAYS = 60
+S2_MAX_HOLD_DAYS = 100
 
 # -------------------------
 # System 1 (Weekly swing)
