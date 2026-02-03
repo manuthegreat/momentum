@@ -196,6 +196,29 @@ class Portfolio:
             v += float(p.shares) * px * fx_to_usd(p.ticker)
         return float(v)
 
+    def value_usd_at_open(
+        self,
+        px_open: Dict[tuple, float],
+        close_prev_ffill: Dict[str, np.ndarray],
+        date_to_i: Dict[pd.Timestamp, int],
+        date: pd.Timestamp,
+    ) -> float:
+        v = float(self.cash_usd)
+        i = date_to_i.get(date, None)
+        if i is None:
+            return v
+        for p in self.positions.values():
+            px = px_open.get((p.ticker, date), np.nan)
+            if not np.isfinite(px):
+                arr = close_prev_ffill.get(p.ticker)
+                if arr is None:
+                    continue
+                px = float(arr[i])
+            if not np.isfinite(px):
+                continue
+            v += float(p.shares) * px * fx_to_usd(p.ticker)
+        return float(v)
+
     def mark_to_market(self, close_ffill, date_to_i, date):
         d = pd.Timestamp(date).normalize()
         self.equity_curve.append({"date": d, "equity_usd": self.value_usd(close_ffill, date_to_i, d)})
@@ -406,11 +429,13 @@ def main():
     px_low = {(r.ticker, pd.Timestamp(r.date).normalize()): float(r.low) for r in df.itertuples(index=False)}
 
     close_ffill: Dict[str, np.ndarray] = {}
+    close_prev_ffill: Dict[str, np.ndarray] = {}
     cal_index = pd.Index(calendar)
     for t, g in df.groupby("ticker", sort=False):
         s = g.sort_values("date").set_index("date")["close"].astype(float)
         s = s.reindex(cal_index).ffill()
         close_ffill[str(t)] = s.to_numpy(dtype=float)
+        close_prev_ffill[str(t)] = s.shift(1).to_numpy(dtype=float)
 
     month_ends = set(last_trading_day_each_month(calendar))
 
@@ -524,7 +549,7 @@ def main():
                         if np.isfinite(px):
                             p3.sell_all(tk, d0, px)
 
-                eq = p3.value_usd(close_ffill, date_to_i, d0)
+                eq = p3.value_usd_at_open(px_open, close_prev_ffill, date_to_i, d0)
                 if eq > 0 and len(targets) > 0:
                     per = eq / len(targets)
                     for tk in targets:
