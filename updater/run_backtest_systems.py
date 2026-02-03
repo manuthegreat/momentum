@@ -619,12 +619,17 @@ def main():
                 )
 
         for tk in list(p1.positions.keys()):
+            pos = p1.positions[tk]
+            if pos.max_exit_date is not None and d0 >= pos.max_exit_date:
+                px_open_val = px_open.get((tk, d0), np.nan)
+                if np.isfinite(px_open_val):
+                    p1.sell_all(tk, d0, px_open_val)
+                continue
+
             hi = px_high.get((tk, d0), np.nan)
             lo = px_low.get((tk, d0), np.nan)
             if not np.isfinite(hi) or not np.isfinite(lo):
                 continue
-
-            pos = p1.positions[tk]
 
             tgt = pos.entry_px_local * (1.0 + S1_PROFIT_TGT)
             if hi >= tgt:
@@ -642,11 +647,15 @@ def main():
                 if not np.isfinite(px_open_val):
                     continue
 
+                max_exit = nth_trading_date_for_ticker(
+                    dates_by_ticker, tk, d0, int(WEEKLY_CFG.fresh_days)
+                )
                 p1.buy_usd(
                     tk,
                     d0,
                     float(px_open_val),
                     min(S1_TRADE_DOLLARS, p1.cash_usd),
+                    max_exit_date=max_exit,
                 )
 
         p1.mark_to_market(close_ffill, date_to_i, d0)
