@@ -60,6 +60,7 @@ S3_MONTHLY_CONTRIB = 0.0  # force off
 S2_TRADE_DOLLARS = 10_000.0
 S2_INITIAL_CASH = 500_000.0
 S2_TARGET_FIB_RETRACEMENT = 0.382
+S2_MAX_HOLD_DAYS = 100
 
 # -------------------------
 # System 1 (Weekly swing)
@@ -565,12 +566,22 @@ def main():
                             p3.buy_usd(tk, d0, px, min(per, p3.cash_usd))
 
         for tk in list(p2.positions.keys()):
+            pos = p2.positions[tk]
+            if pos.max_exit_date is not None and d0 >= pos.max_exit_date:
+                px_open_val = px_open.get((tk, d0), np.nan)
+                if np.isfinite(px_open_val):
+                    p2.sell_all(tk, d0, px_open_val)
+                else:
+                    i = date_to_i.get(d0, None)
+                    arr = close_ffill.get(tk)
+                    if i is not None and arr is not None and np.isfinite(arr[i]):
+                        p2.sell_all(tk, d0, float(arr[i]))
+                continue
+
             hi = px_high.get((tk, d0), np.nan)
             lo = px_low.get((tk, d0), np.nan)
             if not np.isfinite(hi) or not np.isfinite(lo):
                 continue
-
-            pos = p2.positions[tk]
 
             if pos.stop_px_local is not None and lo <= pos.stop_px_local:
                 p2.sell_all(tk, d0, pos.stop_px_local)
@@ -609,6 +620,9 @@ def main():
                 if entry_px is None:
                     continue
 
+                max_exit = nth_trading_date_for_ticker(
+                    dates_by_ticker, tk, d0, int(S2_MAX_HOLD_DAYS)
+                )
                 p2.buy_usd(
                     tk,
                     d0,
@@ -616,6 +630,7 @@ def main():
                     min(S2_TRADE_DOLLARS, p2.cash_usd),
                     target_px_local=target_px,
                     stop_px_local=stop_px,
+                    max_exit_date=max_exit,
                 )
 
         for tk in list(p1.positions.keys()):
@@ -624,6 +639,11 @@ def main():
                 px_open_val = px_open.get((tk, d0), np.nan)
                 if np.isfinite(px_open_val):
                     p1.sell_all(tk, d0, px_open_val)
+                else:
+                    i = date_to_i.get(d0, None)
+                    arr = close_ffill.get(tk)
+                    if i is not None and arr is not None and np.isfinite(arr[i]):
+                        p1.sell_all(tk, d0, float(arr[i]))
                 continue
 
             hi = px_high.get((tk, d0), np.nan)
