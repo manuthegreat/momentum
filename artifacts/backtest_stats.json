@@ -1,34 +1,34 @@
 {
   "System1": {
     "Start Equity": 250000.0,
-    "End Equity": 332226.99967919424,
-    "Total Return (TWR)": 0.3289079987167749,
-    "CAGR (TWR)": 0.05848682522827353,
-    "Max Drawdown (raw EQ)": -0.09154297588740623,
-    "Sharpe (daily, TWR)": 0.7565138948097335
+    "End Equity": 322397.5069904398,
+    "Total Return (TWR)": 0.28959002796175604,
+    "CAGR (TWR)": 0.05215139558777615,
+    "Max Drawdown (raw EQ)": -0.08965296242586729,
+    "Sharpe (daily, TWR)": 0.6794191150789142
   },
   "System2": {
     "Start Equity": 500000.0,
-    "End Equity": 521123.28353463905,
-    "Total Return (TWR)": 0.04224656706928154,
-    "CAGR (TWR)": 0.008305477334656697,
-    "Max Drawdown (raw EQ)": -0.13870448150027592,
-    "Sharpe (daily, TWR)": 0.16988000397232592
+    "End Equity": 521862.93547755526,
+    "Total Return (TWR)": 0.043725870955107604,
+    "CAGR (TWR)": 0.00859138426558248,
+    "Max Drawdown (raw EQ)": -0.13839529100322578,
+    "Sharpe (daily, TWR)": 0.17525127966496373
   },
   "System3": {
     "Start Equity": 100000.0,
-    "End Equity": 2212459.3920948096,
-    "Total Return (TWR)": 21.124593920948026,
-    "CAGR (TWR)": 0.8570677958215656,
-    "Max Drawdown (raw EQ)": -0.396120945701273,
-    "Sharpe (daily, TWR)": 1.7402158273176611
+    "End Equity": 2379488.679334047,
+    "Total Return (TWR)": 22.794886793340545,
+    "CAGR (TWR)": 0.8842822786406919,
+    "Max Drawdown (raw EQ)": -0.39612094538761167,
+    "Sharpe (daily, TWR)": 1.7745620355821206
   },
   "Combined": {
     "Start Equity": 850000.0,
-    "End Equity": 3065809.675308643,
-    "Total Return (TWR)": 2.606834912127821,
-    "CAGR (TWR)": 0.2923026397679691,
-    "Max Drawdown (raw EQ)": -0.1877180329097945,
-    "Sharpe (daily, TWR)": 1.5548559828237736
+    "End Equity": 3223749.121802042,
+    "Total Return (TWR)": 2.792646025649474,
+    "CAGR (TWR)": 0.30534422229413694,
+    "Max Drawdown (raw EQ)": -0.18789128981268555,
+    "Sharpe (daily, TWR)": 1.5962761268472914
   }
 }
